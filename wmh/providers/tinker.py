@@ -10,24 +10,43 @@ ids, and per-token logprobs) into an optional `TokenRecorder`. Downstream
 training consumes ONLY these recorded ids (tokens-in tokens-out); text is
 never re-encoded, and a sample without per-token logprobs fails loudly.
 
+Multi-turn prompts are built incrementally from the episode's own token
+history: agents re-serialize earlier assistant turns (reformatted tool-call
+JSON, collapsed think framing), so re-rendering the full history never
+byte-matches the tokens actually sampled and every turn would fragment into
+its own training datum. Instead the next prompt is (previous prompt + raw
+sampled ids + a rendered suffix of only the new messages); a genuine history
+edit falls back to a full re-render and is counted on the recorder.
+
 `config.model_type` carries the base model name (renderer and tokenizer
 identity); `config.model` carries either a `tinker://` sampler-weights path or
 a base model name for an untrained student. The tinker SDK is an optional
 extra imported lazily (`uv sync --extra distill`), same contract as e2b.
 
-Every SDK call is deadline-bounded (`wmh.distill.deadlines`): a wedged Tinker
-session blocks forever inside the SDK's own retry loop, so client construction
-and tokenizer fetches run under the `connect` deadline and the sample future
-under the `sample` deadline. An expiry raises the retryable
-`TinkerDeadlineError` and drops the provider-owned sampling client, so the
-retry wrapper's next attempt builds a fresh session instead of inheriting the
-wedge.
+Every SDK call is deadline-bounded (`wmh.distill.deadlines`): a wedged
+session raises a retryable `TinkerDeadlineError` instead of hanging, and the
+provider drops its lazily built sampling client on expiry so the retry
+wrapper's next attempt heals through a fresh session.
+
+SDK clients are shared process-wide (`shared_service_client` and
+`shared_sampling_client`): the SDK's service client starts a heartbeat task
+that strongly references its internal holder, so every constructed client
+lives for the rest of the process and keeps one server-side session alive.
+Building a fresh client per trial therefore leaks sessions until the service
+rejects new session creation with capacity errors (observed live at ~240
+cumulative sessions). One `tinker.ServiceClient` plus one `SamplingClient`
+per exact model string serve every consumer instead; the SDK documents
+`SamplingClient` as thread-safe, and all per-episode state (`TokenRecorder`,
+incremental prompt state, renderer) stays on each provider instance.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
@@ -67,6 +86,113 @@ _MISSING_TINKER_EXTRA = (
 # The tinker SamplingParams default; used when a structured request carries no
 # temperature (pi normally stamps one on every request).
 _DEFAULT_CHAT_TEMPERATURE = 1.0
+
+_shared_lock = threading.Lock()
+"""Guards the process-wide service client and sampling-client cache below."""
+
+_shared_service: tinker.ServiceClient | None = None
+_shared_samplers: dict[str, tinker.SamplingClient] = {}
+"""Process-wide `SamplingClient` cache, keyed by the exact model string."""
+
+
+def shared_service_client() -> tinker.ServiceClient:
+    """The process-wide `tinker.ServiceClient`, constructed at most once.
+
+    The SDK's service client starts a heartbeat task that strongly references
+    its internal holder, so every constructed client lives (and pins one live
+    server-side session) for the rest of the process. Constructing one per
+    trial therefore leaks sessions until the service rejects new session
+    creation with capacity errors; every wmh consumer (the rollout provider,
+    the teacher scorer, the distill loop) shares this single client instead.
+
+    The API key is checked on every call, before the cache, so a missing key
+    stays an actionable error rather than an SDK-internal auth failure.
+
+    Returns:
+        The shared service client.
+
+    Raises:
+        ImportError: If the tinker SDK is not installed (the distill extra).
+        RuntimeError: If TINKER_API_KEY is missing from the environment.
+        TinkerDeadlineError: If construction exceeds the connect deadline
+            (nothing is cached, so the next call rebuilds).
+    """
+    try:
+        import tinker
+    except ImportError as exc:
+        raise ImportError(_MISSING_TINKER_EXTRA) from exc
+    if not os.environ.get(TINKER_API_KEY_ENV):
+        raise RuntimeError(
+            f"{TINKER_API_KEY_ENV} is not set in the environment; set it to "
+            "your Tinker API key to use the tinker provider"
+        )
+    global _shared_service
+    with _shared_lock:
+        if _shared_service is None:
+            _shared_service = call_with_deadline("connect", tinker.ServiceClient)
+        return _shared_service
+
+
+def shared_sampling_client(model: str) -> tinker.SamplingClient:
+    """The process-wide sampling client for one model, from the shared cache.
+
+    Keyed by the exact model string: a `tinker://` sampler-weights path or a
+    base model name. The SDK documents `SamplingClient` as thread-safe, so a
+    single client per model serves every concurrent trial; per-episode state
+    (`TokenRecorder`, incremental prompt state, renderer) stays on each
+    provider instance. Entries live for the rest of the process (the SDK pins
+    every constructed client regardless); a wedged entry is replaced through
+    `evict_shared_sampling_client`.
+
+    Args:
+        model: The exact model string to sample from.
+
+    Returns:
+        The cached (or newly built and cached) sampling client.
+
+    Raises:
+        ImportError: If the tinker SDK is not installed (the distill extra).
+        RuntimeError: If TINKER_API_KEY is missing from the environment.
+        TinkerDeadlineError: If client construction exceeds the connect
+            deadline (nothing is cached, so the next call rebuilds).
+    """
+    service = shared_service_client()
+    with _shared_lock:
+        cached = _shared_samplers.get(model)
+        if cached is not None:
+            return cached
+
+        def build() -> tinker.SamplingClient:
+            if model.startswith("tinker://"):
+                return service.create_sampling_client(model_path=model)
+            return service.create_sampling_client(base_model=model)
+
+        client = call_with_deadline("connect", build)
+        _shared_samplers[model] = client
+        return client
+
+
+def evict_shared_sampling_client(model: str, client: tinker.SamplingClient) -> None:
+    """Drop one model's cached sampling client if it is still `client`.
+
+    The wedged-session heal path: a client that blew a deadline is wedged for
+    EVERY user sharing it, so callers evict the cache entry (not merely their
+    own reference) and the next `shared_sampling_client(model)` builds a
+    fresh session. The identity check keeps a late eviction from discarding a
+    replacement another caller already rebuilt.
+
+    Args:
+        model: The cache key the wedged client was built under.
+        client: The wedged client itself, identity-compared to the entry.
+    """
+    with _shared_lock:
+        if _shared_samplers.get(model) is client:
+            del _shared_samplers[model]
+            logger.info(
+                "evicted the shared tinker sampling client for %s; the next "
+                "user builds a fresh session",
+                model,
+            )
 
 
 class TokenSpan(BaseModel):
@@ -110,6 +236,7 @@ class TokenRecorder:
     def __init__(self, jsonl_path: Path | None = None) -> None:
         self._spans: list[TokenSpan] = []
         self._jsonl_path = jsonl_path
+        self._fallbacks = 0
 
     def __len__(self) -> int:
         return len(self._spans)
@@ -125,6 +252,15 @@ class TokenRecorder:
     def spans(self) -> list[TokenSpan]:
         """A snapshot copy of the spans recorded so far."""
         return list(self._spans)
+
+    @property
+    def fallback_count(self) -> int:
+        """How many prompts fell back to a full re-render (each one fragments)."""
+        return self._fallbacks
+
+    def record_fallback(self) -> None:
+        """Count one incremental-prompt fallback (genuine mid-episode history edit)."""
+        self._fallbacks += 1
 
 
 class SampledSequenceLike(Protocol):
@@ -178,6 +314,11 @@ class SdkSampler:
     def __init__(self, client: tinker.SamplingClient) -> None:
         self._client = client
 
+    @property
+    def sdk_client(self) -> tinker.SamplingClient:
+        """The wrapped SDK client (shared-cache eviction compares its identity)."""
+        return self._client
+
     def sample(
         self,
         prompt_token_ids: list[int],
@@ -189,7 +330,7 @@ class SdkSampler:
         """Run one deadline-bounded sample and return the single sampled sequence.
 
         Raises:
-            TinkerDeadlineError: If the `sample` deadline expires (the session
+            TinkerDeadlineError: If the sample deadline expires (the session
                 is likely wedged; the caller should retry with a fresh one).
         """
         import tinker
@@ -204,11 +345,7 @@ class SdkSampler:
         return wait_with_deadline("sample", future).sequences[0]
 
     def get_tokenizer(self) -> RendererTokenizer:
-        """The HF tokenizer for the client's base model (deadline-bounded fetch).
-
-        Raises:
-            TinkerDeadlineError: If the `connect` deadline expires.
-        """
+        """The HF tokenizer for the client's base model (deadline-bounded fetch)."""
         # HF stubs type decode as `str | list[str]` depending on the input
         # shape; for the list[int] calls renderers make it is always str.
         return cast("RendererTokenizer", call_with_deadline("connect", self._client.get_tokenizer))
@@ -222,6 +359,70 @@ class _SampledTurn(BaseModel):
     parsed: ParsedAssistantMessage
 
 
+@dataclass
+class _PromptState:
+    """The provider's last successful call, for incremental prompt extension.
+
+    Shares the recorder's single-episode ownership: one provider serves one
+    episode sequentially, so the next call's history normally extends this
+    call's message list by the assistant echo plus new tool/user messages.
+    """
+
+    messages: list[ChatMessage]
+    """Snapshot of the message list the last prompt was built from."""
+
+    tool_signature: str | None
+    """Normalized digest of the tool schemas the last prompt rendered with."""
+
+    prompt_tokens: list[int]
+    """The exact prompt ids sent on the last call (incremental or full)."""
+
+    sampled_tokens: list[int]
+    """The raw sampled ids of the last call, including any end-of-turn token."""
+
+
+def _tool_signature(tools: list[ChatTool] | None) -> str | None:
+    """A normalized digest of tool schemas; None when no tools are rendered."""
+    if not tools:
+        return None
+    return json.dumps([tool.model_dump(mode="json") for tool in tools], sort_keys=True)
+
+
+def _first_incompatible_index(
+    previous: list[ChatMessage], incoming: list[ChatMessage]
+) -> int | None:
+    """Where `incoming` stops being a tolerant extension of `previous`, or None.
+
+    The shared region must match role for role and count for count. Assistant
+    turns are compared by role only: the agent re-serializes the provider's
+    own turns (parsed and reformatted tool calls, collapsed think framing), so
+    their text never byte-matches and the provider's token history is the
+    ground truth for them. System, user, and tool messages must match exactly
+    by content and tool linkage. When `incoming` is longer, the first new
+    message must be the assistant echo of the provider's last sampled turn.
+
+    Returns:
+        None when compatible; otherwise the index of the first message that
+        breaks the extension (a genuine history edit or compaction).
+    """
+    if len(incoming) < len(previous):
+        return len(incoming)
+    for index, (prev, cur) in enumerate(zip(previous, incoming, strict=False)):
+        if prev.role != cur.role:
+            return index
+        if prev.role == "assistant":
+            continue
+        if prev.content != cur.content:
+            return index
+        if prev.tool_call_id != cur.tool_call_id:
+            return index
+        if (prev.model_extra or {}).get("name") != (cur.model_extra or {}).get("name"):
+            return index
+    if len(incoming) > len(previous) and incoming[len(previous)].role != "assistant":
+        return len(previous)
+    return None
+
+
 class TinkerChatProvider:
     """Serves completions from a Tinker-hosted LoRA student during distillation.
 
@@ -231,8 +432,14 @@ class TinkerChatProvider:
             name for an untrained student).
         sampling_client: Optional injected sampler (tests use the fakes in
             `wmh.distill.fake_tinker`; wrap a real `tinker.SamplingClient` in
-            `SdkSampler`). When None, a real client is built lazily from
-            `config.model` on first use.
+            `SdkSampler`). When None, a real client is fetched lazily from
+            the process-wide shared cache (`shared_sampling_client`, keyed by
+            `config.model`; one client per model string serves every
+            concurrent trial, and the SDK documents `SamplingClient` as
+            thread-safe) and EVICTED from that cache after a
+            `TinkerDeadlineError` so every future user rebuilds through a
+            fresh session; an injected client bypasses the cache entirely and
+            is never dropped.
         renderer: Optional injected rendering. When None, it is built lazily
             from the base model name and the sampling client's tokenizer.
         recorder: Optional per-episode span recorder; when present, every
@@ -274,6 +481,7 @@ class TinkerChatProvider:
         self._owns_sampler = sampling_client is None
         self._rendering = renderer
         self._recorder = recorder
+        self._prompt_state: _PromptState | None = None
 
     def _base_model_name(self) -> str:
         base = self.config.model_type or self.config.model
@@ -292,54 +500,35 @@ class TinkerChatProvider:
         return base
 
     def _get_sampler(self) -> TinkerSampler:
-        """The sampling client, built on first use and rebuilt after a wedge.
-
-        Raises:
-            ImportError: If the tinker SDK is not installed (the distill extra).
-            RuntimeError: If TINKER_API_KEY is missing from the environment.
-            TinkerDeadlineError: If service-client construction or sampling-client
-                creation exceeds the `connect` deadline. Neither is cached in that
-                case, so the next attempt starts from a fresh session.
-        """
-        # Lazy: don't import the SDK or read the key env var until first use.
         if self._sampler is None:
-            try:
-                import tinker
-            except ImportError as exc:
-                raise ImportError(_MISSING_TINKER_EXTRA) from exc
-            if not os.environ.get(TINKER_API_KEY_ENV):
-                raise RuntimeError(
-                    f"{TINKER_API_KEY_ENV} is not set in the environment; set it to "
-                    "your Tinker API key to use the tinker provider"
-                )
-            # Both SDK calls are fully blocking with no timeout parameter, so they run
-            # under the "connect" deadline on a daemon thread rather than forever.
-            service = call_with_deadline("connect", tinker.ServiceClient)
-            model = self.config.model
-
-            def build() -> tinker.SamplingClient:
-                if model.startswith("tinker://"):
-                    return service.create_sampling_client(model_path=model)
-                return service.create_sampling_client(base_model=model)
-
-            self._sampler = SdkSampler(call_with_deadline("connect", build))
+            self._sampler = self._build_sdk_sampler()
         return self._sampler
 
-    def _drop_wedged_sampler(self) -> None:
-        """Forget a sampling client that blew its deadline, so the next attempt rebuilds.
+    def _build_sdk_sampler(self) -> TinkerSampler:
+        # Lazy: the SDK import and the API-key check happen inside the shared
+        # cache path (`shared_sampling_client`), so nothing touches tinker
+        # before the first completion. Sharing keeps session creation bounded
+        # by distinct model strings instead of by trial count.
+        return SdkSampler(shared_sampling_client(self.config.model))
 
-        A wedged session keeps timing out while a freshly built one succeeds, so
-        holding the cached client would turn one expiry into an endless run of
-        them. Dropping it makes the next `_get_sampler` construct a new
-        `ServiceClient` and a new `SamplingClient` (each construction is itself
-        `connect`-bounded). An injected client is never dropped: the provider
-        cannot rebuild what it did not build.
+    def _drop_wedged_sampler(self) -> None:
+        """Forget (and evict from the shared cache) a wedged sampling client.
+
+        A wedged session keeps timing out while a freshly built one heals
+        (observed live), so dropping here makes the retry wrapper's next
+        attempt rebuild through `_get_sampler`. The shared cache entry is
+        evicted too, not just this provider's reference: the client is shared
+        process-wide, so leaving it cached would hand the same wedged session
+        to every future trial. An injected client is never dropped: the
+        provider cannot rebuild what it did not build.
         """
         if self._owns_sampler and self._sampler is not None:
             logger.warning(
                 "dropping the tinker sampling client after a deadline expiry; "
                 "the next attempt builds a fresh session"
             )
+            if isinstance(self._sampler, SdkSampler):
+                evict_shared_sampling_client(self.config.model, self._sampler.sdk_client)
             self._sampler = None
 
     def _get_rendering(self) -> ChatRendering:
@@ -355,6 +544,55 @@ class TinkerChatProvider:
             self._rendering = build_renderer(base_model, sampler.get_tokenizer())
         return self._rendering
 
+    def _build_prompt_tokens(
+        self, messages: list[ChatMessage], tools: list[ChatTool] | None
+    ) -> list[int]:
+        """Build the prompt ids, extending the episode's own token history when possible.
+
+        When the previous call's message list is a tolerant prefix of the
+        incoming one (see `_first_incompatible_index`) and the tool schemas
+        are unchanged, the prompt is the previous prompt plus the raw sampled
+        ids plus a rendered suffix of only the NEW messages, so it extends
+        (previous prompt + previous sample) verbatim as a token prefix and the
+        episode merges into one training datum. An identical-length compatible
+        history (the caller discarded the last turn and re-asks) reuses the
+        previous prompt unchanged. Anything else (a genuine history edit or
+        compaction) falls back to a full re-render, which is counted on the
+        recorder because every fallback fragments the episode's datums.
+        """
+        rendering = self._get_rendering()
+        state = self._prompt_state
+        if state is None:
+            return rendering.build_generation_prompt(messages, tools)
+        signature = _tool_signature(tools)
+        mismatch = _first_incompatible_index(state.messages, messages)
+        if mismatch is None and signature == state.tool_signature:
+            if len(messages) == len(state.messages):
+                return list(state.prompt_tokens)
+            suffix = rendering.render_suffix(
+                messages,
+                len(state.messages) + 1,
+                tools,
+                previous_sampled_ids=state.sampled_tokens,
+            )
+            return state.prompt_tokens + state.sampled_tokens + suffix
+        if self._recorder is not None:
+            self._recorder.record_fallback()
+        if mismatch is not None:
+            logger.info(
+                "incremental prompt fallback: incoming message %d does not extend the "
+                "previous call's history (genuine edit or compaction); re-rendering the "
+                "full prompt, which fragments this episode's training datums",
+                mismatch,
+            )
+        else:
+            logger.info(
+                "incremental prompt fallback: the tool schemas changed since the previous "
+                "call; re-rendering the full prompt, which fragments this episode's "
+                "training datums"
+            )
+        return rendering.build_generation_prompt(messages, tools)
+
     def _sample_turn(
         self,
         messages: list[ChatMessage],
@@ -366,7 +604,7 @@ class TinkerChatProvider:
         """Render, sample, parse, and (on success) record exactly one span."""
         try:
             rendering = self._get_rendering()
-            prompt_ids = rendering.build_generation_prompt(messages, tools)
+            prompt_ids = self._build_prompt_tokens(messages, tools)
             sequence = self._get_sampler().sample(
                 prompt_ids,
                 max_tokens=max_tokens,
@@ -374,9 +612,9 @@ class TinkerChatProvider:
                 stop=rendering.stop_sequences,
             )
         except TinkerDeadlineError:
-            # The session is likely wedged; drop it so the retry wrapper's next
-            # attempt rebuilds fresh. No span was recorded (recording happens
-            # only after the whole completion succeeds, below).
+            # The session is likely wedged; drop it so the retry wrapper's
+            # next attempt rebuilds fresh. No span was recorded (recording
+            # happens only after the whole completion succeeds, below).
             self._drop_wedged_sampler()
             raise
         sampled_ids = list(sequence.tokens)
@@ -392,8 +630,15 @@ class TinkerChatProvider:
                 "for tokens-in-tokens-out training and are never fabricated"
             )
         parsed = rendering.parse_response(sampled_ids)
-        # Record only after the whole completion succeeded, so a failure that an
-        # outer retry wrapper re-invokes never leaves a span behind.
+        # Update the incremental state and record only after the whole completion
+        # succeeded, so a failure that an outer retry wrapper re-invokes never
+        # leaves a span (or stale prompt state) behind.
+        self._prompt_state = _PromptState(
+            messages=list(messages),
+            tool_signature=_tool_signature(tools),
+            prompt_tokens=prompt_ids,
+            sampled_tokens=sampled_ids,
+        )
         if self._recorder is not None:
             self._recorder.record(
                 TokenSpan(

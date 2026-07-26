@@ -15,8 +15,9 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import TYPE_CHECKING, NoReturn, cast
 
 import pytest
@@ -33,9 +34,19 @@ from pydantic import JsonValue, ValidationError
 import wmh.distill.rendering as rendering_module
 import wmh.providers.tinker as tinker_module
 from wmh.config import PROVIDER_ENV_VARS
+from wmh.distill.config import (
+    DistillConfig,
+    HarborConfig,
+    RolloutConfig,
+    StudentConfig,
+    TeacherConfig,
+    TrainConfig,
+)
+from wmh.distill.data import build_datums
 from wmh.distill.deadlines import TinkerDeadlineError, env_var_for
 from wmh.distill.fake_tinker import FakeSampledSequence, FakeSamplingClient, FakeTokenizer
 from wmh.distill.rendering import ParsedAssistantMessage
+from wmh.distill.tokens import TrialRecord
 from wmh.providers.base import (
     Message,
     Provider,
@@ -48,6 +59,7 @@ from wmh.providers.tinker import (
     TINKER_API_KEY_ENV,
     SdkSampler,
     TinkerChatProvider,
+    TinkerSampler,
     TokenRecorder,
     TokenSpan,
 )
@@ -80,7 +92,28 @@ class _MiniRendering:
         lines.append("assistant:")
         return self._tok.encode("\n".join(lines))
 
+    def render_suffix(
+        self,
+        messages: list[ChatMessage],
+        delta_start: int,
+        tools: list[ChatTool] | None = None,
+        *,
+        previous_sampled_ids: list[int],
+    ) -> list[int]:
+        del tools, previous_sampled_ids
+        lines = [""]
+        for message in messages[delta_start:]:
+            content = message.content if isinstance(message.content, str) else ""
+            lines.append(f"{message.role}: {content}")
+        lines.append("assistant:")
+        return self._tok.encode("\n".join(lines))
+
     def decode(self, token_ids: list[int]) -> str:
+        return self._tok.decode(token_ids)
+
+    def decode_with_specials(self, token_ids: list[int]) -> str:
+        # The char-level fake has no special tokens to strip, so the raw
+        # decode IS the specials-preserving decode.
         return self._tok.decode(token_ids)
 
     def parse_response(self, sampled_ids: list[int]) -> ParsedAssistantMessage:
@@ -121,25 +154,6 @@ class _FlakySampler:
         return self._inner.sample(
             prompt_token_ids, max_tokens=max_tokens, temperature=temperature, stop=stop
         )
-
-
-class _DeadlineSampler:
-    """A sampler whose every sample expires, as a wedged session's would."""
-
-    def __init__(self) -> None:
-        self.calls = 0
-
-    def sample(
-        self,
-        prompt_token_ids: list[int],
-        *,
-        max_tokens: int,
-        temperature: float,
-        stop: list[str] | list[int] | None = None,
-    ) -> NoReturn:
-        del prompt_token_ids, max_tokens, temperature, stop
-        self.calls += 1
-        raise TinkerDeadlineError("sample", elapsed_s=0.05, deadline_s=0.05)
 
 
 class _StubModelInput:
@@ -267,12 +281,19 @@ def _install_stub_tinker(
     monkeypatch.setitem(
         sys.modules,
         "tinker",
-        SimpleNamespace(
-            ModelInput=_StubModelInput,
-            SamplingParams=_StubSamplingParams,
-            ServiceClient=service_factory,
+        cast(
+            "ModuleType",
+            SimpleNamespace(
+                ModelInput=_StubModelInput,
+                SamplingParams=_StubSamplingParams,
+                ServiceClient=service_factory,
+            ),
         ),
     )
+    # Give the test its own empty process-wide cache (restored afterwards); without
+    # this a stub client would leak into every later test through the shared cache.
+    monkeypatch.setattr(tinker_module, "_shared_service", None)
+    monkeypatch.setattr(tinker_module, "_shared_samplers", {})
 
 
 def _config() -> ProviderConfig:
@@ -458,6 +479,266 @@ def test_span_recorded_once_per_success_and_not_on_failure() -> None:
 
     provider.complete_chat(_request())
     assert [span.call_index for span in recorder.spans()] == [0, 1]
+
+
+class _FramedRendering(_MiniRendering):
+    """Scripted renderer with explicit per-message framing and suffix rendering.
+
+    Each message renders as `<role>content|calls=name:args</>`, the generation
+    header is `<assistant>`, and `</>` is the end-of-turn framing. Tool-call
+    arguments render VERBATIM, so a caller that echoes an assistant turn with
+    reformatted JSON spacing changes the re-rendered tokens, exactly the live
+    defect the incremental prompt construction exists to absorb.
+    """
+
+    def _segment(self, message: ChatMessage) -> str:
+        content = message.content if isinstance(message.content, str) else ""
+        calls = ""
+        if message.tool_calls:
+            calls = "|calls=" + ";".join(
+                f"{call.function.name}:{call.function.arguments}" for call in message.tool_calls
+            )
+        return f"<{message.role}>{content}{calls}</>"
+
+    def build_generation_prompt(
+        self, messages: list[ChatMessage], tools: list[ChatTool] | None = None
+    ) -> list[int]:
+        prefix = ""
+        if tools:
+            prefix = "<tools>" + ",".join(tool.function.name for tool in tools) + "</>"
+        body = "".join(self._segment(message) for message in messages)
+        return self._tok.encode(prefix + body + "<assistant>")
+
+    def render_suffix(
+        self,
+        messages: list[ChatMessage],
+        delta_start: int,
+        tools: list[ChatTool] | None = None,
+        *,
+        previous_sampled_ids: list[int],
+    ) -> list[int]:
+        del tools
+        end_of_turn = self._tok.encode("</>")
+        tokens: list[int] = []
+        if previous_sampled_ids[-len(end_of_turn) :] != end_of_turn:
+            tokens.extend(end_of_turn)
+        for message in messages[delta_start:]:
+            tokens.extend(self._tok.encode(self._segment(message)))
+        tokens.extend(self._tok.encode("<assistant>"))
+        return tokens
+
+    def parse_response(self, sampled_ids: list[int]) -> ParsedAssistantMessage:
+        text = self._tok.decode(sampled_ids)
+        stopped = text.endswith("</>")
+        return ParsedAssistantMessage(text=text.removesuffix("</>"), tool_calls=[], stopped=stopped)
+
+
+class _ScriptedSampler:
+    """Returns canned token sequences in order, recording every prompt."""
+
+    def __init__(self, texts: list[str]) -> None:
+        self._tok = FakeTokenizer()
+        self._outputs = [self._tok.encode(text) for text in texts]
+        self.prompts: list[list[int]] = []
+
+    def sample(
+        self,
+        prompt_token_ids: list[int],
+        *,
+        max_tokens: int,
+        temperature: float,
+        stop: list[str] | list[int] | None = None,
+    ) -> FakeSampledSequence:
+        del max_tokens, temperature, stop
+        self.prompts.append(list(prompt_token_ids))
+        tokens = self._outputs.pop(0)
+        return FakeSampledSequence(tokens=tokens, logprobs=[-0.5] * len(tokens), stop_reason="stop")
+
+
+def _distill_cfg() -> DistillConfig:
+    return DistillConfig(
+        student=StudentConfig(base_model="Qwen/Qwen3-8B"),
+        teacher=TeacherConfig(model="Qwen/Qwen3-32B"),
+        harbor=HarborConfig(job_template="job.yaml"),
+        rollout=RolloutConfig(),
+        train=TrainConfig(),
+    )
+
+
+def _trial(recorder: TokenRecorder) -> TrialRecord:
+    return TrialRecord(
+        task_id="task-a",
+        attempt=1,
+        trial_name="task-a__x1",
+        reward=1.0,
+        passed=True,
+        spans=recorder.spans(),
+        stop_reason="submitted",
+        artifact_dir="/tmp/jobs/task-a__x1",
+    )
+
+
+def _framed_provider(texts: list[str]) -> tuple[TinkerChatProvider, TokenRecorder]:
+    recorder = TokenRecorder()
+    provider = TinkerChatProvider(
+        _config(),
+        sampling_client=_ScriptedSampler(texts),
+        renderer=_FramedRendering(),
+        recorder=recorder,
+    )
+    return provider, recorder
+
+
+def _chat(provider: TinkerChatProvider, messages: list[ChatMessage]) -> ChatMessage:
+    response = provider.complete_chat(
+        ChatRequest(messages=messages, temperature=0.0, max_tokens=64)
+    )
+    return response.choices[0].message
+
+
+_HISTORY = [
+    ChatMessage(role="system", content="be terse"),
+    ChatMessage(role="user", content="list files"),
+]
+
+
+def _echo(arguments: str) -> ChatMessage:
+    return ChatMessage(
+        role="assistant",
+        content="ok",
+        tool_calls=[
+            ChatToolCall(id="call_0", function=ChatFunctionCall(name="bash", arguments=arguments))
+        ],
+    )
+
+
+def _tool_result(content: str) -> ChatMessage:
+    return ChatMessage.model_validate(
+        {"role": "tool", "content": content, "tool_call_id": "call_0"}
+    )
+
+
+def test_multi_turn_verbatim_echo_prompts_extend_and_merge() -> None:
+    # Regression: when the caller echoes the assistant turn verbatim, prompts
+    # are prefix-extending AND identical to a full re-render, validating that
+    # the suffix composition matches full-render framing.
+    rendering = _FramedRendering()
+    provider, recorder = _framed_provider(['ok|calls=bash:{"cmd": "ls"}</>', "done</>"])
+    _chat(provider, _HISTORY)
+    extended = [*_HISTORY, _echo('{"cmd": "ls"}'), _tool_result("a.txt b.txt")]
+    _chat(provider, extended)
+
+    first, second = recorder.spans()
+    episode = first.prompt_token_ids + first.sampled_token_ids
+    assert second.prompt_token_ids[: len(episode)] == episode
+    assert second.prompt_token_ids == rendering.build_generation_prompt(extended)
+    datums, stats = build_datums([_trial(recorder)], _distill_cfg())
+    assert len(datums) == 1
+    assert stats.fragments == 0
+    assert recorder.fallback_count == 0
+
+
+def test_reformatted_assistant_echo_still_extends_and_merges() -> None:
+    # The live defect: the agent re-serializes the assistant turn (different
+    # JSON spacing in tool_calls), so a full re-render would NOT extend the
+    # sampled tokens; the incremental prompt must still extend and merge.
+    rendering = _FramedRendering()
+    provider, recorder = _framed_provider(['ok|calls=bash:{"cmd": "ls"}</>', "done</>"])
+    _chat(provider, _HISTORY)
+    extended = [*_HISTORY, _echo('{"cmd":"ls"}'), _tool_result("a.txt b.txt")]
+    _chat(provider, extended)
+
+    first, second = recorder.spans()
+    episode = first.prompt_token_ids + first.sampled_token_ids
+    # The defect is real in this scripted world: a full re-render diverges.
+    assert rendering.build_generation_prompt(extended)[: len(episode)] != episode
+    # The fix: the incrementally built prompt still extends the token history.
+    assert second.prompt_token_ids[: len(episode)] == episode
+    datums, stats = build_datums([_trial(recorder)], _distill_cfg())
+    assert len(datums) == 1
+    assert stats.fragments == 0
+    assert stats.fragmentation_rate == 0.0
+    assert recorder.fallback_count == 0
+
+
+def test_genuine_history_edit_falls_back_and_fragments(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    rendering = _FramedRendering()
+    provider, recorder = _framed_provider(["a</>", "b</>", "c</>"])
+    _chat(provider, _HISTORY)
+    second_messages = [*_HISTORY, _echo('{"cmd":"ls"}'), _tool_result("a.txt")]
+    _chat(provider, second_messages)
+    # A changed tool-result message mid-history is a genuine edit: fall back.
+    edited = [
+        *_HISTORY,
+        _echo('{"cmd":"ls"}'),
+        _tool_result("EDITED"),
+        ChatMessage(role="assistant", content="b"),
+        _tool_result("more"),
+    ]
+    with caplog.at_level("INFO", logger="wmh.providers.tinker"):
+        _chat(provider, edited)
+
+    assert recorder.fallback_count == 1
+    assert any("incoming message 3" in record.message for record in caplog.records)
+    spans = recorder.spans()
+    # The fallback prompt is a correct full render of the edited history.
+    assert spans[2].prompt_token_ids == rendering.build_generation_prompt(edited)
+    datums, stats = build_datums([_trial(recorder)], _distill_cfg())
+    assert len(datums) == 2
+    assert stats.fragments == 1
+
+
+def test_max_tokens_truncation_gets_end_of_turn_framing() -> None:
+    tok = FakeTokenizer()
+    provider, recorder = _framed_provider(["par", "done</>"])
+    first_response = _chat(provider, _HISTORY)
+    assert first_response.content == "par"
+    extended = [
+        *_HISTORY,
+        ChatMessage(role="assistant", content="par"),
+        ChatMessage(role="user", content="continue"),
+    ]
+    _chat(provider, extended)
+
+    first, second = recorder.spans()
+    episode = first.prompt_token_ids + first.sampled_token_ids
+    assert second.prompt_token_ids[: len(episode)] == episode
+    # The suffix supplies the missing end-of-turn framing before the new message.
+    expected_suffix = tok.encode("</>" + "<user>continue</>" + "<assistant>")
+    assert second.prompt_token_ids[len(episode) :] == expected_suffix
+    datums, stats = build_datums([_trial(recorder)], _distill_cfg())
+    assert len(datums) == 1
+    assert stats.fragments == 0
+
+
+def test_re_asked_identical_history_reuses_the_exact_prompt() -> None:
+    provider, recorder = _framed_provider(["a</>", "b</>"])
+    _chat(provider, _HISTORY)
+    _chat(provider, _HISTORY)
+    first, second = recorder.spans()
+    assert second.prompt_token_ids == first.prompt_token_ids
+    assert recorder.fallback_count == 0
+
+
+def test_tool_schema_change_mid_episode_falls_back() -> None:
+    provider, recorder = _framed_provider(["a</>", "b</>"])
+    tool = ChatTool(
+        function=ChatFunctionDefinition(
+            name="bash", description="run bash", parameters={"type": "object"}
+        )
+    )
+    request = ChatRequest(messages=list(_HISTORY), temperature=0.0, max_tokens=64)
+    request.tools = [tool]
+    provider.complete_chat(request)
+    follow_up = ChatRequest(
+        messages=[*_HISTORY, ChatMessage(role="assistant", content="a"), _tool_result("out")],
+        temperature=0.0,
+        max_tokens=64,
+    )
+    provider.complete_chat(follow_up)
+    assert recorder.fallback_count == 1
 
 
 def test_complete_plain_text_uses_same_machinery() -> None:
@@ -659,8 +940,9 @@ def test_sampling_client_creation_is_bounded_by_the_connect_deadline(
 def test_expired_sample_drops_the_owned_client_so_the_next_attempt_rebuilds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # A wedged client keeps expiring; caching it would turn one expiry into an endless
-    # run of them, so the retry wrapper's next attempt must get a fresh session.
+    # A wedged client keeps expiring; leaving it in the process-wide cache would turn
+    # one expiry into an endless run of them for every user, so the retry wrapper's
+    # next attempt must get a freshly built sampling client.
     monkeypatch.setenv(env_var_for("sample"), "0.05")
     services: list[_StubService] = []
 
@@ -674,16 +956,18 @@ def test_expired_sample_drops_the_owned_client_so_the_next_attempt_rebuilds(
     for _ in range(2):
         with pytest.raises(TinkerDeadlineError, match="tinker sample timed out"):
             provider.complete_chat(_request())
-    assert [service.created for service in services] == [
-        ["tinker://run/weights/0"],
-        ["tinker://run/weights/0"],
-    ]
+    # Exactly one ServiceClient across both attempts (the session-leak rule), but two
+    # sampling clients: the wedged one was evicted from the shared cache, not reissued.
+    assert len(services) == 1
+    assert services[0].created == ["tinker://run/weights/0"] * 2
     # Each wedged client was used exactly once and then dropped, never reused.
-    assert [client.samples for service in services for client in service.clients] == [1, 1]
+    assert [client.samples for client in services[0].clients] == [1, 1]
+    assert _config().model not in tinker_module._shared_samplers
 
 
 def test_expired_ping_drops_the_owned_client(monkeypatch: pytest.MonkeyPatch) -> None:
-    # `verify()` runs the same render+sample path, so it must heal the same way.
+    # `verify()` runs the same render+sample path, so it must heal the same way: the
+    # wedged client is evicted from the shared cache and the next ping rebuilds one.
     monkeypatch.setenv(env_var_for("sample"), "0.05")
     services: list[_StubService] = []
 
@@ -698,20 +982,8 @@ def test_expired_ping_drops_the_owned_client(monkeypatch: pytest.MonkeyPatch) ->
         result = provider.verify()
         assert result.ok is False
         assert "timed out" in (result.detail or "")
-    assert len(services) == 2
-
-
-def test_injected_client_is_never_dropped(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The provider cannot rebuild a client it did not build, so an expiry must leave the
-    # injected sampler in place. Poisoning the SDK proves no rebuild is attempted: a drop
-    # would surface as ImportError on the second call instead of another expiry.
-    monkeypatch.setitem(sys.modules, "tinker", None)
-    sampler = _DeadlineSampler()
-    provider = TinkerChatProvider(_config(), sampling_client=sampler, renderer=_MiniRendering())
-    for _ in range(2):
-        with pytest.raises(TinkerDeadlineError):
-            provider.complete_chat(_request())
-    assert sampler.calls == 2
+    assert len(services) == 1
+    assert services[0].created == ["tinker://run/weights/0"] * 2
 
 
 def _module_scope_import_roots(path: Path) -> set[str]:
@@ -733,3 +1005,308 @@ def test_module_scope_never_imports_the_distill_extra() -> None:
         assert module.__file__ is not None
         roots = _module_scope_import_roots(Path(module.__file__))
         assert not roots & {"tinker", "tinker_cookbook"}, module.__name__
+
+
+# --- deadlines: wedged sessions become retryable errors with fresh clients ----------------------
+
+
+class _WedgedSampler:
+    """A sampler whose every call reports a deadline expiry (a wedged session)."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def sample(
+        self,
+        prompt_token_ids: list[int],
+        *,
+        max_tokens: int,
+        temperature: float,
+        stop: list[str] | list[int] | None = None,
+    ) -> NoReturn:
+        del prompt_token_ids, max_tokens, temperature, stop
+        self.calls += 1
+        raise TinkerDeadlineError("sample", elapsed_s=0.05, deadline_s=0.05)
+
+
+def test_sampling_deadline_drops_and_rebuilds_the_lazy_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = TokenRecorder()
+    provider = TinkerChatProvider(_config(), renderer=_MiniRendering(), recorder=recorder)
+    builds: list[TinkerSampler] = []
+
+    def build_sampler() -> TinkerSampler:
+        sampler: TinkerSampler = _WedgedSampler() if not builds else FakeSamplingClient(seed="s")
+        builds.append(sampler)
+        return sampler
+
+    monkeypatch.setattr(provider, "_build_sdk_sampler", build_sampler)
+
+    with pytest.raises(TinkerDeadlineError, match="timed out"):
+        provider.complete_chat(_request())
+    # The timed-out call recorded no span, and the retry wrapper's next
+    # attempt (simulated by calling again) builds a fresh client and succeeds.
+    assert len(recorder) == 0
+    response = provider.complete_chat(_request())
+    assert response.choices[0].message.role == "assistant"
+    assert len(builds) == 2
+    assert [span.call_index for span in recorder.spans()] == [0]
+
+
+def test_injected_sampling_client_is_never_dropped_on_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An injected client cannot be rebuilt; poison the SDK so any accidental
+    # rebuild attempt would fail loudly instead of hitting the network.
+    monkeypatch.setitem(sys.modules, "tinker", None)
+    sampler = _WedgedSampler()
+    provider = TinkerChatProvider(_config(), sampling_client=sampler, renderer=_MiniRendering())
+    for _ in range(2):
+        with pytest.raises(TinkerDeadlineError):
+            provider.complete_chat(_request())
+    assert sampler.calls == 2
+
+
+class _NeverResolvingFuture:
+    """Mimics the SDK future of a wedged session: result(timeout) honors the timeout."""
+
+    def __init__(self) -> None:
+        self._never = threading.Event()
+
+    def result(self, timeout: float | None = None) -> NoReturn:
+        self._never.wait(timeout)
+        raise TimeoutError(f"fake future gave up after {timeout}s")
+
+
+def test_sdk_sampler_bounds_the_sample_future(monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("tinker")
+    monkeypatch.setenv("WMH_TINKER_DEADLINE_SAMPLE", "0.05")
+
+    class _WedgedClient:
+        def sample(
+            self, prompt: object, num_samples: int, sampling_params: object
+        ) -> _NeverResolvingFuture:
+            del prompt, num_samples, sampling_params
+            return _NeverResolvingFuture()
+
+    sampler = SdkSampler(cast("tinker.SamplingClient", _WedgedClient()))
+    with pytest.raises(TinkerDeadlineError, match="tinker sample timed out"):
+        sampler.sample([1, 2, 3], max_tokens=4, temperature=1.0)
+
+
+# --- process-wide client sharing: the session-leak regression -----------------------------------
+
+
+@dataclass
+class _FakeSdkState:
+    """Counters the fake tinker SDK module tracks for the sharing tests.
+
+    `live_sessions` is deliberately never decremented: the real SDK's
+    heartbeat task strongly references each constructed client's holder, so
+    every construction pins a live server-side session for the rest of the
+    process. `session_cap` models the service refusing new session creation
+    with a capacity-shaped error once too many are live.
+    """
+
+    session_cap: int
+    live_sessions: int = 0
+    service_clients: int = 0
+    sampling_clients: int = 0
+    wedge_first_sampler: bool = False
+    wedge_sampler_construction: bool = False
+
+
+@dataclass(frozen=True)
+class _FakeSdkSequence:
+    tokens: list[int]
+    logprobs: list[float]
+
+
+@dataclass(frozen=True)
+class _FakeSdkSampleResult:
+    sequences: list[_FakeSdkSequence]
+
+
+class _ReadySdkFuture:
+    """A fake SDK future whose result is immediately available."""
+
+    def __init__(self, value: _FakeSdkSampleResult) -> None:
+        self._value = value
+
+    def result(self, timeout: float | None = None) -> _FakeSdkSampleResult:
+        del timeout
+        return self._value
+
+
+class _TimedOutSdkFuture:
+    """A wedged session's future: reports the timeout immediately (fast tests)."""
+
+    def result(self, timeout: float | None = None) -> NoReturn:
+        raise TimeoutError(f"fake future gave up after {timeout}s")
+
+
+class _FakeSdkSamplingClient:
+    """Just enough of `tinker.SamplingClient` for `SdkSampler` to drive."""
+
+    def __init__(self, wedged: bool) -> None:
+        self._wedged = wedged
+
+    def sample(
+        self, prompt: object, num_samples: int, sampling_params: object
+    ) -> _ReadySdkFuture | _TimedOutSdkFuture:
+        del prompt, num_samples, sampling_params
+        if self._wedged:
+            return _TimedOutSdkFuture()
+        return _ReadySdkFuture(
+            _FakeSdkSampleResult(
+                sequences=[_FakeSdkSequence(tokens=[65, 66], logprobs=[-0.1, -0.2])]
+            )
+        )
+
+    def get_tokenizer(self) -> FakeTokenizer:
+        return FakeTokenizer()
+
+
+class _FakeModelInput:
+    """Stands in for tinker.ModelInput (the provider only calls from_ints)."""
+
+    @classmethod
+    def from_ints(cls, token_ids: list[int]) -> list[int]:
+        return list(token_ids)
+
+
+class _FakeSamplingParams:
+    """Stands in for tinker.SamplingParams (constructed, never read)."""
+
+    def __init__(
+        self,
+        max_tokens: int,
+        temperature: float,
+        stop: list[str] | list[int] | None = None,
+    ) -> None:
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+        self.stop = stop
+
+
+class _FakeTinkerModule:
+    """A sys.modules-injectable stand-in for the tinker SDK module."""
+
+    ServiceClient: type
+    ModelInput: type[_FakeModelInput]
+    SamplingParams: type[_FakeSamplingParams]
+
+    def __init__(self, service_client: type) -> None:
+        self.ServiceClient = service_client
+        self.ModelInput = _FakeModelInput
+        self.SamplingParams = _FakeSamplingParams
+
+
+def _install_fake_sdk(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    session_cap: int,
+    wedge_first_sampler: bool = False,
+    wedge_sampler_construction: bool = False,
+) -> _FakeSdkState:
+    """Install a fake tinker module that meters sessions like the live outage."""
+    state = _FakeSdkState(
+        session_cap=session_cap,
+        wedge_first_sampler=wedge_first_sampler,
+        wedge_sampler_construction=wedge_sampler_construction,
+    )
+
+    class _FakeServiceClient:
+        def __init__(self) -> None:
+            state.service_clients += 1
+            state.live_sessions += 1
+
+        def create_sampling_client(
+            self, model_path: str | None = None, base_model: str | None = None
+        ) -> _FakeSdkSamplingClient:
+            assert (model_path is None) != (base_model is None)
+            if state.wedge_sampler_construction:
+                threading.Event().wait()  # a fully blocking construction, never returns
+            state.live_sessions += 1
+            if state.live_sessions > state.session_cap:
+                raise RuntimeError(
+                    "429 too many requests: session capacity exceeded "
+                    f"({state.live_sessions} live sessions, cap {state.session_cap})"
+                )
+            state.sampling_clients += 1
+            wedged = state.wedge_first_sampler and state.sampling_clients == 1
+            return _FakeSdkSamplingClient(wedged)
+
+    fake = _FakeTinkerModule(_FakeServiceClient)
+    monkeypatch.setitem(sys.modules, "tinker", cast("ModuleType", fake))
+    monkeypatch.setenv("TINKER_API_KEY", "test-key")
+    # Give the test its own empty process-wide cache (restored afterwards).
+    monkeypatch.setattr(tinker_module, "_shared_service", None)
+    monkeypatch.setattr(tinker_module, "_shared_samplers", {})
+    monkeypatch.setattr(tinker_module, "build_renderer", _stub_build_renderer)
+    return state
+
+
+def _stub_build_renderer(base_model: str, tokenizer: object) -> _MiniRendering:
+    """The cookbook renderer stub for the fake base models."""
+    del base_model, tokenizer
+    return _MiniRendering()
+
+
+def test_session_cap_regression_shares_one_service_client_across_trials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The outage: a fresh ServiceClient + sampling client per trial pinned a
+    # live session each until the service refused new session creation with
+    # capacity errors (~240 cumulative). M >> N per-trial providers must all
+    # succeed because the SDK clients are shared process-wide.
+    state = _install_fake_sdk(monkeypatch, session_cap=5)
+    weights_config = _config()
+    base_config = ProviderConfig(kind=ProviderKind.TINKER, model="Qwen/Qwen3-8B")
+
+    for trial in range(40):
+        provider = get_provider(weights_config if trial % 2 == 0 else base_config)
+        assert isinstance(provider, TinkerChatProvider)
+        response = provider.complete_chat(_request())
+        assert response.choices[0].message.role == "assistant"
+
+    assert state.service_clients == 1
+    # Live sessions are bounded by distinct model strings, not by trial count:
+    # the one service client plus one sampling client per model.
+    assert state.sampling_clients == 2
+    assert state.live_sessions == 1 + 2
+
+
+def test_deadline_evicts_the_shared_cache_so_every_user_heals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _install_fake_sdk(monkeypatch, session_cap=100, wedge_first_sampler=True)
+
+    first = TinkerChatProvider(_config())
+    with pytest.raises(TinkerDeadlineError, match="timed out"):
+        first.complete_chat(_request())
+    # The wedged client was EVICTED from the shared cache (not merely dropped
+    # from this provider), so a different provider builds a fresh session
+    # instead of inheriting the wedged one.
+    assert _config().model not in tinker_module._shared_samplers
+    second = TinkerChatProvider(_config())
+    assert second.complete_chat(_request()).choices[0].message.role == "assistant"
+    assert state.sampling_clients == 2
+    # The first provider's next attempt heals through the same fresh client.
+    assert first.complete_chat(_request()).choices[0].message.role == "assistant"
+    assert state.sampling_clients == 2  # reused from the cache, not rebuilt again
+    assert state.service_clients == 1
+
+
+def test_shared_sampling_client_construction_is_deadline_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_sdk(monkeypatch, session_cap=100, wedge_sampler_construction=True)
+    monkeypatch.setenv("WMH_TINKER_DEADLINE_CONNECT", "0.05")
+
+    with pytest.raises(TinkerDeadlineError, match="tinker connect timed out"):
+        tinker_module.shared_sampling_client("tinker://run/weights/0")
+    # Nothing was cached, so a later attempt rebuilds instead of returning a
+    # half-constructed entry.
+    assert "tinker://run/weights/0" not in tinker_module._shared_samplers
