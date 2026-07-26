@@ -7,6 +7,7 @@ from wmo.engine.build import (
     DEFAULT_TRAIN_SPLIT,
     build,
     ingest,
+    split_holdout,
     split_traces,
     split_traces_3way,
 )
@@ -20,6 +21,7 @@ __all__ = [
     "DEFAULT_TRAIN_SPLIT",
     "build",
     "ingest",
+    "split_holdout",
     "split_traces",
     "split_traces_3way",
     "DemoReplay",
