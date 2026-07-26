@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 from typing import Literal
@@ -19,6 +20,7 @@ from wmo.optimize.policy import (
     knn_decision,
     rank_decision,
     select_model,
+    write_artifact_atomically,
 )
 from wmo.providers.base import ProviderKind
 from wmo.providers.openrouter_pricing import CATALOG_PATH_ENV, PriceCatalog
@@ -207,6 +209,86 @@ def test_openrouter_candidate_keeps_the_price_it_was_fitted_under(
     assert select_model(served, "anything").model == "or-glm"
     assert served.pool[1].price().input_per_mtok == 0.4
     assert served.pool[1].price().output_per_mtok == 1.75
+
+
+def test_a_failed_policy_save_leaves_the_previous_artifact_intact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Serving reads the artifact dir while the optimizer writes it: no torn policy.json."""
+    path = tmp_path / "policy.json"
+    _rank_policy().save(path)
+    served = RoutingPolicy.load(path)
+
+    def _die(self: Path, data: bytes) -> int:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(Path, "write_bytes", _die)
+    with pytest.raises(OSError, match="disk full"):
+        _static().save(path)
+    assert RoutingPolicy.load(path) == served  # the staged write never replaced it
+    assert [entry.name for entry in tmp_path.iterdir()] == ["policy.json"]  # no staging litter
+
+
+def test_interleaved_artifact_writes_do_not_share_a_staging_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two writers mid-flight on one path must not stage through the same file.
+
+    Regression: the staging name was a fixed `<name>.partial`, so a second writer overwrote the
+    first's staged bytes before the first renamed. One save then published the OTHER's payload
+    under its own success message, and the loser failed on a file already renamed away.
+
+    The second write is driven to completion inside the first one's `replace`, which is the
+    interleaving that breaks a shared staging path, without depending on thread timing.
+    """
+    path = tmp_path / "policy.json"
+    staged: list[Path] = []
+    real_replace = Path.replace
+
+    def _replace(self: Path, target: Path) -> Path:
+        staged.append(self)
+        if len(staged) == 1:  # the first writer is mid-flight: run the second start to finish
+            write_artifact_atomically(path, b'{"second": true}')
+        return real_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", _replace)
+    write_artifact_atomically(path, b'{"first": true}')
+
+    assert len({entry.name for entry in staged}) == 2  # two writers, two staging files
+    # The first writer renamed last, so its own bytes are what landed -- not the second's.
+    assert path.read_bytes() == b'{"first": true}'
+    assert [entry.name for entry in tmp_path.iterdir()] == ["policy.json"]
+
+
+def test_interleaved_bank_writes_do_not_share_a_staging_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two fits racing on one `--out` derive one bank path; they must not stage through one file.
+
+    Regression: `KnnBank.save` staged through a fixed `<bank>.partial`, so one fit could publish
+    the OTHER fit's evidence under its own bank name while the loser raised `FileNotFoundError`.
+    A policy serving a competing fit's rewards is the failure this whole change is about, and
+    the derived bank name does not prevent it when both fits target the same policy path.
+    """
+    path = tmp_path / "bank.npz"
+    mine = _knn_bank([[1.0, 0.0]] * 12)  # fable-5 wins every neighbor
+    theirs = _knn_bank([[0.0, 1.0]] * 12)  # ...and haiku-4-5 wins every neighbor
+    staged: list[Path] = []
+    real_replace = Path.replace
+
+    def _replace(self: Path, target: Path) -> Path:
+        staged.append(self)
+        if len(staged) == 1:  # this fit is mid-flight: run the competing one start to finish
+            theirs.save(path)
+        return real_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", _replace)
+    mine.save(path)
+
+    assert len({entry.name for entry in staged}) == 2  # two fits, two staging files
+    # The bank that renamed last is the one on disk, with ITS rewards, not the competitor's.
+    assert np.array_equal(KnnBank.load(path).rewards, mine.rewards)
+    assert [entry.name for entry in tmp_path.iterdir()] == ["bank.npz"]
 
 
 def test_azure_embedder_spec_requires_backend_fields() -> None:
@@ -550,6 +632,23 @@ def test_knn_bank_loads_lazily_from_the_sidecar_and_stays_cached(tmp_path: Path)
     # Cached after the first decision: the sidecar is read once per policy instance, not per
     # request (a 3072-dimensional bank is megabytes).
     (tmp_path / KNN_BANK_FILENAME).unlink()
+    assert select_model(loaded, "anything", embedder=_UnitEmbedder()).model == "haiku-4-5"
+
+
+def test_knn_bank_path_falls_back_to_the_legacy_sidecar_name(tmp_path: Path) -> None:
+    """A policy artifact that records no bank path still resolves the conventional sidecar.
+
+    Backward compatibility: policies fitted before the bank name was derived from the policy
+    file live beside `policy_knn_bank.npz`, and hand-built artifacts may omit the field.
+    """
+    bank = _knn_bank([[0.0, 1.0]] * 12)
+    bank.save(tmp_path / KNN_BANK_FILENAME)
+    document = _knn_policy(bank).model_dump(mode="json")
+    document.pop("knn_bank_path")
+    (tmp_path / "policy.json").write_text(json.dumps(document), encoding="utf-8")
+
+    loaded = RoutingPolicy.load(tmp_path / "policy.json")
+    assert loaded.bank_path() == tmp_path / KNN_BANK_FILENAME
     assert select_model(loaded, "anything", embedder=_UnitEmbedder()).model == "haiku-4-5"
 
 

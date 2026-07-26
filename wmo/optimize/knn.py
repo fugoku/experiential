@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -275,7 +276,33 @@ COST_QUALITY_DEFAULT_FLOOR_Q = 0.05  # the shipped novelty floor
 # ran past the turn would sell an operator a worse policy on both axes.
 COST_QUALITY_MAX_LAM = 0.03
 
+# What `apply_cost_quality` appends to `fitted_from` to record the dial position. Sliding is
+# absolute, so the suffix is rewritten (never stacked) and `fit_provenance` strips it back off.
+COST_QUALITY_PROVENANCE_MARK = " | cost_quality="
+
+# The WHOLE trailer that mark introduces, anchored to the end of the string. `fit_provenance`
+# matches this shape rather than searching for the mark alone, because the mark can also occur
+# inside the fit half: `fitted_from` opens with an operator-supplied matrix path, and splitting
+# on the first occurrence of a substring that path contains would throw away the digest and
+# every fit flag after it, collapsing two unrelated fits onto one identity. The fit flags always
+# follow the path, so an occurrence inside the path is never at the end and never matches here.
+_DIAL_SUFFIX = re.compile(
+    re.escape(COST_QUALITY_PROVENANCE_MARK) + r"[\d.eE+-]+ "
+    r"\(floor_q=[\d.eE+-]+, lam=[\d.eE+-]+, guard=(?:symmetric|asymmetric)\)$"
+)
+
 CostQualityPointName = str
+
+
+def fit_provenance(policy: RoutingPolicy) -> str:
+    """The fit a policy came from, with any dial suffix stripped off.
+
+    `fitted_from` records the outcome matrix and fit parameters, and `apply_cost_quality`
+    appends the dial position to it. This returns the fit half alone, which is the identity two
+    artifacts must share to be the same fit at different dial positions: a tuned policy and the
+    as-fitted snapshot it was dialed from agree here, a refit does not.
+    """
+    return _DIAL_SUFFIX.sub("", policy.fitted_from or "unknown")
 
 
 class CostQualityKnobs(BaseModel):
@@ -447,7 +474,7 @@ def apply_cost_quality(policy: RoutingPolicy, cost_quality: float) -> RoutingPol
     bank = policy.knn_bank()
     # Absolute, not relative: the knobs come from the dial alone, so re-applying any setting to
     # an already-slid policy lands on the same artifact instead of compounding.
-    provenance = (policy.fitted_from or "unknown").split(" | cost_quality=")[0]
+    provenance = fit_provenance(policy)
     adjusted = policy.model_copy(
         update={
             "knn_z": knobs.knn_z,
@@ -457,7 +484,7 @@ def apply_cost_quality(policy: RoutingPolicy, cost_quality: float) -> RoutingPol
             "guard_mode": knobs.guard_mode,
             "cost_quality": cost_quality,
             "fitted_from": (
-                f"{provenance} | cost_quality={cost_quality:g} "
+                f"{provenance}{COST_QUALITY_PROVENANCE_MARK}{cost_quality:g} "
                 f"(floor_q={knobs.floor_q:g}, lam={knobs.pick_lam:g}, guard={knobs.guard_mode})"
             ),
         }

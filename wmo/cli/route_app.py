@@ -20,6 +20,7 @@ customer copy never says router.
 
 from __future__ import annotations
 
+import hashlib
 import itertools
 import os
 from collections import Counter
@@ -50,13 +51,15 @@ from wmo.optimize.knn import (
     cost_quality_knobs,
     cost_quality_named_point,
     fit_knn_policy,
+    fit_provenance,
 )
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.optimize.policy import (
-    KNN_BANK_FILENAME,
     POLICY_FILENAME,
     EmbedderSpec,
     RoutingPolicy,
+    knn_bank_path_for,
+    write_artifact_atomically,
 )
 from wmo.optimize.report import build_report
 from wmo.optimize.routing import evaluate_policy, fit_rank_policy, rerank_policy
@@ -746,6 +749,49 @@ def _confirm_cost(*, yes: bool) -> None:
         raise typer.Exit(0)
 
 
+# Provenance carries a digest of the matrix, not just its path: a corpus is routinely rebuilt in
+# place under the same filename, and a fit is identified by the data it saw. 16 hex characters
+# is 64 bits, far past collision risk for the handful of matrices one artifact directory sees.
+_MATRIX_DIGEST_CHARS = 16
+
+
+def _load_matrix(matrix_file: str) -> tuple[OutcomeMatrix, str]:
+    """The outcome matrix and its `<path> sha256=<digest>` provenance, from ONE read of the file.
+
+    The digest is what makes `fitted_from` an identity rather than a label. `tune` compares it
+    against the as-fitted snapshot beside a policy, and two fits of the same path with different
+    contents (or the same contents at two paths) have to come out different for that check to
+    protect anything.
+
+    Both come out of the same bytes on purpose. Digesting a SECOND read would let a corpus
+    rebuilt in place between the two describe the fit as having seen bytes it never saw: the
+    policy would be fitted from the old matrix and stamped with the new one's digest, so the
+    next fit of that new matrix would match its provenance and `tune` would accept the
+    superseded snapshot -- the exact failure the digest exists to catch, reintroduced by
+    reading twice.
+    """
+    payload = Path(matrix_file).read_bytes()
+    digest = hashlib.sha256(payload).hexdigest()
+    return (
+        OutcomeMatrix.model_validate_json(payload),
+        f"{matrix_file} sha256={digest[:_MATRIX_DIGEST_CHARS]}",
+    )
+
+
+def _embedder_provenance(spec: EmbedderSpec) -> str:
+    """The embedding-function half of `fitted_from`, taken from the spec serving rebuilds.
+
+    Derived from `EmbedderSpec` rather than from the flags, so it cannot describe an embedder
+    different from the one recorded in the artifact. The azure RESOURCE is part of the identity
+    and not just the deployment name: two accounts routinely hold a deployment of the same name
+    and dimension, their embeddings are not interchangeable, and a refit that only repointed
+    `--endpoint` therefore has to read as a different fit. The credential variable is left out
+    on purpose -- renaming it does not move a single vector.
+    """
+    tag = f"{spec.kind}-{spec.dim}"
+    return tag if spec.kind == "hashing" else f"{tag}/{spec.deployment}@{spec.endpoint}"
+
+
 @route_app.command("student")
 def student(
     card_dir: str = typer.Argument(
@@ -985,7 +1031,7 @@ def fit(
     """Fit a routing policy on an outcome matrix (kNN evidence or Avengers cluster ranks)."""
     if kind not in ("rank", "knn"):
         raise typer.BadParameter(f"unknown kind '{kind}'; use knn or rank")
-    matrix = OutcomeMatrix.load(Path(matrix_file))
+    matrix, source = _load_matrix(matrix_file)
     if embedder not in ("hashing", "azure"):
         raise typer.BadParameter(f"unknown embedder '{embedder}'; use hashing or azure")
     spec = (
@@ -1005,6 +1051,7 @@ def fit(
         # writes a sidecar it will then abandon.
         raise typer.BadParameter("--rag-thres must be greater than 0")
     built = spec.build()  # ONE embedder for fit and evaluation; azure would otherwise embed twice
+    embed_tag = _embedder_provenance(spec)
     if kind == "knn":
         if cost_weight > 0.0:
             raise typer.BadParameter(
@@ -1012,10 +1059,12 @@ def fit(
                 "policy trades cost through its dial instead: fit it, then "
                 "`wmo optimize route tune <policy.json> --cost-quality <0..1>`"
             )
-        # The sidecar goes beside the policy file: that is where serving resolves it from.
+        # The sidecar is named after --out and beside it, and the fit records that name in the
+        # policy JSON: serving then resolves THIS policy's evidence explicitly, so a second knn
+        # fit into the same directory gets its own bank instead of overwriting this one's.
         policy = fit_knn_policy(
             matrix,
-            bank_path=out_path.parent / KNN_BANK_FILENAME,
+            bank_path=knn_bank_path_for(out_path),
             embedder=spec,
             embed_with=built,
             guard_model=fallback,
@@ -1025,7 +1074,11 @@ def fit(
             min_pairs=min_pairs,
             se_floor=se_floor,
             floor_q=floor_q,
-            fitted_from=f"{matrix_file} knn z={z} k={rag_num} q={floor_q} {embedder}-{dim}",
+            fitted_from=(
+                f"{source} knn fallback={fallback or 'auto'} z={z:g} k={rag_num} "
+                f"thres={rag_thres:g} pairs={min_pairs} se_floor={se_floor} q={floor_q:g} "
+                f"{embed_tag}"
+            ),
         )
     else:
         policy = fit_rank_policy(
@@ -1035,7 +1088,10 @@ def fit(
             seed=seed,
             top_k_clusters=top_k_clusters,
             beta=beta,
-            fitted_from=f"{matrix_file} seed={seed} k={clusters} {embedder}-{dim}",
+            fitted_from=(
+                f"{source} rank seed={seed} k={clusters} topk={top_k_clusters} beta={beta:g} "
+                f"cost_weight={cost_weight:g} {embed_tag}"
+            ),
         )
         if cost_weight > 0.0:
             policy = rerank_policy(policy, cost_weight=cost_weight)
@@ -1045,8 +1101,7 @@ def fit(
         routed = 1.0 - result.model_mix.get(policy.default_model, 0.0)
         _console.print(
             f"[green]✓[/green] fitted knn policy over {result.scenarios} scenarios -> {out}\n"
-            f"  bank {out_path.parent / KNN_BANK_FILENAME}, fallback {policy.default_model}, "
-            f"z={z}\n"
+            f"  bank {policy.bank_path()}, fallback {policy.default_model}, z={z}\n"
             f"  routed away from the fallback {routed:.1%} of the time; cost/scenario "
             f"${result.cost_per_scenario:.5f}\n"
             f"  fit-set accuracy {result.accuracy:.4f} is IN-SAMPLE (every request retrieves its "
@@ -1161,11 +1216,16 @@ def tune(
     """Set a fitted policy's cost/quality dial in place, without refitting anything.
 
     The dial maps to the policy's knobs along the measured frontier (see
-    `wmo.optimize.knn.apply_cost_quality`). The first run copies the un-tuned artifact to
-    `policy.base.json` and every later run re-reads THAT, so the dial is always applied to the
+    `wmo.optimize.knn.apply_cost_quality`). The first successful run copies the un-tuned artifact
+    to `policy.base.json` and every later run re-reads THAT, so the dial is always applied to the
     policy as fitted and sliding twice never compounds:
 
         wmo optimize route tune models/support/policy.json --cost-quality 0.6
+
+    That snapshot is only a valid baseline for the fit it came from, so this command refuses to
+    run when the two disagree (refit the policy and the stale snapshot must be deleted, not
+    silently dialed back over the new fit). A tune that is rejected writes nothing at all, and
+    every write it does make is atomic.
 
     The evidence bank is untouched, so this is instant. A served endpoint can be dialed without
     touching files at all: `PUT /v1/endpoints/{name}/config`.
@@ -1173,16 +1233,35 @@ def tune(
     path = Path(policy_file)
     if not path.is_file():
         raise typer.BadParameter(f"no policy file at {path}")
+    policy = RoutingPolicy.load(path)
     base_path = path.with_name(f"{path.stem}.base{path.suffix}")
-    if not base_path.is_file():
-        # Preserve the artifact as fitted the first time, so `tune` is always re-appliable from
-        # the fit and never from an already-slid copy of itself.
-        base_path.write_bytes(path.read_bytes())
-    base = RoutingPolicy.load(base_path)
+    as_fitted = RoutingPolicy.load(base_path) if base_path.is_file() else None
+    if as_fitted is not None and (as_fitted.kind, fit_provenance(as_fitted)) != (
+        policy.kind,
+        fit_provenance(policy),
+    ):
+        # `fit` overwrites the policy without touching this snapshot, so a refit leaves one
+        # behind that describes a policy that no longer exists. Dialing it would report success
+        # while replacing the new fit with a slid copy of the superseded one.
+        raise typer.BadParameter(
+            f"{base_path} is the as-fitted snapshot of a different fit than {path}: the "
+            f"snapshot holds kind='{as_fitted.kind}' from '{fit_provenance(as_fitted)}', the "
+            f"policy holds kind='{policy.kind}' from '{fit_provenance(policy)}'. Tuning it "
+            f"would overwrite the current fit with a dialed copy of the old one. Delete "
+            f"{base_path} to re-baseline the dial on the fit that is on disk now."
+        )
     try:
-        tuned = apply_cost_quality(base, cost_quality)
+        tuned = apply_cost_quality(policy if as_fitted is None else as_fitted, cost_quality)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
+    if as_fitted is None:
+        # Preserve the artifact as fitted, so `tune` is always re-appliable from the fit and
+        # never from an already-slid copy of itself. Written only now that the dial has applied:
+        # a snapshot left behind by a REJECTED tune would poison the path for the next fit.
+        # Both writes are atomic, so the only interruption that leaves a snapshot behind is one
+        # where the policy is still the as-fitted bytes the snapshot copied, which is consistent
+        # rather than stale.
+        write_artifact_atomically(base_path, path.read_bytes())
     tuned.save(path)
     knobs = cost_quality_knobs(cost_quality)
     _console.print(
