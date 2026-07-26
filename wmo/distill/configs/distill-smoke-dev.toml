@@ -9,7 +9,7 @@ backend = "tinker"
 model = "Qwen/Qwen3.5-9B"
 
 [harbor]
-job_template = ".agents/distill/tb2-harbor-job-template.yaml"
+job_template = "wmo/distill/configs/tb2-harbor-job-template.yaml"
 backend = "local"
 reward_key = "reward"
 

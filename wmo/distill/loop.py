@@ -86,7 +86,7 @@ from llm_waterfall.types import ChatMessage
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from wmo.config.store import validate_name
-from wmo.distill.config import DistillConfig, PricingConfig
+from wmo.distill.config import DistillConfig, PricingConfig, TeacherConfig
 from wmo.distill.cost import (
     METER_NAMES,
     BudgetExhausted,
@@ -221,6 +221,13 @@ WARMUP_ROLLOUTS_DIR = "warmup-rollouts"
 TEACHER_BASELINE_EVAL = "baseline-teacher"
 STUDENT_BEFORE_EVAL = "baseline-student-before"
 STUDENT_AFTER_EVAL = "student-after"
+
+DEFAULT_DISTILL_HARNESS = "pi"
+"""`wmo optimize model run --harness` default: the built-in pi agent document.
+
+Lives here rather than in the CLI because `resume_command` must know when the
+flag can be omitted, and the loop may not import the CLI.
+"""
 
 DistillPhase = Literal[
     "preflight", "baseline", "warmup", "rollouts", "training", "eval", "finalize", "gate"
@@ -1506,14 +1513,16 @@ def tito_recompute_check(
 def resume_command(name: str, run_dir: Path) -> str:
     """The CLI command that resumes a distillation run.
 
-    The CLI layer (`wmo/cli/harness_distill.py`) reuses this helper so the
-    command printed on a budget abort stays the command that actually works.
-    On resume the run's pinned config is the `config.toml` snapshot inside
-    the run dir. `name` must be the agent string as the user typed it (an
-    @ref included) or the printed command trips the CLI resume conflict
-    check.
+    The CLI layer (`wmo/cli/model_app.py`) reuses this helper so the command
+    printed on a budget abort stays the command that actually works. On resume
+    the run's pinned config is the `config.toml` snapshot inside the run dir.
+    `name` must be the `--harness` string as the user typed it (an @ref
+    included) or the printed command trips the CLI resume conflict check; at
+    the option's default the flag is omitted, because a resume that does not
+    type it adopts the recorded value.
     """
-    return f"wmo optimize harness {name} harbor --mode distill --run-dir {run_dir} --resume"
+    harness = "" if name == DEFAULT_DISTILL_HARNESS else f" --harness {name}"
+    return f"wmo optimize model run{harness} --run-dir {run_dir} --resume"
 
 
 def pin_rollout_params(harness: HarnessDoc, cfg: DistillConfig) -> HarnessDoc:
@@ -1734,6 +1743,43 @@ class _RunBudget:
         return self._meter.lines()
 
 
+UNWIRED_TEACHER_BACKEND = (
+    'teacher.backend = "openai_compat" (chunk alignment) validates but is not wired up on '
+    "this build: the byte-aligned chunk scorer in wmo.distill.xtoken has no caller yet, so "
+    "the loop would score this teacher through Tinker with same-tokenizer alignment and "
+    'ignore teacher.endpoint entirely. Set teacher.backend = "tinker" with a '
+    "Tinker-lineup teacher that shares the student's tokenizer (dropping teacher.endpoint, "
+    "teacher.tokenizer, and teacher.alignment), or wait for the cross-tokenizer change that "
+    "activates the openai_compat path."
+)
+"""Why a schema-valid `openai_compat` teacher still cannot run (see `_require_wired_teacher`)."""
+
+
+def _require_wired_teacher(teacher: TeacherConfig) -> None:
+    """Refuse a teacher backend this build validates but cannot execute.
+
+    `TeacherConfig` deliberately still accepts `openai_compat` plus chunk
+    alignment, so the cross-tokenizer change can land against an unchanged
+    schema. Nothing consumes it yet, and the failure it would otherwise
+    produce is silent rather than loud: `TinkerTeacher` never reads
+    `backend`, so a config naming a vLLM endpoint would be served from Tinker
+    under the wrong alignment and the resulting logprobs would be garbage
+    against tokens they do not correspond to. This is the fence that turns
+    that into an error at run start, before any rollout is paid for.
+
+    Args:
+        teacher: The run's validated teacher section.
+
+    Raises:
+        NotImplementedError: If `teacher.backend` is not `tinker`.
+    """
+    match teacher.backend:
+        case "tinker":
+            return
+        case "openai_compat":
+            raise NotImplementedError(UNWIRED_TEACHER_BACKEND)
+
+
 class _DistillRun:
     """One orchestrated distillation run; `run_distillation` drives it."""
 
@@ -1768,6 +1814,9 @@ class _DistillRun:
         self._live_trial_preflight = live_trial_preflight
         self._tracker = tracker
         self._store = DistillRunStore(run_dir)
+        # Before the run dir, the service client, or any rollout: a teacher backend
+        # this build cannot serve must fail at run start, not after paid rollouts.
+        _require_wired_teacher(cfg.teacher)
         self._teacher_identity = cfg.teacher.checkpoint or cfg.teacher.model
         # Set by _preflight (the renderer needs the training client's tokenizer);
         # kept for sample-rollout logging across every later batch.
@@ -2335,6 +2384,50 @@ class _DistillRun:
             teacher_metered=teacher_metered,
             completed_step=completed_step,
         )
+
+    def _gate_baselines(self, *, reuse: bool) -> tuple[DistillEvalReport, DistillEvalReport]:
+        """The gate's two reference reports: teacher-in-harness and student-before.
+
+        Both the up-front path in `execute` and the deferred path in `_finalize`
+        need exactly this pair, measured over the holdout at `gate.k` with the
+        same metering and import fields, so they share one definition rather
+        than two copies that can drift apart. Only `reuse` differs between the
+        callers: up front it tracks whether this session is a resume, while the
+        deferred path always reuses, because reaching `_finalize` means the
+        training this session would otherwise redo is already paid for.
+
+        Args:
+            reuse: Whether a report already recorded under this run's `evals/`
+                satisfies the request without re-importing or re-measuring.
+
+        Returns:
+            The teacher baseline report and the student-before report.
+        """
+        cfg = self._cfg
+        teacher_report = self._eval_or_load(
+            TEACHER_BASELINE_EVAL,
+            self._holdout_ids,
+            cfg.gate.k,
+            self._teacher_provider(),
+            phase="baseline",
+            teacher_metered=True,
+            reuse=reuse,
+            pin_provider=True,
+            baseline_from=cfg.eval.teacher_baseline_from,
+            baseline_from_field="eval.teacher_baseline_from",
+        )
+        before_report = self._eval_or_load(
+            STUDENT_BEFORE_EVAL,
+            self._holdout_ids,
+            cfg.gate.k,
+            self._student_provider(),
+            phase="baseline",
+            teacher_metered=False,
+            reuse=reuse,
+            baseline_from=cfg.eval.student_baseline_from,
+            baseline_from_field="eval.student_baseline_from",
+        )
+        return teacher_report, before_report
 
     def _await_deferred_baselines(self) -> None:
         """Block until every configured deferred baseline file exists, or time out.
@@ -3194,29 +3287,7 @@ class _DistillRun:
                 self._train_step(step)
             return self._finalize(None, None)
 
-        teacher_report = self._eval_or_load(
-            TEACHER_BASELINE_EVAL,
-            self._holdout_ids,
-            cfg.gate.k,
-            self._teacher_provider(),
-            phase="baseline",
-            teacher_metered=True,
-            reuse=resume,
-            pin_provider=True,
-            baseline_from=cfg.eval.teacher_baseline_from,
-            baseline_from_field="eval.teacher_baseline_from",
-        )
-        before_report = self._eval_or_load(
-            STUDENT_BEFORE_EVAL,
-            self._holdout_ids,
-            cfg.gate.k,
-            self._student_provider(),
-            phase="baseline",
-            teacher_metered=False,
-            reuse=resume,
-            baseline_from=cfg.eval.student_baseline_from,
-            baseline_from_field="eval.student_baseline_from",
-        )
+        teacher_report, before_report = self._gate_baselines(reuse=resume)
 
         if cfg.warmup.steps > 0:
             if warmup_record is not None:
@@ -3269,29 +3340,7 @@ class _DistillRun:
             # re-measure, and no second harbor job ever runs beside the training one.
             self._emit("baseline", "measuring deferred gate baselines after training")
             self._await_deferred_baselines()
-            teacher_report = self._eval_or_load(
-                TEACHER_BASELINE_EVAL,
-                self._holdout_ids,
-                cfg.gate.k,
-                self._teacher_provider(),
-                phase="baseline",
-                teacher_metered=True,
-                reuse=True,
-                pin_provider=True,
-                baseline_from=cfg.eval.teacher_baseline_from,
-                baseline_from_field="eval.teacher_baseline_from",
-            )
-            before_report = self._eval_or_load(
-                STUDENT_BEFORE_EVAL,
-                self._holdout_ids,
-                cfg.gate.k,
-                self._student_provider(),
-                phase="baseline",
-                teacher_metered=False,
-                reuse=True,
-                baseline_from=cfg.eval.student_baseline_from,
-                baseline_from_field="eval.student_baseline_from",
-            )
+            teacher_report, before_report = self._gate_baselines(reuse=True)
         # Reuse a recorded student-after report on resume: a budget abort inside
         # a prior session's finalize already paid for it, and the resumed weights
         # restore the same final checkpoint it measured.
@@ -3445,6 +3494,9 @@ def run_distillation(
             wandb tracking enabled without credentials.
         RuntimeError: On preflight failures (each message says what to fix),
             or resume with nothing to resume.
+        NotImplementedError: If `cfg.teacher.backend` is a backend this build
+            validates but cannot serve (see `_require_wired_teacher`); raised
+            at run start, before any rollout is paid for.
         ImportError: If no service client is injected and the tinker SDK is
             not installed, or wandb tracking is enabled without the wandb SDK.
         DistillBudgetError: When `budget.max_usd` is exhausted; state is
