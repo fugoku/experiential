@@ -1,8 +1,8 @@
 # World Model Optimizer
 
-`wmo` is an open-source project for running and building continuously improving agents. It
-includes a flexible agent runtime, a world model that simulates tool calls, and an optimizer that
-builds task-specific harnesses for stronger performance at lower cost.
+`wmo` turns agent traces you already collect into continuous improvement. Start with a model
+endpoint at frontier quality with 40%+ lower cost. Keep improving it with world model simulations,
+meta-harness optimization, and model distillation.
 
 ![World model, runtime agent, and optimizer connected in a continuous improvement loop](assets/world-model-agent-loop.svg)
 
@@ -14,27 +14,42 @@ builds task-specific harnesses for stronger performance at lower cost.
 
 ## Getting started
 
-### Local setup
-
-Install WMO, choose the model provider for the built-in runtime agent, and start a local run:
+**1. Register your providers.**
 
 ```bash
 pip install world-model-optimizer
 wmo providers set
-wmo run --task "Inspect this repository and explain it"
 ```
 
-Build a named world model from collected traces:
+**2. Tune a router on your OTel traces.**
 
 ```bash
-wmo build --file traces.jsonl --name my-environment
+wmo build --file traces.jsonl --name my-endpoint
+
+# Score every registered model on held-out tasks from your traces
+wmo optimize route sweep my-endpoint --traces traces.otel.jsonl
+
+# Turn those measurements into a routing policy
+wmo optimize route fit matrix.json --kind knn \
+  --out .wmo/models/my-endpoint/policy.json
 ```
 
-Then optimize an agent harness against that model and a set of tasks:
+**3. Serve it.**
 
 ```bash
-wmo optimize harness my-agent my-environment --tasks tasks.jsonl
+wmo serve --name my-endpoint
 ```
+
+See what it bought you against the model you were using before:
+
+```bash
+wmo optimize route report matrix.json .wmo/models/my-endpoint/policy.json \
+  --baseline gpt-5.5
+```
+
+Distill your own small model into the pool with [`wmo optimize model`](wmo/distill/README.md),
+serve a single model with no routing via `wmo optimize route pin`, or build an optimized harness
+for your agent with `wmo optimize harness`.
 
 ### Hosted platform
 
@@ -64,6 +79,9 @@ wmo optimize harness my-agent my-environment --tasks tasks.jsonl --backend e2b
 
 ## Use a world model as an API
 
+`world-model-optimizer` includes world models that can be used to simulate your agent environment
+for testing and optimization.
+
 ```python
 from wmo import Action, ActionKind
 from wmo.config.store import WorldModelStore
@@ -78,7 +96,8 @@ obs = wm.step(session.id, Action(kind=ActionKind.TOOL_CALL, name="add_to_cart",
 print(obs.content)
 ```
 
-Or over HTTP (same code path), namespaced by model name: `GET /world_models`, then `POST /world_models/{name}/sessions` and `POST /world_models/{name}/sessions/{id}/step`.
+Or over HTTP (same code path), namespaced by model name: `GET /world_models`, then `POST
+/world_models/{name}/sessions` and `POST /world_models/{name}/sessions/{id}/step`.
 
 ## Run after platform login
 
@@ -132,7 +151,8 @@ uv run pytest -q         # tests
 ## Usage telemetry
 
 `wmo` uses anonymous usage telemetry to track the volume of usage.
-Telemetry is strictly metadata. It never includes prompts, traces, actions, observations, file paths,
+Telemetry is strictly metadata. It never includes prompts, traces, actions, observations, file
+paths,
 model names, provider credentials, or raw user content.
 
 Telemetry is enabled by default. To opt out for a project:
