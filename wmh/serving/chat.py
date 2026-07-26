@@ -15,6 +15,12 @@ Request log: one JSONL row per call with the D-SERVING-LOG fields (id, ts, endpo
 model, cluster, tokens incl. cached, cache-adjusted cost, latency, ttfb, status, reason).
 Provider cache CONTROLS (breakpoint placement, TTL) are not exposed yet; they land with the
 cache-aware routing model.
+
+The endpoint's operator surface lives here too, deliberately outside the OpenAI routes so a
+customer's OpenAI client sees exactly what it saw before: `GET`/`PUT /v1/endpoints/{name}/config`
+reads and moves the cost/quality dial (`wmh.optimize.knn.apply_cost_quality`) on the live runtime
+with no restart and no refit, and `GET /v1/endpoints/{name}/savings` totals what the endpoint has
+saved so far out of the request log (`wmh.serving.savings`).
 """
 
 from __future__ import annotations
@@ -36,6 +42,12 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, JsonValue, field_validator
 from starlette.background import BackgroundTask
 
+from wmh.optimize.knn import (
+    COST_QUALITY_ANCHORS,
+    CostQualityAnchor,
+    apply_cost_quality,
+    cost_quality_named_point,
+)
 from wmh.optimize.policy import Embedder, RoutingDecision, RoutingPolicy, select_model
 from wmh.providers.base import (
     DEFAULT_MAX_TOKENS,
@@ -45,6 +57,8 @@ from wmh.providers.base import (
     TokenUsage,
 )
 from wmh.providers.pool import PoolEntry, pool_provider
+from wmh.serving.endpoint_config import EndpointConfig
+from wmh.serving.savings import EndpointSavings, SavingsWindow, compute_savings
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping
@@ -55,6 +69,7 @@ logger = logging.getLogger(__name__)
 # Finished-exchange fingerprints remembered per endpoint for conversation affinity. Bounded so
 # a long-running server cannot grow without limit; least-recently-used conversations re-route.
 _AFFINITY_CAPACITY = 4096
+
 
 ChatRole = Literal["system", "user", "assistant"]
 
@@ -213,6 +228,7 @@ class RequestLog:
     def __init__(self, path: Path | None, *, keep: int = 200) -> None:
         self._path = path
         self._recent: deque[RequestLogRecord] = deque(maxlen=keep)
+        self._revision = 0
         self._lock = threading.Lock()
         if path is not None:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -220,17 +236,55 @@ class RequestLog:
     def append(self, record: RequestLogRecord) -> None:
         with self._lock:
             self._recent.append(record)
+            self._revision += 1
             if self._path is not None:
                 with self._path.open("a", encoding="utf-8") as handle:
                     handle.write(record.model_dump_json() + "\n")
+
+    @property
+    def revision(self) -> int:
+        """Rows appended so far: a cheap "has anything changed" stamp for derived summaries."""
+        with self._lock:
+            return self._revision
 
     def recent(self) -> list[RequestLogRecord]:
         with self._lock:
             return list(self._recent)
 
+    def replay(self, endpoint: str) -> list[RequestLogRecord]:
+        """Every persisted row for `endpoint`, oldest first (the in-memory tail when no file).
+
+        Read from disk rather than from the tail so a total computed over it survives a restart
+        and covers more than the last few hundred calls. A row this build cannot parse (an older
+        schema, a line truncated by a hard kill) is skipped: a savings figure that refuses to
+        render because of one bad line is worse than one computed over the rest.
+        """
+        if self._path is None or not self._path.is_file():
+            return [record for record in self.recent() if record.endpoint == endpoint]
+        rows: list[RequestLogRecord] = []
+        with self._path.open(encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                try:
+                    record = RequestLogRecord.model_validate_json(line)
+                except ValueError:
+                    logger.warning("skipping an unreadable request log row in %s", self._path)
+                    continue
+                if record.endpoint == endpoint:
+                    rows.append(record)
+        return rows
+
 
 class EndpointRuntime:
-    """One served endpoint: its policy, its providers, its affinity memory, its log."""
+    """One served endpoint: its policy, its providers, its affinity memory, its log.
+
+    `cost_quality` sets the endpoint's cost/quality dial at mount time (see
+    `wmh.optimize.knn.apply_cost_quality`); None serves the policy exactly as fitted, so
+    mounting never silently re-tunes an artifact. `config_path` is the `endpoint.toml` a live
+    dial change is persisted to, so the setting survives a restart; None keeps changes in memory
+    (injected-policy tests, and any caller that owns persistence itself).
+    """
 
     def __init__(
         self,
@@ -239,15 +293,85 @@ class EndpointRuntime:
         *,
         provider_factory: Callable[[PoolEntry], Provider] = pool_provider,
         log: RequestLog,
+        cost_quality: float | None = None,
+        config_path: Path | None = None,
     ) -> None:
         self.name = name
         self.policy = policy
         self.log = log
+        self._base_policy = policy
+        self._config_path = config_path
         self._provider_factory = provider_factory
         self._providers: dict[str, Provider] = {}
         self._policy_embedder: Embedder | None = None
         self._affinity: OrderedDict[str, str] = OrderedDict()
+        # window -> (log revision the summary was computed at, the summary)
+        self._savings: dict[SavingsWindow, tuple[int, EndpointSavings]] = {}
         self._lock = threading.Lock()
+        # Serializes dial changes end to end (persist + install); _lock alone only protects
+        # the in-memory swap and would let two PUTs interleave file writes and installs.
+        self._dial_lock = threading.Lock()
+        if cost_quality is not None:
+            self._install_policy(apply_cost_quality(self._base_policy, cost_quality))
+
+    @property
+    def cost_quality(self) -> float | None:
+        """The dial the served policy is currently on (None: served as fitted)."""
+        return self.policy.cost_quality
+
+    def set_cost_quality(self, cost_quality: float) -> None:
+        """Move the dial on the live endpoint, and persist it when there is a file to persist to.
+
+        PERSIST FIRST, then swap, both under one dial lock: a failed write must leave the live
+        endpoint exactly where it was (never a dial that evaporates on restart), and two
+        overlapping PUTs must resolve to ONE (position, file) pair rather than interleaving a
+        swap from one with the write from the other.
+
+        In-flight requests keep the policy they started on: the swap replaces the whole policy
+        object, so no request can ever read half of one dial position and half of another. The
+        pool, baseline, and evidence bank are identical across positions, so a conversation that
+        spans a swap is still served by a model this endpoint knows.
+        """
+        adjusted = apply_cost_quality(self._base_policy, cost_quality)
+        with self._dial_lock:
+            if self._config_path is not None:
+                EndpointConfig(cost_quality=cost_quality).save(self._config_path)
+            self._install_policy(adjusted)
+
+    def _install_policy(self, adjusted: RoutingPolicy) -> None:
+        with self._lock:
+            self.policy = adjusted
+            self._savings.clear()  # the dial changed, so the quality expectation did too
+
+    def savings(self, window: SavingsWindow = "all_time") -> EndpointSavings:
+        """What this endpoint has saved so far (see `wmh.serving.savings`).
+
+        The all-time total is cached until the log grows or the dial moves, so a dashboard
+        polling it does not re-read the whole JSONL on every paint, and the request that changes
+        the total is the thing that invalidates it.
+
+        A BOUNDED window is recomputed on every read and never cached, because its answer moves
+        with the clock and not only with the log: rows age out of a 7-day window while nothing
+        appends, so an idle endpoint would otherwise keep serving week-old traffic as this
+        week's. Replay is a single sequential read of an append-only file, which is the cheap
+        part of this call; the common case (the all-time card) still pays it once per new request.
+        """
+        revision = self.log.revision
+        cacheable = window == "all_time"
+        with self._lock:
+            cached = self._savings.get(window) if cacheable else None
+            if cached is not None and cached[0] == revision:
+                return cached[1]
+            policy = self.policy
+        computed = compute_savings(self.log.replay(self.name), policy, window=window)
+        if cacheable:
+            with self._lock:
+                if self.policy is policy:
+                    # Store only if the dial has not moved since we captured the policy: a slow
+                    # computation racing a dial swap must not resurrect the OLD dial's quality
+                    # expectation under a revision the new dial also answers to.
+                    self._savings[window] = (revision, computed)
+        return computed
 
     def decide(self, messages: list[ChatMessage]) -> RoutingDecision:
         incumbent = None
@@ -353,12 +477,142 @@ def _chunk_payload(
     }
 
 
+class ServedKnobs(BaseModel):
+    """The knobs an endpoint is ACTUALLY serving, read off its policy.
+
+    Same field names as the mapping's `CostQualityKnobs`, but `floor_q` is nullable: a policy can
+    carry a novelty threshold whose quantile was never recorded (fitted before the field existed,
+    or set by hand), and the honest answer there is null rather than a 0.0 that reads as "no
+    floor". The threshold itself is not reported: it is a similarity number that means different
+    things on different evidence banks, so it would tell a reader nothing they could act on.
+    """
+
+    knn_z: float
+    floor_q: float | None
+    pick_lam: float
+    guard_mode: Literal["symmetric", "asymmetric"]
+
+
+class EndpointConfigResponse(BaseModel):
+    """The endpoint's cost/quality dial, everything needed to render it, and where it stands.
+
+    `cost_quality` is null when the endpoint serves its policy exactly as fitted (nobody has set
+    the dial), and `named_point` is "as-fitted" then: there is no dial position to label, and
+    calling that "Custom" would imply someone chose it. Any position that IS set gets its
+    anchor's label only when it sits exactly on that anchor, else "Custom".
+
+    `knobs` is what the served policy is actually running, so a client can see the effect of the
+    dial and not just its label. `anchors` are the MEASURED points behind the mapping
+    (routerbench-ours9, 5 held-out splits, quality and cost both against the best single pool
+    model), sorted by position: they are the ONLY deltas this response carries, because a delta
+    quoted for an arbitrary position would read as a measurement of that position. A client that
+    wants a curve interpolates between them itself.
+
+    `dialable` is false for policy kinds with no dial (static and rank endpoints), and then the
+    dial fields are null and PUT returns 409.
+    """
+
+    endpoint: str
+    dialable: bool
+    cost_quality: float | None
+    named_point: str
+    knobs: ServedKnobs | None
+    anchors: list[CostQualityAnchor]
+
+
+class EndpointConfigUpdate(BaseModel):
+    """A live dial change: the one field the platform's slider sends.
+
+    `allow_inf_nan=False` because a slider bug that sends Infinity or NaN must be a 400 with a
+    readable message, not a policy carrying an unusable knob (NaN fails every comparison the
+    guard makes, so it would silently disable routing).
+    """
+
+    cost_quality: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
+
+
+def _config_response(runtime: EndpointRuntime) -> EndpointConfigResponse:
+    dialable = runtime.policy.kind == "knn"
+    dial = runtime.cost_quality if dialable else None
+    return EndpointConfigResponse(
+        endpoint=runtime.name,
+        dialable=dialable,
+        cost_quality=dial,
+        named_point=cost_quality_named_point(dial) if dial is not None else "as-fitted",
+        knobs=(
+            ServedKnobs(
+                knn_z=runtime.policy.knn_z,
+                # Straight off the policy, which records the quantile its threshold came from, so
+                # an as-fitted endpoint reports the coverage setting it was FITTED with instead of
+                # the dial's default. Null when that policy never recorded one.
+                floor_q=runtime.policy.floor_q,
+                pick_lam=runtime.policy.pick_lam,
+                guard_mode=runtime.policy.guard_mode,
+            )
+            if dialable
+            else None
+        ),
+        anchors=list(COST_QUALITY_ANCHORS),
+    )
+
+
 def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
-    """Mount `/v1/models` + `/v1/chat/completions` over the given endpoints."""
+    """Mount `/v1/models` and `/v1/chat/completions` plus the dial and savings routes."""
     router = APIRouter()
 
     def _endpoint_or_none(name: str) -> EndpointRuntime | None:
         return endpoints.get(name)
+
+    def _endpoint_or_error(name: str) -> EndpointRuntime | Response:
+        runtime = endpoints.get(name)
+        if runtime is not None:
+            return runtime
+        available = ", ".join(sorted(endpoints)) or "(none)"
+        return _error_response(
+            404,
+            f"no endpoint {name!r}; have: {available}",
+            err_type="invalid_request_error",
+            code="model_not_found",
+        )
+
+    @router.get("/v1/endpoints/{name}/config", response_model=EndpointConfigResponse)
+    def get_endpoint_config(name: str) -> EndpointConfigResponse | Response:
+        found = _endpoint_or_error(name)
+        if isinstance(found, Response):
+            return found
+        return _config_response(found)
+
+    @router.put("/v1/endpoints/{name}/config", response_model=EndpointConfigResponse)
+    def put_endpoint_config(
+        name: str, update: EndpointConfigUpdate
+    ) -> EndpointConfigResponse | Response:
+        found = _endpoint_or_error(name)
+        if isinstance(found, Response):
+            return found
+        try:
+            found.set_cost_quality(update.cost_quality)
+        except ValueError as exc:
+            # A dial the policy cannot honor: a non-knn kind, or a savings position on a policy
+            # fitted without cost evidence. Both are configuration, not transport, so say which.
+            return _error_response(
+                409, str(exc), err_type="invalid_request_error", code="dial_unavailable"
+            )
+        return _config_response(found)
+
+    @router.get("/v1/endpoints/{name}/savings", response_model=EndpointSavings)
+    def get_endpoint_savings(
+        name: str, window: SavingsWindow = "all_time"
+    ) -> EndpointSavings | Response:
+        """What this endpoint has saved so far, from its own request log (`?window=7d` for a week).
+
+        Available for every policy kind, including static: a static endpoint has simply saved
+        nothing yet, which is a truthful answer and the honest "before" state the improvement
+        story is told against.
+        """
+        found = _endpoint_or_error(name)
+        if isinstance(found, Response):
+            return found
+        return found.savings(window)
 
     @router.get("/v1/models")
     def list_models() -> dict[str, object]:

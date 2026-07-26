@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -30,7 +31,15 @@ from wmh.providers.base import (
 )
 from wmh.providers.pool import PoolEntry
 from wmh.retrieval.embedders import HashingEmbedder
-from wmh.serving.chat import EndpointRuntime, RequestLog, create_chat_router
+from wmh.serving.chat import (
+    EndpointRuntime,
+    RequestLog,
+    RequestLogRecord,
+    create_chat_router,
+    install_openai_error_shapes,
+)
+from wmh.serving.endpoint_config import ENDPOINT_CONFIG_FILENAME, EndpointConfig
+from wmh.serving.savings import EndpointSavings, SavingsWindow
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -418,6 +427,8 @@ def _knn_policy(tmp_path: Path) -> RoutingPolicy:
         embedder=EmbedderSpec(dim=64),
         rag_num=6,
         knn_min_pairs=4,
+        # What the fitter persists for this bank: the mean of the per-model mean cell costs.
+        cost_scale=0.0055,
     ).save(tmp_path / POLICY_FILENAME)
     return RoutingPolicy.load(tmp_path / POLICY_FILENAME)
 
@@ -498,3 +509,428 @@ def test_static_policy_never_builds_its_embedder(
         json={"model": "tau-bench", "messages": [{"role": "user", "content": "hi"}]},
     )
     assert response.status_code == 200
+
+
+# --- the cost/quality dial: GET/PUT /v1/endpoints/{name}/config -----------------------------
+
+
+def _dial_client(
+    tmp_path: Path, policy: RoutingPolicy, *, config_path: Path | None = None
+) -> tuple[TestClient, EndpointRuntime]:
+    """A client with OpenAI error shapes installed, so 400s look like the real server's."""
+    runtime = EndpointRuntime(
+        name="tau-bench",
+        policy=policy,
+        provider_factory=_EchoProvider,
+        log=RequestLog(tmp_path / "requests.jsonl"),
+        config_path=config_path,
+    )
+    app = FastAPI()
+    app.include_router(create_chat_router({"tau-bench": runtime}))
+    install_openai_error_shapes(app)
+    return TestClient(app), runtime
+
+
+def test_config_reports_an_as_fitted_endpoint_with_the_measured_anchors(tmp_path: Path) -> None:
+    client, _ = _dial_client(tmp_path, _knn_policy(tmp_path))
+    body = client.get("/v1/endpoints/tau-bench/config").json()
+    assert body["endpoint"] == "tau-bench"
+    assert body["dialable"] is True
+    # Nobody has set the dial, and mounting did not set one for them.
+    assert body["cost_quality"] is None
+    assert body["named_point"] == "as-fitted"
+    # The anchors are what a slider labels itself with: measured quality and cost per position,
+    # sorted, and carrying nothing else. A client interpolates between them itself, so the
+    # response must never hand it a delta for a position nobody measured.
+    assert [anchor["s"] for anchor in body["anchors"]] == [0.0, 0.25, 0.5, 0.75, 1.0]
+    assert [anchor["label"] for anchor in body["anchors"]] == [
+        "Quality max",
+        "Balanced (default)",
+        "Cost saver",
+        "Deep saver",
+        "Max savings",
+    ]
+    balanced = next(anchor for anchor in body["anchors"] if anchor["s"] == 0.25)
+    assert balanced == {
+        "s": 0.25,
+        "label": "Balanced (default)",
+        "quality_delta_pt": 0.99,
+        "cost_delta_pct": -24.7,
+    }
+
+
+def test_a_dial_between_anchors_is_labelled_custom(tmp_path: Path) -> None:
+    # Never borrow the nearer anchor's name: its label sits next to its measured numbers.
+    client, _ = _dial_client(tmp_path, _knn_policy(tmp_path))
+    body = client.put("/v1/endpoints/tau-bench/config", json={"cost_quality": 0.26}).json()
+    assert body["named_point"] == "Custom"
+    assert body["cost_quality"] == 0.26
+
+
+def test_put_moves_the_dial_on_the_live_endpoint(tmp_path: Path) -> None:
+    client, runtime = _dial_client(tmp_path, _knn_policy(tmp_path))
+    put = client.put("/v1/endpoints/tau-bench/config", json={"cost_quality": 1.0})
+    assert put.status_code == 200
+    body = put.json()
+    assert body["cost_quality"] == 1.0
+    assert body["named_point"] == "Max savings"
+    assert body["knobs"] == {
+        "knn_z": 0.5,
+        "floor_q": 0.05,
+        "pick_lam": 0.03,
+        "guard_mode": "asymmetric",
+    }
+    # The runtime is serving the new policy, not just reporting it.
+    assert runtime.policy.pick_lam == 0.03
+    assert runtime.policy.guard_mode == "asymmetric"
+    assert client.get("/v1/endpoints/tau-bench/config").json() == body
+    # And the routed request says the knob was in play.
+    routed = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [{"role": "user", "content": "SELECT count(*) FROM superheroes"}],
+        },
+    )
+    assert routed.status_code == 200
+    rows = [json.loads(line) for line in (tmp_path / "requests.jsonl").read_text().splitlines()]
+    assert "cost knob lam=0.03" in rows[-1]["routing_reason"]
+
+
+def test_put_persists_the_dial_next_to_the_policy(tmp_path: Path) -> None:
+    config_path = tmp_path / ENDPOINT_CONFIG_FILENAME
+    client, _ = _dial_client(tmp_path, _knn_policy(tmp_path), config_path=config_path)
+    client.put("/v1/endpoints/tau-bench/config", json={"cost_quality": 0.6})
+    # A restart has to come back on the same dial, so the file is the record.
+    assert EndpointConfig.load(config_path).cost_quality == 0.6
+    restarted = EndpointRuntime(
+        name="tau-bench",
+        policy=_knn_policy(tmp_path),
+        log=RequestLog(tmp_path / "requests.jsonl"),
+        cost_quality=EndpointConfig.load(config_path).cost_quality,
+    )
+    assert restarted.cost_quality == 0.6
+    assert restarted.policy.guard_mode == "asymmetric"
+
+
+def test_mounting_a_dial_setting_applies_it_before_the_first_request(tmp_path: Path) -> None:
+    runtime = EndpointRuntime(
+        name="tau-bench",
+        policy=_knn_policy(tmp_path),
+        provider_factory=_EchoProvider,
+        log=RequestLog(tmp_path / "requests.jsonl"),
+        cost_quality=0.75,
+    )
+    assert runtime.cost_quality == 0.75
+    assert runtime.policy.pick_lam == pytest.approx(0.02)
+
+
+def test_put_rejects_a_dial_outside_the_range(tmp_path: Path) -> None:
+    client, runtime = _dial_client(tmp_path, _knn_policy(tmp_path))
+    response = client.put("/v1/endpoints/tau-bench/config", json={"cost_quality": 1.5})
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_request"
+    assert "cost_quality" in response.json()["error"]["message"]
+    assert runtime.cost_quality is None  # a rejected change changes nothing
+
+
+def test_config_on_a_policy_kind_without_a_dial(tmp_path: Path) -> None:
+    static = RoutingPolicy(kind="static", default_model="haiku-4-5", pool=_pool())
+    client, _ = _dial_client(tmp_path, static)
+    body = client.get("/v1/endpoints/tau-bench/config").json()
+    assert body["dialable"] is False
+    assert body["cost_quality"] is None and body["knobs"] is None
+    conflict = client.put("/v1/endpoints/tau-bench/config", json={"cost_quality": 0.5})
+    assert conflict.status_code == 409
+    assert conflict.json()["error"]["code"] == "dial_unavailable"
+    assert "kind='static'" in conflict.json()["error"]["message"]
+
+
+def test_put_409s_when_the_policy_carries_no_cost_evidence(tmp_path: Path) -> None:
+    # The coverage leg needs no prices; the price leg cannot be honored without them, and
+    # saying so beats serving a dial position that silently does nothing.
+    priceless = _knn_policy(tmp_path).model_copy(update={"cost_scale": 0.0})
+    client, _ = _dial_client(tmp_path, priceless)
+    assert (
+        client.put("/v1/endpoints/tau-bench/config", json={"cost_quality": 0.2}).status_code == 200
+    )
+    conflict = client.put("/v1/endpoints/tau-bench/config", json={"cost_quality": 0.8})
+    assert conflict.status_code == 409
+    assert "cost_scale" in conflict.json()["error"]["message"]
+
+
+def test_config_404s_for_an_unknown_endpoint(tmp_path: Path) -> None:
+    client, _ = _dial_client(tmp_path, _knn_policy(tmp_path))
+    missing = client.get("/v1/endpoints/nope/config")
+    assert missing.status_code == 404
+    assert missing.json()["error"]["code"] == "model_not_found"
+    assert "tau-bench" in missing.json()["error"]["message"]
+    assert client.put("/v1/endpoints/nope/config", json={"cost_quality": 0.5}).status_code == 404
+
+
+def test_the_openai_surface_is_untouched_by_the_dial_routes(tmp_path: Path) -> None:
+    # The customer-facing contract must not grow: /v1/models still lists endpoints only, and a
+    # chat completion still names the endpoint.
+    client, _ = _dial_client(tmp_path, _knn_policy(tmp_path))
+    client.put("/v1/endpoints/tau-bench/config", json={"cost_quality": 0.9})
+    assert [m["id"] for m in client.get("/v1/models").json()["data"]] == ["tau-bench"]
+    completion = client.post(
+        "/v1/chat/completions",
+        json={"model": "tau-bench", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert completion.status_code == 200
+    assert completion.json()["model"] == "tau-bench"
+    assert "cost_quality" not in completion.text
+
+
+def test_put_rejects_non_finite_dial_values(tmp_path: Path) -> None:
+    # A slider bug that sends NaN must be a readable 400: NaN fails every comparison the guard
+    # makes, so accepting it would quietly stop the endpoint from routing at all.
+    client, runtime = _dial_client(tmp_path, _knn_policy(tmp_path))
+    for payload in ('{"cost_quality": NaN}', '{"cost_quality": Infinity}'):
+        response = client.put(
+            "/v1/endpoints/tau-bench/config",
+            content=payload,
+            headers={"content-type": "application/json"},
+        )
+        assert response.status_code == 400, payload
+        assert response.json()["error"]["code"] == "invalid_request"
+    assert runtime.cost_quality is None
+
+
+# --- the savings card: GET /v1/endpoints/{name}/savings --------------------------------------
+
+
+def _served_request(client: TestClient, content: str) -> None:
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "tau-bench", "messages": [{"role": "user", "content": content}]},
+    )
+    assert response.status_code == 200
+
+
+def test_savings_start_at_the_empty_state(tmp_path: Path) -> None:
+    client, _ = _dial_client(tmp_path, _knn_policy(tmp_path))
+    body = client.get("/v1/endpoints/tau-bench/savings").json()
+    assert body["requests_served"] == 0
+    assert body["cost_saved_usd"] == 0.0
+    assert body["cost_saved_pct"] == 0.0
+    assert body["time_saved_s_estimate"] == 0.0
+    assert body["expected_quality_delta_pt"] == 0.0
+    assert body["window"] == "all_time"
+    assert body["estimate_basis"]  # never empty: the card explains the zero
+
+
+def test_savings_accrue_as_the_endpoint_serves(tmp_path: Path) -> None:
+    client, runtime = _dial_client(tmp_path, _knn_policy(tmp_path))
+    _served_request(client, "SELECT count(*) FROM superheroes")  # routes to fable-5
+    _served_request(client, "draft a thank-you")  # stays on the haiku-4-5 fallback
+    body = client.get("/v1/endpoints/tau-bench/savings").json()
+    assert body["requests_served"] == 2
+    # fable-5 is the pricier model here, so routing away from the cheap fallback COSTS money and
+    # the card says so with a negative saving rather than hiding it.
+    assert body["actual_cost_usd"] > body["baseline_cost_estimate_usd"]
+    assert body["cost_saved_usd"] < 0.0
+    assert any("haiku-4-5" in basis for basis in body["estimate_basis"])
+
+
+def test_savings_window_parameter_selects_the_period(tmp_path: Path) -> None:
+    client, _ = _dial_client(tmp_path, _knn_policy(tmp_path))
+    assert client.get("/v1/endpoints/tau-bench/savings?window=7d").json()["window"] == "7d"
+    bad = client.get("/v1/endpoints/tau-bench/savings?window=forever")
+    assert bad.status_code == 400
+    assert bad.json()["error"]["code"] == "invalid_request"
+
+
+def test_savings_survive_a_restart_by_reading_the_log(tmp_path: Path) -> None:
+    # The persisted JSONL is the source, so a customer's savings are not reset by a deploy.
+    client, _ = _dial_client(tmp_path, _knn_policy(tmp_path))
+    _served_request(client, "SELECT count(*) FROM superheroes")
+    restarted, _ = _dial_client(tmp_path, _knn_policy(tmp_path))
+    body = restarted.get("/v1/endpoints/tau-bench/savings").json()
+    assert body["requests_served"] == 1
+
+
+def test_savings_ignore_other_endpoints_rows(tmp_path: Path) -> None:
+    log = RequestLog(tmp_path / "requests.jsonl")
+    log.append(
+        RequestLogRecord(
+            id="other",
+            ts=datetime.now(UTC).isoformat(),
+            endpoint="somebody-else",
+            model="haiku-4-5",
+            provider_model="claude-haiku-4-5",
+            routing_reason="test",
+            input_tokens=1000,
+            output_tokens=1000,
+            cost_usd=1.0,
+        )
+    )
+    runtime = EndpointRuntime(
+        name="tau-bench",
+        policy=_knn_policy(tmp_path),
+        provider_factory=_EchoProvider,
+        log=log,
+    )
+    assert runtime.savings().requests_served == 0
+
+
+def test_savings_skip_an_unreadable_log_row(tmp_path: Path) -> None:
+    # A line truncated by a hard kill must not take the whole card down.
+    client, _ = _dial_client(tmp_path, _knn_policy(tmp_path))
+    _served_request(client, "SELECT count(*) FROM superheroes")
+    with (tmp_path / "requests.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write('{"id": "truncated"\n')
+    body = client.get("/v1/endpoints/tau-bench/savings").json()
+    assert body["requests_served"] == 1
+
+
+def test_savings_are_available_for_a_static_endpoint(tmp_path: Path) -> None:
+    static = RoutingPolicy(kind="static", default_model="haiku-4-5", pool=_pool())
+    client, _ = _dial_client(tmp_path, static)
+    _served_request(client, "hi")
+    body = client.get("/v1/endpoints/tau-bench/savings").json()
+    assert body["requests_served"] == 1
+    assert body["cost_saved_usd"] == 0.0  # nothing to save against itself
+    assert body["expected_quality_delta_pt"] == 0.0
+
+
+def test_savings_404_for_an_unknown_endpoint(tmp_path: Path) -> None:
+    client, _ = _dial_client(tmp_path, _knn_policy(tmp_path))
+    missing = client.get("/v1/endpoints/nope/savings")
+    assert missing.status_code == 404
+    assert missing.json()["error"]["code"] == "model_not_found"
+
+
+def test_moving_the_dial_refreshes_the_quality_expectation(tmp_path: Path) -> None:
+    client, _ = _dial_client(tmp_path, _knn_policy(tmp_path))
+    _served_request(client, "draft a thank-you")
+    client.put("/v1/endpoints/tau-bench/config", json={"cost_quality": 1.0})
+    body = client.get("/v1/endpoints/tau-bench/savings").json()
+    assert body["expected_quality_delta_pt"] == -0.54  # the Max savings anchor, not a stale 0.0
+
+
+def test_savings_are_recomputed_when_the_log_grows_not_on_a_timer(tmp_path: Path) -> None:
+    # Cached between requests (a polling dashboard must not re-read the JSONL every paint), and
+    # invalidated by the request that changes the total, so the card is never stale.
+    client, runtime = _dial_client(tmp_path, _knn_policy(tmp_path))
+    reads = {"n": 0}
+    original = RequestLog.replay
+
+    def counting_replay(self: RequestLog, endpoint: str) -> list[RequestLogRecord]:
+        reads["n"] += 1
+        return original(self, endpoint)
+
+    RequestLog.replay = counting_replay
+    try:
+        client.get("/v1/endpoints/tau-bench/savings")
+        client.get("/v1/endpoints/tau-bench/savings")
+        assert reads["n"] == 1  # the second read came from the cache
+        _served_request(client, "draft a thank-you")
+        assert client.get("/v1/endpoints/tau-bench/savings").json()["requests_served"] == 1
+        assert reads["n"] == 2
+    finally:
+        RequestLog.replay = original
+    assert runtime.savings().requests_served == 1
+
+
+def test_failed_dial_persist_leaves_the_live_endpoint_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Persist-then-install: a dial whose file write fails must not serve until restart un-sets
+    # it, and must not move the live endpoint at all.
+    from wmh.serving.endpoint_config import EndpointConfig
+
+    _, runtime = _dial_client(
+        tmp_path, _knn_policy(tmp_path), config_path=tmp_path / "endpoint.toml"
+    )
+    runtime.set_cost_quality(0.25)
+    before = runtime.policy
+
+    def exploding_save(self: EndpointConfig, path: Path) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(EndpointConfig, "save", exploding_save)
+    with pytest.raises(OSError, match="disk full"):
+        runtime.set_cost_quality(1.0)
+    assert runtime.policy is before  # live dial unmoved
+    assert runtime.cost_quality == 0.25
+
+
+def test_slow_savings_computation_cannot_resurrect_the_old_dial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A savings computation that captures the old policy, races a dial move, and finishes late
+    # must NOT store its stale result under a revision the new dial answers to.
+    import wmh.serving.chat as chat_module
+
+    client, runtime = _dial_client(tmp_path, _knn_policy(tmp_path))
+    runtime.set_cost_quality(0.25)
+    # The empty log zeroes every savings field; serve one request so the quality expectation
+    # actually reflects the dial.
+    client.post(
+        "/v1/chat/completions",
+        json={"model": "tau-bench", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    original = chat_module.compute_savings
+
+    moved = {"done": False}
+
+    def racing_compute(
+        rows: list[RequestLogRecord],
+        policy: RoutingPolicy,
+        *,
+        window: SavingsWindow = "all_time",
+    ) -> EndpointSavings:
+        if not moved["done"]:
+            moved["done"] = True
+            runtime.set_cost_quality(1.0)  # the dial moves mid-computation
+        return original(rows, policy, window=window)
+
+    monkeypatch.setattr(chat_module, "compute_savings", racing_compute)
+    stale = runtime.savings()  # computed against the 0.25 policy, returned to ITS caller
+    fresh = runtime.savings()  # must recompute against the 1.0 policy, not read a stale cache
+    assert fresh.expected_quality_delta_pt != stale.expected_quality_delta_pt
+    assert fresh.expected_quality_delta_pt == pytest.approx(-0.54, abs=0.01)
+
+
+def test_config_reports_the_coverage_setting_the_policy_was_fitted_with(tmp_path: Path) -> None:
+    # An as-fitted endpoint's knobs must describe THAT fit, not the dial's default: a policy
+    # fitted at the quality-max coverage setting reports 0.5, and one whose fit never recorded a
+    # coverage setting reports null rather than a 0.0 that reads as "no floor".
+    fitted_wide = _knn_policy(tmp_path).model_copy(update={"floor_q": 0.5})
+    client, _ = _dial_client(tmp_path, fitted_wide)
+    assert client.get("/v1/endpoints/tau-bench/config").json()["knobs"]["floor_q"] == 0.5
+
+    unrecorded = _knn_policy(tmp_path).model_copy(update={"floor_q": None})
+    older, _ = _dial_client(tmp_path, unrecorded)
+    body = older.get("/v1/endpoints/tau-bench/config").json()
+    assert body["knobs"]["floor_q"] is None
+    assert body["knobs"]["knn_z"] == 0.5  # the rest of the knobs still report
+    # Dialing it fixes the gap: the mapping records the quantile it applied.
+    dialed = older.put("/v1/endpoints/tau-bench/config", json={"cost_quality": 0.0}).json()
+    assert dialed["knobs"]["floor_q"] == 0.5
+
+
+def test_the_seven_day_savings_window_is_never_served_from_cache(tmp_path: Path) -> None:
+    # A bounded window ages with the clock, so an idle endpoint must not keep serving the answer
+    # it computed an hour ago; the all-time card is still cached between requests.
+    client, _ = _dial_client(tmp_path, _knn_policy(tmp_path))
+    _served_request(client, "draft a thank-you")
+    reads = {"n": 0}
+    original = RequestLog.replay
+
+    def counting_replay(self: RequestLog, endpoint: str) -> list[RequestLogRecord]:
+        reads["n"] += 1
+        return original(self, endpoint)
+
+    RequestLog.replay = counting_replay
+    try:
+        client.get("/v1/endpoints/tau-bench/savings?window=7d")
+        client.get("/v1/endpoints/tau-bench/savings?window=7d")
+        assert reads["n"] == 2  # recomputed every read
+        client.get("/v1/endpoints/tau-bench/savings")
+        client.get("/v1/endpoints/tau-bench/savings")
+        assert reads["n"] == 3  # all_time cached after the first
+    finally:
+        RequestLog.replay = original
