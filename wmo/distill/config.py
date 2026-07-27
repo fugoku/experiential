@@ -18,6 +18,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    JsonValue,
     ValidationError,
     field_validator,
     model_validator,
@@ -148,6 +149,68 @@ class HarborConfig(BaseModel):
     sandbox/runner deaths (e.g. an E2B transport drop killing the pi runner
     mid-episode); one retry absorbs them, and any trial that still ends
     without a verifier reward scores 0.0 instead of aborting the run."""
+
+
+class Tau2Config(BaseModel):
+    """How rollouts are produced: tau2-bench's own harness on real tau2 tasks.
+
+    The alternative to `[harbor]` (exactly one of the two selects the run's rollout
+    source). Every episode runs Sierra's real benchmark unmodified - tau2's own
+    `llm_agent`, LLM user simulator, orchestrator, and deterministic evaluator - via
+    one `tau2 run` subprocess per (task x attempt). The agent's LLM calls come back
+    into this process through a local OpenAI-compatible proxy backed by a per-episode
+    `TinkerChatProvider`, which is what records the student's exact sampled token
+    spans (`wmo.distill.tau2`).
+
+    tau2 needs Python 3.12+ and a heavy dependency tree, so it lives in its own venv
+    (see `packages/environment-capture/tau-bench/README.md`) and wmo never imports
+    it; `tau2_bin` points into that venv.
+
+    Attempts per task are NOT configured here: training rollouts use
+    `train.group_size` and evals use `eval.k` / `gate.k`, exactly as with harbor.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    tau2_bin: str
+    """Path to the `tau2` CLI executable inside its own venv."""
+
+    data_dir: str
+    """The tau2 data directory, exported as TAU2_DATA_DIR to every runner."""
+
+    user_llm: str = "azure/gpt-5.4-mini"
+    """The user simulator's litellm model spec, pinned across every arm of a study.
+
+    The user simulator is part of the environment: two runs facing different
+    simulated customers are runs on different benchmarks. The default is the pin
+    the 720-episode sim-to-real study ran against. The azure/ route needs
+    AZURE_API_KEY, AZURE_API_BASE, and AZURE_API_VERSION in the environment; the
+    preflight checks for them by name."""
+
+    user_llm_args: dict[str, JsonValue] = Field(default_factory=dict)
+    """Extra litellm kwargs for the user simulator, forwarded verbatim as
+    `--user-llm-args`. Empty (the pinned default) sends `{}`, which is what the
+    prior tau2 captures ran with."""
+
+    backend: Literal["local", "e2b"] = "local"
+    """Where the tau2 runner subprocesses execute.
+
+    `local` runs them in the tau2 venv on this machine (the environment is an
+    in-memory JSON DB; the heavy lifting is remote LLM calls either way). `e2b`
+    isolates each runner in an E2B sandbox per the harbor pattern."""
+
+    max_errors: int = Field(default=10, ge=1)
+    """tau2's per-episode tool/format error budget (`--max-errors`); its default."""
+
+    episode_retries: int = Field(default=1, ge=0)
+    """Fresh-episode retries after an infrastructure failure (no verifier evidence).
+
+    The retry lives HERE, not in tau2's runner (`--max-retries` is pinned to 0):
+    tau2's own retry re-runs the simulation into the same span sink, so training
+    datums would carry an abandoned attempt's tokens under another attempt's
+    reward. Each wmo-level retry starts a fresh sink and a fresh recorder. One
+    retry absorbs the transient user-sim API blips observed in practice; an
+    episode that still ends without evidence stays an `infra_failed` record."""
 
 
 class RolloutConfig(BaseModel):
@@ -334,7 +397,13 @@ class TrainConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    steps: int = Field(default=40, ge=1)
+    steps: int = Field(default=40, ge=0)
+    """On-policy optimizer steps. 0 makes the run WARMUP-ONLY: the supervised
+    phase is the whole training run (teacher rollouts -> keep-filter -> CE),
+    then the student-after eval and the gate run as usual. Rejected unless
+    `warmup.steps > 0`, since a run with neither phase trains nothing and
+    would put a no-op behind the gate."""
+
     tasks_per_batch: int = Field(default=8, ge=1)
     group_size: int = Field(default=4, ge=1)
     learning_rate: float = Field(default=1e-4, gt=0)
@@ -867,16 +936,18 @@ class WandbConfig(BaseModel):
 class DistillConfig(BaseModel):
     """Top-level configuration for one distillation run.
 
-    The student, teacher, and harbor sections are required (each carries a
-    required field); every other section has complete defaults and may be
-    omitted from the TOML file.
+    The student and teacher sections are required, plus EXACTLY ONE rollout
+    source section: `[harbor]` (terminus-2 on harbor benchmark tasks) or
+    `[tau2]` (tau2-bench's own harness on real tau2 tasks). Every other
+    section has complete defaults and may be omitted from the TOML file.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     student: StudentConfig
     teacher: TeacherConfig
-    harbor: HarborConfig
+    harbor: HarborConfig | None = None
+    tau2: Tau2Config | None = None
     rollout: RolloutConfig = Field(default_factory=RolloutConfig)
     train: TrainConfig = Field(default_factory=TrainConfig)
     sampling: SamplingConfig = Field(default_factory=SamplingConfig)
@@ -887,6 +958,66 @@ class DistillConfig(BaseModel):
     budget: BudgetConfig = Field(default_factory=BudgetConfig)
     tripwire: TripwireConfig = Field(default_factory=TripwireConfig)
     wandb: WandbConfig = Field(default_factory=WandbConfig)
+
+    @model_validator(mode="after")
+    def _check_some_training_phase(self) -> DistillConfig:
+        """Reject a run that would train nothing (no OPD steps, no warmup).
+
+        Returns:
+            This config, unchanged, when at least one phase trains.
+
+        Raises:
+            ValueError: If `train.steps` and `warmup.steps` are both 0.
+        """
+        if self.train.steps == 0 and self.warmup.steps == 0:
+            raise ValueError(
+                "train.steps = 0 makes the run warmup-only, but warmup.steps is also 0, "
+                "so nothing would train and the gate would measure a no-op; set "
+                "warmup.steps > 0 for a warmup-only run or train.steps > 0 for OPD"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_rollout_source(self) -> DistillConfig:
+        """Require exactly one rollout source section.
+
+        Returns:
+            This config, unchanged, when exactly one of `[harbor]` / `[tau2]` is set.
+
+        Raises:
+            ValueError: If both or neither source section is present.
+        """
+        if (self.harbor is None) == (self.tau2 is None):
+            raise ValueError(
+                "a distill run needs exactly one rollout source: set [harbor] "
+                "(terminus-2 on harbor benchmark tasks) or [tau2] (tau2-bench's own "
+                "harness on real tau2 tasks), not "
+                + ("both" if self.harbor is not None else "neither")
+            )
+        if self.tau2 is not None:
+            # Both knobs steer harbor's terminus-2 agent and would be silently
+            # ignored here, which is exactly the trap this config forbids. The
+            # tau2 proxy path renders through each model's auto-discovered
+            # cookbook renderer and keeps history verbatim by splicing exact
+            # sampled ids, so neither knob has a tau2 meaning.
+            if self.rollout.renderers:
+                raise ValueError(
+                    "[rollout.renderers] is a terminus-2 (harbor) knob and has no effect "
+                    "under the [tau2] source, whose proxy renders through each model's "
+                    "auto-discovered cookbook renderer; remove the table"
+                )
+            if self.rollout.compaction:
+                raise ValueError(
+                    "rollout.compaction is terminus-2's summarizer and has no effect under "
+                    "the [tau2] source (tau2's own agent keeps its full history); set it "
+                    "false or leave it unset"
+                )
+        return self
+
+    @property
+    def rollout_source(self) -> Literal["harbor", "tau2"]:
+        """Which rollout source this run selected (validated to be exactly one)."""
+        return "harbor" if self.harbor is not None else "tau2"
 
     @model_validator(mode="after")
     def _check_cross_tokenizer_loss(self) -> DistillConfig:

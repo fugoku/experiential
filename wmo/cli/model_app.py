@@ -3,9 +3,10 @@
 The third member of the optimizer family, beside `wmo optimize harness`
 (prompt surfaces) and `wmo optimize route` (routing policy). Where those
 produce a `prompt` or a `routing_policy` artifact, this one produces an
-`adapter`: `run` drives one on-policy distillation of a Tinker LoRA student
-from rollouts of harbor's own terminus-2 agent, and `report` reads a finished
-run dir back.
+`adapter`: `run` drives one distillation of a Tinker LoRA student from real
+benchmark rollouts (the config selects the source: harbor's own terminus-2
+agent, or tau2-bench's own harness), and `report` reads a finished run dir
+back.
 
 `run` owns the run's CLI lifecycle: load and pin the inputs (config, task
 splits, the harness document supplying the rollout params), project the run
@@ -24,7 +25,8 @@ a bare `--resume` (no `--config`) loads.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import os
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Literal
 
@@ -62,6 +64,7 @@ from wmo.distill.store import (
     DistillRunStore,
     build_handoff_toml,
 )
+from wmo.distill.tau2 import parse_tau2_task_id
 from wmo.harness.doc import HarnessDoc
 from wmo.harness.e2b_reap import (
     DEFAULT_E2B_SANDBOX_CAP,
@@ -80,8 +83,8 @@ DISTILL_RUN_RECORD = "distill-run.json"
 _PI_NODE_RUNTIME = "pi-node"
 
 model_app = typer.Typer(
-    help="Train the agent model itself: on-policy distillation of a Tinker LoRA student "
-    "from harbor rollouts, gated on held-out solve rates.",
+    help="Train the agent model itself: distillation of a Tinker LoRA student from real "
+    "benchmark rollouts (harbor or tau2, config-selected), gated on held-out solve rates.",
     no_args_is_help=True,
 )
 
@@ -94,8 +97,9 @@ def run(
     config: str = typer.Option(
         None,
         "--config",
-        help="The run TOML (student, teacher, harbor, rollout, train, sampling, warmup, "
-        "eval, gate, pricing, budget, tripwire, wandb sections). Required to start a run; "
+        help="The run TOML (student, teacher, EXACTLY ONE of harbor/tau2, plus rollout, "
+        "train, sampling, warmup, eval, gate, pricing, budget, tripwire, wandb). Required "
+        "to start a run; "
         "a resume reuses the run dir's config.toml snapshot, and passing it on a resume is "
         "how you raise budget.max_usd.",
     ),
@@ -121,16 +125,17 @@ def run(
         DEFAULT_DISTILL_HARNESS,
         "--harness",
         help="Stored harness document supplying the rollout params (temperature, max turns, "
-        "max output tokens) and the hash that keys every harbor job; the harbor agent is "
-        f"always terminus-2, never this document's runtime. The bare literal "
+        "max output tokens); under the harbor source its hash also keys every harbor job "
+        "(the harbor agent is always terminus-2, never this document's runtime), and the "
+        f"tau2 source takes its params from the config alone. The bare literal "
         f"{DEFAULT_DISTILL_HARNESS!r} is the built-in default agent; 'name@ref' pins a stored "
         "version. Pinned for the whole run.",
     ),
     backend: str = typer.Option(
         None,
         "--backend",
-        help="Override the run config's harbor.backend: local (docker tasks on this machine) "
-        "or e2b (tasks in E2B sandboxes; needs E2B_API_KEY).",
+        help="Override the rollout source's backend (harbor.backend or tau2.backend): local "
+        "(runs on this machine) or e2b (E2B sandboxes; harbor only today, needs E2B_API_KEY).",
     ),
     resume: bool = typer.Option(False, "--resume", help="Continue the run recorded in --run-dir."),
     promote: bool = typer.Option(
@@ -142,17 +147,18 @@ def run(
     yes: bool = typer.Option(False, "--yes", help="Skip the cost confirmation prompt."),
     root: str = typer.Option(ARTIFACT_DIR, "--root", help="Project dir."),
 ) -> None:
-    """Train (or resume) an agent model by on-policy distillation on harbor tasks.
+    """Train (or resume) an agent model by distillation on real benchmark tasks.
 
         wmo optimize distill run --config run.toml --run-dir runs/d1 \\
           --task-ids train.json --holdout-task-ids holdout.json --backend e2b --yes
 
-    Harbor's own terminus-2 agent rolls out on real benchmark tasks while
-    sampling from the student's current Tinker LoRA weights, a larger teacher
-    scores the exact tokens the student sampled, and each step nudges the
-    student toward the teacher with a per-token reverse-KL objective. A
-    held-out gate compares teacher, student-before, and student-after solve
-    rates, and only an adapter that closes enough of the gap is promoted.
+    The config-selected rollout source (harbor's terminus-2 agent, or real
+    tau2-bench episodes through the loopback proxy) rolls out while sampling
+    the student's current Tinker LoRA weights, a larger teacher scores or
+    demonstrates, and training nudges the student toward the teacher (warmup
+    cross-entropy, then optional per-token reverse-KL OPD steps). A held-out
+    gate compares teacher, student-before, and student-after solve rates, and
+    only an adapter that closes enough of the gap is promoted.
 
     The harness is NOT the subject here and is never edited: it is pinned for
     the whole run. Search the scaffold with `wmo optimize harness` instead.
@@ -269,8 +275,8 @@ def run_distill(
         holdout_task_ids_path: JSON array of holdout task ids; required to
             start. Baselines and the gate are measured here.
         run_dir: The run's durable state directory; always required.
-        backend: An explicit `--backend` override for the config's
-            harbor.backend, or None when the flag was not given.
+        backend: An explicit `--backend` override for the rollout source's
+            backend (harbor or tau2), or None when the flag was not given.
         resume: Continue the run recorded in `run_dir`.
         yes: Skip the cost confirmation (see `_confirm_cost` for the one
             case where confirmation is forced anyway).
@@ -358,7 +364,9 @@ def run_distill(
         train_ids = _load_harbor_task_ids(Path(task_ids_path))
         holdout_ids = _load_harbor_task_ids(Path(holdout_task_ids_path))
         base, seed_doc, seed_version = _resolve_seed_doc(root, harness_name)
-        effective_backend = backend_override if backend_override is not None else cfg.harbor.backend
+        effective_backend = (
+            backend_override if backend_override is not None else _source_backend(cfg)
+        )
 
     overlap = sorted(set(train_ids) & set(holdout_ids))
     if overlap:
@@ -367,9 +375,12 @@ def run_distill(
             "--holdout-task-ids; the gate is only meaningful on tasks the student "
             "never trained on, so make the splits disjoint"
         )
-    if effective_backend != cfg.harbor.backend:
+    if effective_backend != _source_backend(cfg):
+        source = cfg.rollout_source
+        section = cfg.harbor if source == "harbor" else cfg.tau2
+        assert section is not None  # exactly-one source, validated by the config
         cfg = cfg.model_copy(
-            update={"harbor": cfg.harbor.model_copy(update={"backend": effective_backend})}
+            update={source: section.model_copy(update={"backend": effective_backend})}
         )
     runtime_kind = seed_doc.runtime_kind()
     if runtime_kind != _PI_NODE_RUNTIME:
@@ -379,15 +390,18 @@ def run_distill(
             f"pi-node harness (the built-in {DEFAULT_DISTILL_HARNESS!r} agent, or a "
             "version optimized from it)"
         )
-    template_path = Path(cfg.harbor.job_template)
-    if not template_path.is_file():
-        raise typer.BadParameter(
-            f"harbor.job_template {template_path} does not exist; point the distill "
-            "config's [harbor] job_template at the harbor JobConfig YAML/JSON the "
-            "rollouts should run"
-        )
-    if effective_backend == "e2b":
-        _preflight_e2b_capacity(console, trial_concurrency=cfg.train.trial_concurrency)
+    if cfg.harbor is not None:
+        template_path = Path(cfg.harbor.job_template)
+        if not template_path.is_file():
+            raise typer.BadParameter(
+                f"harbor.job_template {template_path} does not exist; point the distill "
+                "config's [harbor] job_template at the harbor JobConfig YAML/JSON the "
+                "rollouts should run"
+            )
+        if effective_backend == "e2b":
+            _preflight_e2b_capacity(console, trial_concurrency=cfg.train.trial_concurrency)
+    else:
+        _preflight_tau2(cfg, [*train_ids, *holdout_ids])
 
     console.print(
         f"distilling [bold]{base}[/bold]: student {cfg.student.base_model} <- teacher "
@@ -453,6 +467,67 @@ def run_distill(
 
 
 # -- input resolution ------------------------------------------------------------------------
+
+
+def _source_backend(cfg: DistillConfig) -> Literal["local", "e2b"]:
+    """The configured rollout source's backend (the `--backend` default)."""
+    if cfg.harbor is not None:
+        return cfg.harbor.backend
+    assert cfg.tau2 is not None  # exactly-one source, validated by the config
+    return cfg.tau2.backend
+
+
+def _preflight_tau2(cfg: DistillConfig, task_ids: Sequence[str]) -> None:
+    """Fail a tau2-source run before anything is spent, naming the fix.
+
+    Checks the pieces a tau2 rollout cannot run without: a wired backend, the
+    tau2 CLI in its own venv, the data directory, well-formed composite task
+    ids in both splits, and (for an azure/ user simulator) the litellm Azure
+    credentials, by NAME only.
+
+    Args:
+        cfg: The validated run config; `cfg.tau2` must be set.
+        task_ids: Every task id the run will draw (train plus holdout).
+
+    Raises:
+        typer.BadParameter: If any prerequisite is missing.
+    """
+    assert cfg.tau2 is not None
+    if cfg.tau2.backend == "e2b":
+        raise typer.BadParameter(
+            "tau2.backend = 'e2b' is not wired yet; run with backend 'local' (the tau2 "
+            "runner is an API-only subprocess, so the heavy work is remote either way)"
+        )
+    tau2_bin = Path(cfg.tau2.tau2_bin)
+    if not tau2_bin.is_file():
+        raise typer.BadParameter(
+            f"tau2.tau2_bin {tau2_bin} does not exist; point it at the tau2 CLI inside "
+            "its own venv (see packages/environment-capture/tau-bench/README.md for the "
+            "one-time setup)"
+        )
+    data_dir = Path(cfg.tau2.data_dir)
+    if not data_dir.is_dir():
+        raise typer.BadParameter(
+            f"tau2.data_dir {data_dir} does not exist; point it at the tau2-bench clone's "
+            "data directory (exported to every runner as TAU2_DATA_DIR)"
+        )
+    for task_id in task_ids:
+        try:
+            parse_tau2_task_id(task_id)
+        except ValueError as error:
+            raise typer.BadParameter(str(error)) from error
+    if cfg.tau2.user_llm.startswith("azure/"):
+        missing = [
+            name
+            for name in ("AZURE_API_KEY", "AZURE_API_BASE", "AZURE_API_VERSION")
+            if not os.environ.get(name)
+        ]
+        if missing:
+            raise typer.BadParameter(
+                f"tau2.user_llm {cfg.tau2.user_llm!r} runs the user simulator through "
+                f"litellm's azure/ route, which needs {', '.join(missing)} in the "
+                "environment (set them in the gitignored .env; never commit values)"
+            )
 
 
 def _load_config(path: Path) -> DistillConfig:

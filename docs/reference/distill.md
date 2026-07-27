@@ -2,8 +2,8 @@
 
 The other optimizers edit the agent's *harness* or its *routing policy*; `wmo optimize distill`
 trains the agent's *model*.
-It runs on-policy distillation of a Tinker LoRA student: harbor's own `terminus-2` agent rolls
-out on real harbor benchmark tasks while sampling from the student's current weights; a larger
+It runs on-policy distillation of a Tinker LoRA student: an agent rolls out on real benchmark
+tasks while sampling from the student's current weights; a larger
 teacher model scores the exact tokens the student sampled; and each training
 step nudges the student toward the teacher with a per-token reverse-KL objective (the
 teacher-minus-student logprob gap as the advantage, trained under Tinker's `importance_sampling`
@@ -12,28 +12,64 @@ student-after solve rates, and only an adapter that closes enough of the gap to 
 promoted. The result is a small model that behaves like the big one inside your agent, plus a
 ready-to-paste serving snippet.
 
+## Rollout sources
+
+Where episodes come from is config-selected: exactly one of `[harbor]` or `[tau2]`.
+
+- **`[harbor]`** (the original source): harbor's own `terminus-2` agent on harbor benchmark
+  tasks (e.g. TerminalBench-2), sampling the student through `harbor.llms.tinker.TinkerLLM`
+  with per-turn token ids recorded into each trial's `result.json`. Everything below about job
+  templates, renderers, compaction, and E2B sandboxes belongs to this source.
+- **`[tau2]`**: Sierra's real tau2-bench, unmodified - tau2's own `llm_agent`, its LLM user
+  simulator, its orchestrator, and its deterministic evaluator (`results.json`
+  `reward_info.reward`). tau2 lives in its own Python 3.13 venv (`tau2_bin` points into it;
+  see `packages/environment-capture/tau-bench/README.md` for the one-time setup) and each
+  episode runs as its own `tau2 run` subprocess whose agent LLM calls a loopback
+  OpenAI-compatible proxy inside the wmo process. A PER-EPISODE `TinkerChatProvider` behind
+  that proxy samples the current weights and records the episode's exact token spans; its
+  prompt state splices `prompt(N) + sampled(N) + suffix`, so the ids are never re-encoded from
+  the text tau2 echoes back and a clean episode stays one training datum. Task ids are
+  composite `"domain/task_id"` strings (`airline/12`); the user simulator is part of the
+  environment and stays pinned (`tau2.user_llm`, default `azure/gpt-5.4-mini`, which needs
+  `AZURE_API_KEY`/`AZURE_API_BASE`/`AZURE_API_VERSION` in the environment).
+  `[rollout.renderers]` and `rollout.compaction` are terminus-2 knobs and are rejected under
+  this source. `rollout.max_turns` maps to tau2's `--max-steps` and `rollout.episode_timeout_s`
+  to its graceful per-simulation `--timeout`. The reference config is
+  `wmo/distill/configs/distill-tau2-smoke.toml`.
+
+Training phases are also composable per run: `train.steps = 0` makes the run **warmup-only**
+(the supervised phase - teacher rollouts, keep-filter, cross-entropy - is the whole run, then
+the student-after eval and the gate run as usual); it is rejected unless `warmup.steps > 0`.
+
 ## Prerequisites
 
 - **The distill extra**: `uv sync --extra distill` (installs the `tinker` SDK and `wandb`).
 - **`TINKER_API_KEY`** in the environment: the student trains and samples on Tinker, and the
   teacher scores there too.
 - **`E2B_API_KEY`** when the run config sets `harbor.backend = "e2b"` (rollout trials in E2B
-  sandboxes); `backend = "local"` runs them on your machine instead.
+  sandboxes); `backend = "local"` runs them on your machine instead. The tau2 source declares
+  the same backend knob but only `"local"` is wired today.
 - **Free E2B sandbox capacity** for `backend = "e2b"`: a running trial holds one concurrent
   sandbox (harbor's task environment; terminus-2 itself runs in the `wmo` process), so a
   run needs `train.trial_concurrency` free slots against your account's concurrent-sandbox
   limit (100 by default; set `WMO_E2B_SANDBOX_CAP` when yours differs). See
   [Sandbox capacity](#sandbox-capacity).
-- **A harbor job template**: the Harbor `JobConfig` YAML/JSON naming the benchmark dataset the
-  trials run against, pointed at by the config's `[harbor] job_template`.
+- **A harbor job template** (harbor source only): the Harbor `JobConfig` YAML/JSON naming the
+  benchmark dataset the trials run against, pointed at by the config's `[harbor] job_template`.
+- **The tau2 clone and its venv** (tau2 source only): `tau2_bin` points at the tau2 CLI inside
+  its own Python 3.13 venv and `data_dir` at the clone's data directory (one-time setup in
+  `packages/environment-capture/tau-bench/README.md`), plus
+  `AZURE_API_KEY`/`AZURE_API_BASE`/`AZURE_API_VERSION` for the pinned azure/ user simulator.
 - **Task-id splits**: two JSON files, each a plain array of task-id strings. The train split
   feeds rollouts and interim evals; the holdout split (disjoint, enforced) is reserved for the
   baselines and the promotion gate.
 
 ## The run config
 
-One TOML file describes one run. `[student]`, `[teacher]`, and `[harbor]` are required; every
-other section has complete defaults. A minimal, realistic config:
+One TOML file describes one run. `[student]`, `[teacher]`, and exactly ONE rollout source
+section (`[harbor]` below; `[tau2]` per the section above, with
+`wmo/distill/configs/distill-tau2-smoke.toml` as its reference shape) are required; every
+other section has complete defaults. A minimal, realistic harbor-source config:
 
 ```toml
 [student]
