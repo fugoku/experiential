@@ -43,6 +43,13 @@ from uuid import uuid4
 import numpy as np
 from pydantic import BaseModel, Field, PrivateAttr, model_validator
 
+from wmo.optimize.compression import (
+    CompressionConfig,
+    Compressor,
+    compression_signature,
+    same_compression,
+    servable_compressor,
+)
 from wmo.providers.base import Embedder, ProviderConfig, ProviderKind
 from wmo.providers.pool import PoolEntry
 from wmo.providers.registry import get_provider
@@ -285,6 +292,10 @@ class ClusterRanking(BaseModel):
     # so `rerank_policy` can re-apply the identical check without the outcome matrix.
     support: dict[str, int] = Field(default_factory=dict)
     total: int = 0  # fit scenarios that landed in this cluster
+    # D-COMPRESS: this cluster's compression choice, fitted jointly with the model ranking.
+    # None (the default) = no cluster-level choice; consumers fall back to the policy-level
+    # `compression`. Additive: pre-compression artifacts load unchanged.
+    compression: CompressionConfig | None = None
 
 
 # How a non-baseline candidate fared, as `RoutingEvidence.gate` records it. "passed" and
@@ -379,6 +390,18 @@ class RoutingPolicy(BaseModel):
     min_support: int | None = None  # scored episodes a challenger needs to lead its cluster
     guard_margin: float | None = None  # reward the challenger must beat the guard by
     fitted_from: str | None = None  # provenance: the outcome matrix the fitter used
+    # D-COMPRESS: the endpoint-level compression choice, applied by the serving compress stage
+    # BEFORE routing (the router embeds what the model will see), so it cannot vary by cluster
+    # at serve time; per-cluster overrides live on ClusterRanking for the joint fit and eval
+    # grids. None (the default) = compression off, today's behavior exactly.
+    compression: CompressionConfig | None = None
+    # D-COMPRESS representation consistency: the compression config the ROUTING EVIDENCE was
+    # fitted under (bank rows, cluster centroids, and the novelty floor quantile all live in the
+    # embedding geometry of whatever text the fit embedded). None (the default) = fitted on raw
+    # text, which is every artifact written before this field existed, so they load unchanged.
+    # A policy that routes may only serve the config it was fitted under: see
+    # `_check_compression`.
+    fit_compression: CompressionConfig | None = None
 
     # kNN policies only (see module docstring and `wmo.optimize.knn`). The fitter records the
     # bank it actually wrote (`knn_bank_path_for(<policy path>)`), so serving resolves the
@@ -448,6 +471,7 @@ class RoutingPolicy(BaseModel):
                 f"guard_model '{self.guard_model}' is not in the policy pool "
                 f"(available: {sorted(names)})"
             )
+        self._check_compression()
         if self.kind != "rank" and self.clusters:
             raise ValueError(f"a {self.kind} policy carries no clusters; use kind='rank'")
         if self.kind == "knn":
@@ -490,6 +514,51 @@ class RoutingPolicy(BaseModel):
                         f"{len(cluster.centroid)}, embedder dim is {self.embedder.dim}"
                     )
         return self
+
+    def _check_compression(self) -> None:
+        """The two D-COMPRESS mount gates, applied wherever a policy is built or loaded.
+
+        1. SERVABILITY: every compressor this artifact names must exist and must attest append
+           stability (`servable_compressor`). Unknown ids and churny compressors fail here, at
+           mount, rather than on the first request mid-conversation.
+        2. REPRESENTATION CONSISTENCY: a policy that ROUTES on embeddings may only serve the
+           compression config its evidence was fitted under. A bank, its cluster centroids, and
+           its novelty floor are geometry in the space of the text the fit embedded; serving a
+           different representation against them was measured (C2 Q2) to trip the novelty floor
+           10-13x more often, collapse route-away, and raise cost 11-41% while accuracy sat flat
+           to negative. That is a silently BROKEN policy, not a degraded one, so it does not
+           mount. Static policies embed nothing and are exempt: there is no geometry to mismatch.
+
+        Per-cluster overrides are checked for servability only. They are fit and eval inputs
+        (`ClusterRanking.compression`); the serve-time stage reads the policy-level config,
+        because cluster assignment is not known until after routing.
+        """
+        servable_compressor(self.compression)
+        for cluster in self.clusters:
+            servable_compressor(cluster.compression)
+        if self.kind == "static" or same_compression(self.compression, self.fit_compression):
+            return
+        raise ValueError(
+            f"this {self.kind} policy's routing evidence was fitted on "
+            f"{compression_signature(self.fit_compression)}, but the endpoint would serve "
+            f"{compression_signature(self.compression)}. A routing bank and its novelty floor "
+            "are only valid for the representation they were fitted on. Refit under the serving "
+            "config (`wmo optimize route fit --compressor <id> --aggressiveness <a>`), or serve "
+            "the config the artifact was fitted under."
+        )
+
+    def serving_compressor(self) -> Compressor | None:
+        """The compressor the serving stage applies, or None when this endpoint compresses nothing.
+
+        Runs both mount gates again rather than trusting validation, for two reasons: the
+        cost/quality dial installs a NEW policy object on a live runtime
+        (`wmo.serving.chat.EndpointRuntime._install_policy`), so the compressor has to follow the
+        object requests actually read; and a policy assembled in memory through `model_copy`
+        never went through a validator at all, so this is the only place a hand-built mismatch
+        is caught before it serves traffic.
+        """
+        self._check_compression()
+        return servable_compressor(self.compression)
 
     def save(self, path: Path) -> None:
         """Write the policy artifact atomically (a torn policy.json must not be loadable)."""

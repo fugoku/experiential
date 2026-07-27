@@ -40,6 +40,14 @@ from wmo.distill.store import MODEL_CARD_FILE, DistillModelCard, student_pool_en
 from wmo.engine import load_world_model
 from wmo.env import WorldModelEnv
 from wmo.env.llm_agent import DEFAULT_HISTORY_CHARS
+from wmo.optimize.compression import (
+    CompressingEmbedder,
+    CompressionConfig,
+    compression_signature,
+    get_compressor,
+    same_compression,
+    servable_compressor,
+)
 from wmo.optimize.knn import (
     COST_QUALITY_ANCHORS,
     DialResult,
@@ -94,6 +102,26 @@ _console = Console()
 
 DEFAULT_MATRIX_FILENAME = "matrix.json"
 """Default `sweep --out`: the outcome matrix `fit` takes as its argument."""
+
+
+def _compression_for(compressor: str, aggressiveness: float) -> CompressionConfig:
+    """The compression config `--compressor` names, stamped with the version that will RUN.
+
+    The version is read off the resolved implementation rather than defaulted, because that is
+    what the field means: the version this config was fitted against. Defaulting it to "1" made
+    every fit against a version-bumped compressor stamp a lie, which the mount gate would then
+    correctly refuse with a remedy the CLI has no flag to carry out.
+
+    Raises (naming the compressor) when the id is unknown or the implementation is not servable.
+    """
+    resolved = get_compressor(compressor)
+    config = CompressionConfig(
+        compressor_id=compressor,
+        compressor_version=resolved.version,
+        aggressiveness=aggressiveness,
+    )
+    servable_compressor(config)
+    return config
 
 
 @route_app.command("sweep")
@@ -161,6 +189,22 @@ def sweep(
         "scenarios. The fit is then biased (both fitters skip unscored rows and weigh the rest per "
         "episode); the coverage table prints either way.",
     ),
+    compressor: str = typer.Option(
+        None,
+        "--compressor",
+        help="D-COMPRESS: measure every candidate call through this compressor (identity | "
+        "truncate), so the matrix is the compressed ARM of the grid. Default: uncompressed. "
+        "`fit` requires the matrix arm to match the policy it stamps.",
+    ),
+    aggressiveness: float = typer.Option(
+        0.0,
+        "--aggressiveness",
+        min=0.0,
+        max=1.0,
+        help="Compressor-defined dial in [0, 1] for --compressor: 0.0 is a no-op and higher "
+        "never removes less, but it is not an exact removal fraction (the achieved ratio is "
+        "recorded per episode).",
+    ),
 ) -> None:
     """Measure every pool candidate closed-loop and write the outcome matrix `fit` consumes.
 
@@ -221,6 +265,16 @@ def sweep(
     it, and the matrix is written either way.
     """
     out_path = Path(out)
+    if compressor is None and aggressiveness > 0.0:
+        raise typer.BadParameter("--aggressiveness needs --compressor to apply it")
+    sweep_compression = None
+    if compressor is not None:
+        try:
+            # Checked before a single episode is paid for, and against the SERVING rule: there
+            # is no point measuring an arm whose compressor could never be mounted.
+            sweep_compression = _compression_for(compressor, aggressiveness)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
     store = WorldModelStore(root)
     try:
         model_dir = store.resolve(model)
@@ -256,6 +310,7 @@ def sweep(
             assume_input_tokens=assume_input_tokens,
             assume_output_tokens=assume_output_tokens,
             history_chars=history_chars,
+            compression=sweep_compression,
         )
     except SweepError as exc:
         raise typer.BadParameter(str(exc)) from exc
@@ -281,8 +336,8 @@ def sweep(
     # the line would print a path that does not exist (and this one is meant to be copied).
     _console.print(
         f"[green]✓[/green] {len(matrix.outcomes)} cell(s), {scored} scored -> {escape(out)}\n"
-        f"  measured candidate spend ${run.candidate_usd:.4f} (the world model's own serve/judge "
-        "cost is metered separately)",
+        f"  measured candidate spend ${run.candidate_usd:.4f}{_compressor_note(run)} (the world "
+        "model's own serve/judge cost is metered separately)",
         soft_wrap=True,  # a path a user copies must not be wrapped
     )
     print_world_model_spend(_console, run)
@@ -349,6 +404,19 @@ def print_tiny_corpus_note(console: Console, plan: SweepPlan) -> None:
         "these scenarios come from the FULL corpus: they are not leak-free, and a policy "
         "fitted on them is a smoke test, not evidence"
     )
+
+
+def _compressor_note(run: SweepRun) -> str:
+    """Name the compressor's share of candidate spend, but only when one actually billed.
+
+    The D-COMPRESS rule folds the compressor's inference cost into the candidate figure, so on a
+    compressed arm that number is not just the models. Saying so on an UNCOMPRESSED sweep would
+    be noise about a stage that did not run, which is why this is conditional on a nonzero bill
+    rather than on the flag.
+    """
+    if run.compressor_usd <= 0.0:
+        return ""
+    return f" (incl. ${run.compressor_usd:.4f} compressor)"
 
 
 def print_world_model_spend(console: Console, run: SweepRun) -> None:
@@ -791,6 +859,21 @@ def fit(
     api_key_env: str = typer.Option(
         None, "--api-key-env", help="(azure) env var holding the account key."
     ),
+    compressor: str = typer.Option(
+        None,
+        "--compressor",
+        help="D-COMPRESS: compressor id the endpoint applies before routing (identity | "
+        "truncate). Default: compression off.",
+    ),
+    aggressiveness: float = typer.Option(
+        0.0,
+        "--aggressiveness",
+        min=0.0,
+        max=1.0,
+        help="Compressor-defined dial in [0, 1]: 0.0 is a no-op and higher never removes "
+        "less, but it is not an exact removal fraction (the achieved ratio is reported per "
+        "call). Only meaningful with --compressor.",
+    ),
 ) -> None:
     """Fit a routing policy on an outcome matrix (kNN evidence or Avengers cluster ranks)."""
     if kind not in ("rank", "knn"):
@@ -817,6 +900,31 @@ def fit(
         probe_embedder(spec)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
+    if compressor is None and aggressiveness > 0.0:
+        raise typer.BadParameter("--aggressiveness needs --compressor to apply it")
+    compression = None
+    if compressor is not None:
+        try:
+            # Fail before the fit spends anything: model_copy below skips validators, and an
+            # unservable compressor would otherwise only surface when serving mounts the result.
+            compression = _compression_for(compressor, aggressiveness)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+    # The rewards in this matrix were produced under SOME compression config, and a joint fit is
+    # only joint if that config is the one being fitted. `--compressor` moves the fit-side
+    # representation (embeddings), but it cannot retroactively change what the episodes ran
+    # under: fitting a compressed policy over uncompressed rewards would stamp an arm that was
+    # never measured. Checked both directions, since compressed rewards under a raw fit is the
+    # same mistake mirrored.
+    measured = matrix.measured_compression()
+    if not same_compression(measured, compression):
+        raise typer.BadParameter(
+            f"this matrix's rewards were measured with {compression_signature(measured)}, but "
+            f"the fit would stamp {compression_signature(compression)}. Rewards cannot be "
+            "recompressed after the fact, so measure the arm you intend to serve: "
+            "`wmo optimize route sweep <model> --compressor <id> --aggressiveness <a>` writes a "
+            "matrix whose episodes actually ran that way (one matrix per arm)."
+        )
     if kind == "knn":
         if cost_weight > 0.0:
             raise typer.BadParameter(
@@ -836,10 +944,16 @@ def fit(
             min_pairs=min_pairs,
             se_floor=se_floor,
             floor_q=floor_q,
+            compression=compression,
         )
         print_knn_fit(_console, fitted, out=out, z=z)
         return
     built = spec.build()  # ONE embedder for fit and evaluation; azure would otherwise embed twice
+    if compression is not None:
+        # Representation consistency: the cluster centroids have to live in the geometry of the
+        # text serving will embed, which is the COMPRESSED text (see `fit_knn_artifact`, which
+        # applies the same rule to the bank on the knn path).
+        built = CompressingEmbedder(built, compression)
     policy = fit_rank_policy(
         matrix,
         embedder=spec,
@@ -854,6 +968,14 @@ def fit(
     )
     if cost_weight > 0.0:
         policy = rerank_policy(policy, cost_weight=cost_weight)
+    if compression is not None:
+        # Stamped as BOTH halves of the contract: what this endpoint serves, and what its
+        # evidence was fitted under. They are the same config here by construction (the fit just
+        # embedded through it), which is exactly what the mount gate re-checks. The knn path
+        # stamps inside `fit_knn_artifact`, which saves and returns before this line.
+        policy = policy.model_copy(
+            update={"compression": compression, "fit_compression": compression}
+        )
     policy.save(out_path)
     result = evaluate_policy(policy, matrix, matrix.scenario_ids(), embedder=built)
     _console.print(

@@ -13,6 +13,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, model_validator
 
+from wmo.optimize.compression import CompressionConfig
 from wmo.providers.base import TokenUsage
 from wmo.providers.pool import PoolEntry
 
@@ -46,6 +47,18 @@ class ScenarioOutcome(BaseModel):
     # fitting). Reasoning models that emit thought before the JSON action keep it here.
     replies: list[str] = []
     error: str | None = None
+    # D-COMPRESS fields, additive with defaults so pre-compression matrices load unchanged;
+    # 0/"" = the episode ran uncompressed. Token counts are the compressor's deterministic
+    # proxy totals summed over the episode's calls (wmo.optimize.compression); billable truth
+    # stays in `usage`/`cost_usd`. Latency and cost are the compressor's OWN, which sit inside
+    # effective cost per the compression track's accounting rules.
+    tokens_in_raw: int = 0
+    tokens_in_compressed: int = 0
+    compressor_id: str = ""
+    compressor_version: str = ""
+    aggressiveness: float = 0.0
+    compressor_latency_s: float = 0.0
+    compressor_cost_usd: float = 0.0
 
     @property
     def scored(self) -> bool:
@@ -78,6 +91,40 @@ class OutcomeMatrix(BaseModel):
                 f"pool models are {sorted(names)}"
             )
         return self
+
+    def measured_compression(self) -> CompressionConfig | None:
+        """The compression config every scored row was measured under (None = uncompressed).
+
+        A matrix is ONE arm of the grid: its rewards were produced by episodes that all ran
+        under the same conditions, which is what makes the rows comparable and what a policy
+        fitted from them is entitled to claim. Rows that disagree about compression are two arms
+        in one file, so this raises rather than picking a winner.
+
+        Reads the scored rows only: an unscored row never produced a reward, so whatever it ran
+        under cannot bias a fit.
+        """
+        configs = {
+            (o.compressor_id, o.compressor_version, o.aggressiveness)
+            for o in self.outcomes
+            if o.scored
+        }
+        if len(configs) > 1:
+            readable = sorted(f"{cid or 'uncompressed'}/{ver}/{agg:g}" for cid, ver, agg in configs)
+            raise ValueError(
+                "this matrix mixes compression configs across its scored rows "
+                f"({', '.join(readable)}), so its rows are not comparable and no single policy "
+                "can be fitted from them. Capture one matrix per arm."
+            )
+        if not configs:
+            return None
+        compressor_id, compressor_version, aggressiveness = configs.pop()
+        if not compressor_id:
+            return None
+        return CompressionConfig(
+            compressor_id=compressor_id,
+            compressor_version=compressor_version,
+            aggressiveness=aggressiveness,
+        )
 
     def model_names(self) -> list[str]:
         return [entry.name for entry in self.pool]
