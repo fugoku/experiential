@@ -130,19 +130,21 @@ def show_harness(
 
 
 optimize_app = typer.Typer(
-    help="Optimizers behind one switch, one per artifact they produce: harness "
-    "(agent-scaffold search), route (learned inference policy), model (a distilled "
-    "adapter).",
+    help="Optimizers behind one switch. `model` is the staged one-command path (preflight, "
+    "sweep, fit, tune, report); `route` is those steps individually; `harness` searches the "
+    "agent scaffold; `distill` trains an adapter.",
     no_args_is_help=True,
 )
 
 # Local import placement: route_app imports the optimize package and model_app imports this
 # module back; registering here keeps the whole optimizer family visible in one place.
 from wmo.cli.model_app import model_app  # noqa: E402
+from wmo.cli.optimize_model_app import optimize_model  # noqa: E402
 from wmo.cli.route_app import route_app  # noqa: E402
 
 optimize_app.add_typer(route_app, name="route")
-optimize_app.add_typer(model_app, name="model")
+optimize_app.add_typer(model_app, name="distill")
+optimize_app.command("model")(optimize_model)
 
 
 @optimize_app.command("harness")
@@ -275,7 +277,7 @@ def optimize(
     worker placement (local = docker tasks + local pi; e2b = E2B tasks + sandboxed pi), while
     the PROPOSER project always runs in E2B in this version.
 
-    To train the agent MODEL instead of its harness, use `wmo optimize model run`.
+    To train the agent MODEL instead of its harness, use `wmo optimize distill run`.
     """
     if model == _HARBOR_ENVIRONMENT:
         world_model_only = [
