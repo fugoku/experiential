@@ -7,6 +7,7 @@ import inspect
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -15,8 +16,9 @@ import pytest
 import typer
 from typer.testing import CliRunner
 
-from wmo.cli import app
+from wmo.cli import app, pool_registry
 from wmo.cli.app import _CONCURRENCY_ISOLATION_FLAGS
+from wmo.cli.pool_registry import read_pool_entries
 from wmo.config import HarnessConfig, ModelRole, load_config, load_settings, save_settings
 from wmo.core.types import Trace
 from wmo.engine.build import DEFAULT_TRAIN_SPLIT, split_traces, split_traces_3way
@@ -29,6 +31,8 @@ from wmo.providers.base import (
     VerifyResult,
     verify_via_ping,
 )
+from wmo.providers.openrouter_pricing import CATALOG_PATH_ENV, PriceCatalog
+from wmo.tracking.pricing import ModelPrice
 
 # `wmo.cli`'s `app` attribute (the Typer object) shadows the `wmo.cli.app` submodule on
 # plain `import wmo.cli.app as ...`; go through importlib to monkeypatch module globals.
@@ -524,6 +528,363 @@ def test_providers_set_verifies_and_saves_local_worker(monkeypatch, tmp_path) ->
     assert worker.provider == "openai"
     assert worker.model == "gpt-5.4-mini"
     assert worker.endpoint == "https://models.example/v1"
+
+
+def _accept_every_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub both live pings so `providers set` reaches, and gets through, pool registration.
+
+    Two seams, because the command proves two different things: `verify_all` proves the worker
+    provider, and `verify_pool_entry` proves each routing candidate over its own route.
+    """
+    monkeypatch.setattr(
+        cli_app_module,
+        "verify_all",
+        lambda configs: [
+            VerifyResult(ok=True, kind=config.kind, model=config.model) for config in configs
+        ],
+    )
+    monkeypatch.setattr(
+        pool_registry,
+        "verify_pool_entry",
+        lambda entry: VerifyResult(ok=True, kind=entry.kind, model=entry.model),
+    )
+
+
+def _seed_openrouter_catalog(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point the OpenRouter price resolver at a fixture catalog (the suite never fetches)."""
+    catalog = PriceCatalog(
+        fetched_at=time.time(),
+        source="test fixture",
+        prices={
+            "anthropic/claude-sonnet-4.5": ModelPrice(input_per_mtok=3.0, output_per_mtok=15.0)
+        },
+    )
+    path = tmp_path / "openrouter-prices.json"
+    path.write_text(catalog.model_dump_json(), encoding="utf-8")
+    monkeypatch.setenv(CATALOG_PATH_ENV, str(path))
+
+
+def test_providers_set_registers_pool_models_beside_the_settings_it_writes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The blocker this command exists to remove: nothing wrote `pool.toml` for an ordinary
+    # provider model, so a router had no candidates without hand-authored TOML.
+    _accept_every_provider(monkeypatch)
+    _seed_openrouter_catalog(tmp_path, monkeypatch)
+    root = tmp_path / ".wmo"
+
+    result = runner.invoke(
+        app,
+        [
+            "providers",
+            "set",
+            "--provider",
+            "openrouter",
+            "--model",
+            "anthropic/claude-sonnet-4.5",
+            "--pool-model",
+            "anthropic/claude-sonnet-4.5",
+            "--tier",
+            "open",
+            "--root",
+            str(root),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    worker = load_settings(root).models.worker
+    assert worker is not None and worker.provider == "openrouter"
+    entries = read_pool_entries(root / "pool.toml")
+    assert [(entry.name, entry.model, entry.tier) for entry in entries] == [
+        ("claude-sonnet-4.5", "anthropic/claude-sonnet-4.5", "open")
+    ]
+    # Priced from the published catalog, so the roster never reports $0 for this candidate.
+    assert entries[0].price().input_per_mtok == 3.0
+
+
+def test_providers_set_registers_into_an_explicit_pool_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _accept_every_provider(monkeypatch)
+    roster = tmp_path / "rosters" / "candidates.toml"
+
+    result = runner.invoke(
+        app,
+        [
+            "providers",
+            "set",
+            "--provider",
+            "bedrock",
+            "--model",
+            "claude-opus-4-8",
+            "--pool-model",
+            "claude-haiku-4-5",
+            "--pool",
+            str(roster),
+            "--root",
+            str(tmp_path / ".wmo"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    entry = read_pool_entries(roster)[0]
+    assert entry.kind is ProviderKind.BEDROCK
+    # Resolved through the built-in registry, so the entry carries the callable runtime id.
+    assert entry.model == "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+    assert entry.model_type == "claude-haiku-4-5"
+
+
+def test_providers_set_refuses_a_pool_model_it_cannot_price(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A candidate with no price silently costs $0, and a cost-aware policy routes everything to
+    # it. Non-interactively there is nobody to ask, so the command has to refuse.
+    _accept_every_provider(monkeypatch)
+    root = tmp_path / ".wmo"
+
+    result = runner.invoke(
+        app,
+        [
+            "providers",
+            "set",
+            "--provider",
+            "openai",
+            "--model",
+            "gpt-5.4-mini",
+            "--pool-model",
+            "some-unlisted-model",
+            "--root",
+            str(root),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "no built-in price" in result.output
+    assert not (root / "pool.toml").exists()
+
+
+def test_providers_set_prices_a_pool_model_from_the_flags(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _accept_every_provider(monkeypatch)
+    root = tmp_path / ".wmo"
+
+    result = runner.invoke(
+        app,
+        [
+            "providers",
+            "set",
+            "--provider",
+            "openai",
+            "--model",
+            "gpt-5.4-mini",
+            "--endpoint",
+            "https://vllm.example/v1",
+            "--pool-model",
+            "qwen3-32b",
+            "--input-per-mtok",
+            "0.1",
+            "--output-per-mtok",
+            "0.4",
+            "--api-key-env",
+            "WMO_ENDPOINT_API_KEY",
+            "--root",
+            str(root),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    entry = read_pool_entries(root / "pool.toml")[0]
+    assert (entry.input_per_mtok, entry.output_per_mtok) == (0.1, 0.4)
+    assert entry.endpoint == "https://vllm.example/v1"
+    assert entry.api_key_env == "WMO_ENDPOINT_API_KEY"
+
+
+def test_providers_set_rejects_an_unknown_tier(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _accept_every_provider(monkeypatch)
+
+    result = runner.invoke(
+        app,
+        [
+            "providers",
+            "set",
+            "--provider",
+            "openai",
+            "--model",
+            "gpt-5.4-mini",
+            "--tier",
+            "cheap",
+            "--root",
+            str(tmp_path / ".wmo"),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "frontier, open" in result.output
+
+
+def test_providers_set_never_guesses_an_azure_deployment_for_the_pool(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The worker config fills an Azure deployment in from the model id when none was given; a
+    # pool entry must not inherit that guess, because Azure sends the deployment as the request
+    # model and a guessed name addresses a route that does not exist.
+    _accept_every_provider(monkeypatch)
+    root = tmp_path / ".wmo"
+
+    result = runner.invoke(
+        app,
+        [
+            "providers",
+            "set",
+            "--provider",
+            "azure",
+            "--model",
+            "gpt-5.5",
+            "--pool-model",
+            "gpt-5.5",
+            "--root",
+            str(root),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "azure needs --deployment" in result.output
+    assert not (root / "pool.toml").exists()
+    # The worker role is still saved with its derived deployment: only the pool is strict.
+    worker = load_settings(root).models.worker
+    assert worker is not None and worker.deployment == "gpt-5.5"
+
+
+def test_providers_set_registers_a_named_azure_deployment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _accept_every_provider(monkeypatch)
+    root = tmp_path / ".wmo"
+
+    result = runner.invoke(
+        app,
+        [
+            "providers",
+            "set",
+            "--provider",
+            "azure",
+            "--model",
+            "gpt-5.5",
+            "--deployment",
+            "chat-prod",
+            "--api-version",
+            "2025-01-01-preview",
+            "--pool-model",
+            "gpt-5.5",
+            "--root",
+            str(root),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    entry = read_pool_entries(root / "pool.toml")[0]
+    assert (entry.name, entry.model, entry.deployment) == ("chat-prod", "gpt-5.5", "chat-prod")
+    assert entry.api_version == "2025-01-01-preview"
+
+
+def test_providers_set_refuses_a_pool_model_that_cannot_be_called(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A --pool-model can differ from the verified worker in model, endpoint, deployment and
+    # credential, so the worker's ping proves nothing about it. Registering it unproved would
+    # surface as a 401 inside a paid `route sweep`, after the candidates ahead of it were billed.
+    _accept_every_provider(monkeypatch)
+    monkeypatch.setattr(
+        pool_registry,
+        "verify_pool_entry",
+        lambda entry: VerifyResult(
+            ok=False, kind=entry.kind, model=entry.model, detail="401 unauthorized"
+        ),
+    )
+    root = tmp_path / ".wmo"
+
+    result = runner.invoke(
+        app,
+        [
+            "providers",
+            "set",
+            "--provider",
+            "openai",
+            "--model",
+            "gpt-5.4-mini",
+            "--pool-model",
+            "gpt-5.4",
+            "--root",
+            str(root),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "not callable" in result.output
+    assert not (root / "pool.toml").exists()
+
+
+def test_providers_set_rejects_half_a_price_pair(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A pool entry prices both token tiers or neither. Half a pair would be dropped silently in
+    # the interactive flow and rejected as an invalid entry with --pool-model, so it is refused
+    # up front, where the message can name the flag.
+    _accept_every_provider(monkeypatch)
+    root = tmp_path / ".wmo"
+
+    result = runner.invoke(
+        app,
+        [
+            "providers",
+            "set",
+            "--provider",
+            "openai",
+            "--model",
+            "gpt-5.4-mini",
+            "--pool-model",
+            "qwen3-32b",
+            "--input-per-mtok",
+            "0.1",
+            "--root",
+            str(root),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "both --input-per-mtok and --output-per-mtok" in result.output
+    assert not (root / "pool.toml").exists()
+
+
+def test_providers_set_without_pool_flags_leaves_scripted_runs_untouched(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The pre-existing contract: `--provider` + `--model` prompts for nothing and writes only
+    # settings. Registration is an addition, never something a script trips over.
+    _accept_every_provider(monkeypatch)
+    root = tmp_path / ".wmo"
+
+    result = runner.invoke(
+        app,
+        [
+            "providers",
+            "set",
+            "--provider",
+            "openai",
+            "--model",
+            "gpt-5.4-mini",
+            "--root",
+            str(root),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert load_settings(root).models.worker is not None
+    assert not (root / "pool.toml").exists()
+    assert "Register models" not in result.output
 
 
 def test_providers_set_does_not_save_a_failed_provider(monkeypatch, tmp_path) -> None:  # noqa: ANN001
