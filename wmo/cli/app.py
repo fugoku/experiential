@@ -933,8 +933,12 @@ def download(
             raise typer.BadParameter(str(exc)) from exc
         except urllib.error.HTTPError as exc:
             # One unpublished/broken dataset must not abort the REST of a multi-download:
-            # record it, keep fetching, and fail (with every name) at the end.
-            failures.append(f"{name}: the Hub answered {exc.code} for {exc.url}")
+            # record it, keep fetching, and fail (with every name) at the end. The reason is
+            # quoted rather than summarized here: a fetch tries more than one dataset repo id
+            # and only the error it raises knows which ones the Hub refused. Reading it off
+            # plain HTTPError attributes keeps this working against the PUBLISHED
+            # environment-capture, which the WMO wheel resolves from PyPI.
+            failures.append(f"{name}: the Hub answered {exc.code} for {exc.url} ({exc.reason})")
             _console.print(f"[yellow]skipping {name}: Hub answered {exc.code}[/yellow]")
             continue
         except urllib.error.URLError as exc:
