@@ -39,6 +39,7 @@ from wmo.config import ARTIFACT_DIR, WorldModelStore
 from wmo.distill.store import MODEL_CARD_FILE, DistillModelCard, student_pool_entry
 from wmo.engine import load_world_model
 from wmo.env import WorldModelEnv
+from wmo.env.llm_agent import DEFAULT_HISTORY_CHARS
 from wmo.optimize.knn import (
     COST_QUALITY_ANCHORS,
     DialResult,
@@ -48,10 +49,14 @@ from wmo.optimize.knn import (
 )
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome, load_matrix_with_digest
 from wmo.optimize.policy import (
+    AZURE_EMBEDDER_DIM,
+    AZURE_EMBEDDER_ENV,
+    HASHING_EMBEDDER_DIM,
     POLICY_FILENAME,
-    EmbedderSpec,
     RoutingPolicy,
     embedder_provenance,
+    probe_embedder,
+    resolve_embedder,
 )
 from wmo.optimize.report import build_report
 from wmo.optimize.routing import evaluate_policy, fit_rank_policy, rerank_policy
@@ -121,6 +126,15 @@ def sweep(
     ),
     max_steps: int = typer.Option(
         20, "--max-steps", min=1, help="Step budget per episode (also the cost estimate's cap)."
+    ),
+    history_chars: int = typer.Option(
+        DEFAULT_HISTORY_CHARS,
+        "--history-chars",
+        min=1,
+        help="Characters of each observation the agent sees on later turns. Raise it for an "
+        "environment whose tool payloads are large: too small and the agent cannot see what it "
+        "just fetched, so it re-fetches. Changes what candidates are measured on, so matrices "
+        "swept at different values are not comparable.",
     ),
     assume_input_tokens: int = typer.Option(
         2000,
@@ -241,6 +255,7 @@ def sweep(
             max_steps=max_steps,
             assume_input_tokens=assume_input_tokens,
             assume_output_tokens=assume_output_tokens,
+            history_chars=history_chars,
         )
     except SweepError as exc:
         raise typer.BadParameter(str(exc)) from exc
@@ -755,8 +770,22 @@ def fit(
         help="Quality/cost knob: reward points paid per average-call-cost unit (0 = pure "
         "accuracy ranking, the Avengers reference behavior).",
     ),
-    embedder: str = typer.Option("hashing", "--embedder", help="hashing | azure"),
-    dim: int = typer.Option(512, "--dim", help="Embedding dimension."),
+    embedder: str = typer.Option(
+        "auto",
+        "--embedder",
+        help="auto | hashing | azure. auto uses the Azure text-embedding-3-large deployment when "
+        f"{' and '.join(AZURE_EMBEDDER_ENV)} are set, and hashing otherwise; either way it says "
+        "which one it picked. Resolving to azure means this fit CALLS A PAID EMBEDDING API "
+        "(billed to that resource); --embedder hashing keeps it offline and free.",
+    ),
+    dim: int = typer.Option(
+        None,
+        "--dim",
+        min=1,
+        help="Embedding dimension, sent as the request's `dimensions`. Default: the resolved "
+        f"model's native width ({HASHING_EMBEDDER_DIM} hashing, {AZURE_EMBEDDER_DIM} "
+        "text-embedding-3-large). Set it only to reduce a model's output deliberately.",
+    ),
     deployment: str = typer.Option(None, "--deployment", help="(azure) embedding deployment."),
     endpoint: str = typer.Option(None, "--endpoint", help="(azure) resource endpoint."),
     api_key_env: str = typer.Option(
@@ -767,24 +796,27 @@ def fit(
     if kind not in ("rank", "knn"):
         raise typer.BadParameter(f"unknown kind '{kind}'; use knn or rank")
     matrix, source = load_matrix_with_digest(Path(matrix_file))
-    if embedder not in ("hashing", "azure"):
-        raise typer.BadParameter(f"unknown embedder '{embedder}'; use hashing or azure")
-    spec = (
-        EmbedderSpec(dim=dim)
-        if embedder == "hashing"
-        else EmbedderSpec(
-            kind="azure",
-            dim=dim,
-            deployment=deployment,
-            endpoint=endpoint,
-            api_key_env=api_key_env,
+    try:
+        spec, resolution = resolve_embedder(
+            embedder, dim=dim, deployment=deployment, endpoint=endpoint, api_key_env=api_key_env
         )
-    )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    # Printed before the fit, not after: the embedder decides what the policy can route on, and an
+    # operator who meant to fit on semantic vectors should see that it fell back BEFORE paying for
+    # the fit and reading an accuracy number that quietly came from hashed features.
+    _console.print(resolution)
     out_path = Path(out)
     if rag_thres <= 0.0:
         # typer's min is inclusive but the artifact field requires > 0; fail before the fit
         # writes a sidecar it will then abandon.
         raise typer.BadParameter("--rag-thres must be greater than 0")
+    # One throwaway embedding BEFORE the bulk work: an unreachable or embedding-less resource is
+    # a usage error at the boundary here, instead of a traceback from inside the fit.
+    try:
+        probe_embedder(spec)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     if kind == "knn":
         if cost_weight > 0.0:
             raise typer.BadParameter(

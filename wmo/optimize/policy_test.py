@@ -12,6 +12,10 @@ import pytest
 from pydantic import ValidationError
 
 from wmo.optimize.policy import (
+    AZURE_EMBEDDER_DEPLOYMENT,
+    AZURE_EMBEDDER_DIM,
+    HASHING_DOWNGRADE_NOTICE,
+    HASHING_EMBEDDER_DIM,
     KNN_BANK_FILENAME,
     ClusterRanking,
     EmbedderSpec,
@@ -19,7 +23,9 @@ from wmo.optimize.policy import (
     RoutingPolicy,
     embedder_provenance,
     knn_decision,
+    probe_embedder,
     rank_decision,
+    resolve_embedder,
     select_model,
     write_artifact_atomically,
 )
@@ -780,3 +786,264 @@ def test_embedder_provenance_separates_two_azure_resources() -> None:
     # must not read as a refit.
     assert embedder_provenance(azure("https://east.openai.azure.com", "OTHER_KEY")) == east
     assert embedder_provenance(EmbedderSpec(dim=512)) == "hashing-512"
+
+
+def test_evidence_records_the_guards_numbers_when_a_pick_is_routed() -> None:
+    # The same decision the reason string describes in prose, in a shape something can aggregate.
+    decision = knn_decision(_knn_policy(_knn_bank([[0.0, 1.0]] * 12)), _QUERY)
+    assert decision.evidence is not None
+    assert decision.evidence.gate == "passed"
+    assert decision.evidence.propensity == "greedy"
+    assert decision.evidence.n_pairs == 12
+    assert decision.evidence.mean_diff == pytest.approx(1.0)
+    assert decision.evidence.se is not None
+
+
+def test_evidence_records_a_guard_revert_as_fallback_forced() -> None:
+    decision = knn_decision(_knn_policy(_knn_bank([[0.0, 1.0]] * 5)), _QUERY)
+    assert decision.evidence is not None
+    assert decision.evidence.gate == "reverted"
+    assert decision.evidence.propensity == "fallback-forced"
+    # The numbers behind the refusal are kept, which is what makes a revert diagnosable in bulk.
+    assert decision.evidence.n_pairs == 5
+
+
+def test_evidence_calls_a_baseline_that_won_on_merit_greedy_with_no_gate() -> None:
+    # Nothing overrode the router here: the baseline WAS its preference, so counting this as a
+    # forced fallback would make a healthy endpoint look like a coverage problem.
+    decision = knn_decision(_knn_policy(_knn_bank([[1.0, 0.0]] * 12)), _QUERY)
+    assert decision.evidence is not None
+    assert decision.evidence.gate is None
+    assert decision.evidence.propensity == "greedy"
+    assert decision.evidence.n_pairs is None
+
+
+def test_evidence_records_a_novelty_abstain() -> None:
+    policy = _knn_policy(_knn_bank([[0.0, 1.0]] * 12))
+    abstaining = policy.model_copy(update={"floor_sim": 2.0})  # no similarity can clear it
+    abstaining.attach_bank(policy.knn_bank())
+    decision = knn_decision(abstaining, _QUERY)
+    assert decision.model == "fable-5"
+    assert decision.evidence is not None
+    assert decision.evidence.gate == "novelty-abstain"
+    assert decision.evidence.propensity == "fallback-forced"
+
+
+def test_select_model_attaches_the_normalized_query_vector() -> None:
+    policy = _knn_policy(_knn_bank([[0.0, 1.0]] * 12))
+    decision = select_model(policy, "anything", embedder=_UnitEmbedder())
+    vector = decision.query_embedding()
+    assert vector is not None
+    assert float(np.linalg.norm(vector)) == pytest.approx(1.0)
+    # Private state, not part of the decision's shape: it must never reach a log row or a report.
+    assert "query_embedding" not in decision.model_dump()
+
+
+def test_a_sticky_decision_carries_no_evidence_and_no_vector() -> None:
+    # It never consulted the policy at all, so reporting evidence would be inventing it.
+    policy = _knn_policy(_knn_bank([[0.0, 1.0]] * 12))
+    decision = select_model(policy, "anything", incumbent="haiku-4-5", embedder=_UnitEmbedder())
+    assert decision.evidence is None
+    assert decision.query_embedding() is None
+
+
+def test_a_static_policy_carries_no_evidence() -> None:
+    assert select_model(_static(), "anything").evidence is None
+
+
+# --- `--embedder` resolution -------------------------------------------------------------
+# Moved here with the code it covers when `resolve_embedder`/`probe_embedder` left the CLI
+# (they are now used by two fit commands). They assert ValueError; that the CLI turns it into a
+# usage error is covered in `wmo/cli/route_app_test.py`.
+def test_embedder_auto_resolves_to_azure_when_the_standard_env_is_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "k")
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://sheets.openai.azure.com")
+    spec, line = resolve_embedder(
+        "auto", dim=None, deployment=None, endpoint=None, api_key_env=None
+    )
+    assert spec.kind == "azure"
+    assert spec.deployment == AZURE_EMBEDDER_DEPLOYMENT
+    assert spec.dim == AZURE_EMBEDDER_DIM  # the champion's width, not the hashing default
+    assert spec.endpoint == "https://sheets.openai.azure.com"
+    assert spec.api_key_env == "AZURE_OPENAI_API_KEY"
+    assert "azure text-embedding-3-large (3072d native)" in line
+
+
+def test_embedder_auto_falls_back_to_hashing_and_quotes_the_measured_gap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("AZURE_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("AZURE_OPENAI_ENDPOINT", raising=False)
+    spec, line = resolve_embedder(
+        "auto", dim=None, deployment=None, endpoint=None, api_key_env=None
+    )
+    assert spec.kind == "hashing"
+    assert spec.dim == HASHING_EMBEDDER_DIM
+    # The downgrade is never silent, and it quotes the numbers rather than warning vaguely.
+    assert HASHING_DOWNGRADE_NOTICE in line
+    assert "AZURE_OPENAI_API_KEY" in line and "AZURE_OPENAI_ENDPOINT" in line
+
+
+def test_embedder_auto_needs_both_variables_not_just_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A key with no endpoint cannot embed anything; falling back is right, and the line says
+    # which half is missing so the operator can finish the setup.
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "k")
+    monkeypatch.delenv("AZURE_OPENAI_ENDPOINT", raising=False)
+    spec, line = resolve_embedder(
+        "auto", dim=None, deployment=None, endpoint=None, api_key_env=None
+    )
+    assert spec.kind == "hashing"
+    assert "AZURE_OPENAI_ENDPOINT unset" in line
+
+
+def test_explicit_hashing_is_unchanged_even_with_the_azure_env_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "k")
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://sheets.openai.azure.com")
+    spec, line = resolve_embedder(
+        "hashing", dim=None, deployment=None, endpoint=None, api_key_env=None
+    )
+    assert (spec.kind, spec.dim) == ("hashing", HASHING_EMBEDDER_DIM)
+    assert "explicit" in line
+
+
+def test_explicit_azure_keeps_its_flags(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("AZURE_OPENAI_ENDPOINT", raising=False)
+    spec, line = resolve_embedder(
+        "azure",
+        dim=None,
+        deployment="text-embedding-3-large",
+        endpoint="https://x",
+        api_key_env="MY_KEY",
+    )
+    assert (spec.kind, spec.endpoint, spec.api_key_env) == ("azure", "https://x", "MY_KEY")
+    assert "explicit" in line
+
+
+def test_explicit_azure_gets_the_models_native_width_not_the_hashing_default() -> None:
+    # The footgun this closes: `--dim` used to default to 512 everywhere, so an explicit azure
+    # fit asked a 3072-dimensional model for 512-dimensional vectors and fitted on the
+    # truncation. `dim` is the request's `dimensions` parameter, not bookkeeping.
+    spec, line = resolve_embedder(
+        "azure",
+        dim=None,
+        deployment="text-embedding-3-large",
+        endpoint="https://x",
+        api_key_env=None,
+    )
+    assert spec.dim == AZURE_EMBEDDER_DIM
+    assert "3072d native" in line
+
+
+def test_a_smaller_model_resolves_to_its_own_native_width() -> None:
+    spec, _ = resolve_embedder(
+        "azure",
+        dim=None,
+        deployment="text-embedding-3-small",
+        endpoint="https://x",
+        api_key_env=None,
+    )
+    assert spec.dim == 1536
+
+
+def test_an_unrecognized_deployment_name_assumes_3_large_and_says_so() -> None:
+    # Azure deployment names are operator-chosen, so this is common; the guess is stated in the
+    # line and one flag overrides it.
+    spec, line = resolve_embedder(
+        "azure", dim=None, deployment="prod-embeddings", endpoint="https://x", api_key_env=None
+    )
+    assert spec.dim == AZURE_EMBEDDER_DIM
+    assert "assumed" in line and "--dim" in line
+
+
+def test_an_explicit_dim_is_honored_verbatim_on_the_azure_path() -> None:
+    # A deliberate reduction is still available; it is just no longer the silent default.
+    spec, line = resolve_embedder(
+        "azure",
+        dim=256,
+        deployment="text-embedding-3-large",
+        endpoint="https://x",
+        api_key_env=None,
+    )
+    assert spec.dim == 256
+    assert "256d as asked" in line
+
+
+def test_an_explicit_dim_wins_over_the_auto_resolved_width(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "k")
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://sheets.openai.azure.com")
+    spec, _ = resolve_embedder("auto", dim=256, deployment=None, endpoint=None, api_key_env=None)
+    assert spec.dim == 256
+
+
+def test_explicit_azure_without_a_deployment_says_which_flag_is_missing() -> None:
+    with pytest.raises(ValueError) as caught:
+        resolve_embedder("azure", dim=None, deployment=None, endpoint="https://x", api_key_env=None)
+    assert "--deployment" in str(caught.value)
+
+
+def test_an_unknown_embedder_is_a_usage_error() -> None:
+    with pytest.raises(ValueError) as caught:
+        resolve_embedder("word2vec", dim=None, deployment=None, endpoint=None, api_key_env=None)
+    assert "auto, hashing or azure" in str(caught.value)
+
+
+def test_the_azure_resolution_line_says_it_bills_an_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Resolving to azure is spend nobody typed a flag for, so it must be stated.
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "k")
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://sheets.openai.azure.com")
+    _, line = resolve_embedder("auto", dim=None, deployment=None, endpoint=None, api_key_env=None)
+    assert "calls the embedding API and is billed" in line
+
+
+def test_probe_passes_for_the_offline_hashing_embedder() -> None:
+    probe_embedder(EmbedderSpec(dim=32))
+
+
+def test_probe_turns_a_dead_embedding_deployment_into_a_usage_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The recorded Azure layout points at resources WITHOUT an embedding deployment.
+
+    Without the probe that surfaced as a traceback wall from inside the fit, after the matrix
+    had been read. It must name the deployment, the endpoint, and the way out.
+    """
+
+    def _explode(_self: EmbedderSpec) -> object:
+        raise RuntimeError("Resource not found (404)")
+
+    monkeypatch.setattr(EmbedderSpec, "build", _explode)
+    spec = EmbedderSpec(
+        kind="azure", dim=3072, deployment="text-embedding-3-large", endpoint="https://x"
+    )
+    with pytest.raises(ValueError) as caught:
+        probe_embedder(spec)
+    message = str(caught.value)
+    assert "text-embedding-3-large" in message
+    assert "https://x" in message
+    assert "404" in message
+    assert "--embedder hashing" in message
+    assert "Traceback" not in message
+
+
+def test_probe_rejects_an_embedder_that_returns_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Empty:
+        def embed(self, texts: list[str]) -> list[list[float]]:
+            return [[] for _ in texts]
+
+    monkeypatch.setattr(EmbedderSpec, "build", lambda _self: _Empty())
+    with pytest.raises(ValueError, match="empty vector"):
+        probe_embedder(
+            EmbedderSpec(kind="azure", dim=3072, deployment="embed", endpoint="https://x")
+        )

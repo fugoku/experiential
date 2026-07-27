@@ -130,7 +130,9 @@ class EmbedderSpec(BaseModel):
     """
 
     kind: Literal["hashing", "azure"] = "hashing"
-    dim: int = 512
+    # gt=0 because a zero-width embedding is not a smaller embedding, it is no embedding: it
+    # would reach the provider as `dimensions=0` and build a bank of empty rows.
+    dim: int = Field(default=512, gt=0)
     deployment: str | None = None  # azure embedding deployment name
     endpoint: str | None = None
     api_key_env: str | None = None
@@ -285,6 +287,42 @@ class ClusterRanking(BaseModel):
     total: int = 0  # fit scenarios that landed in this cluster
 
 
+# How a non-baseline candidate fared, as `RoutingEvidence.gate` records it. "passed" and
+# "reverted" are the two outcomes of the paired statistical guard; "novelty-abstain" is the
+# coverage floor firing before the guard ever runs. "contained" belongs to the containment gate
+# (a global win-vs-baseline check on top of the neighborhood's verdict), which is NOT shipped:
+# the value is pinned here so that landing it later does not change a persisted log's vocabulary,
+# and nothing emits it today.
+GateOutcome = Literal["passed", "reverted", "contained", "novelty-abstain"]
+
+# Why this request went where it did, in the one distinction an offline analysis needs: "greedy"
+# means the router served the candidate its own scoring preferred (which includes the baseline
+# winning on merit), "fallback-forced" means something overrode that preference back to the
+# baseline. Counting fallback-forced requests is how a coverage problem shows up as a number
+# rather than as a string that has to be grepped out of `reason`.
+Propensity = Literal["greedy", "fallback-forced"]
+
+
+class RoutingEvidence(BaseModel):
+    """The numbers behind one routing decision, as structured fields rather than prose.
+
+    `reason` is written for a human reading a request log; this is the same decision in a shape
+    something can aggregate. The fields are exactly what `knn_decision` already computes on the
+    way to its answer, so recording them costs nothing and invents nothing.
+
+    The paired statistics are present only when the guard actually ran, which means only when a
+    non-baseline candidate led the neighborhood: a request the baseline won outright, or that
+    abstained before any candidate was scored, has no paired comparison to report and leaves them
+    None rather than reporting a zero that would average in as evidence.
+    """
+
+    mean_diff: float | None = None  # mean paired reward difference, candidate minus baseline
+    se: float | None = None  # its standard error, after any small-sample floor
+    n_pairs: int | None = None  # neighbors scored on BOTH sides, the guard's sample size
+    gate: GateOutcome | None = None  # None when no gate was reached
+    propensity: Propensity
+
+
 class RoutingDecision(BaseModel):
     """Where one request goes and why (the request log's model/cluster/routing_reason)."""
 
@@ -292,6 +330,23 @@ class RoutingDecision(BaseModel):
     cluster_id: int | None = None
     cluster_label: str = ""
     reason: str
+    # Populated by `knn_decision`; None for the kinds that compute no paired evidence (static and
+    # rank) and for a sticky decision, which never consults the policy at all.
+    evidence: RoutingEvidence | None = None
+
+    # The L2-normalized vector this request was routed on, attached by `select_model` so serving
+    # can persist it (`wmo.serving.query_embeddings`) without re-embedding the text. Private
+    # because it is per-request state, not part of the decision's shape: it must not appear in a
+    # log row, a report, or a comparison between two decisions.
+    _query_embedding: np.ndarray | None = PrivateAttr(default=None)
+
+    def attach_query_embedding(self, vector: np.ndarray) -> None:
+        """Record the vector this decision was made from (see `_query_embedding`)."""
+        self._query_embedding = vector
+
+    def query_embedding(self) -> np.ndarray | None:
+        """The vector this decision was made from, when one was embedded for it."""
+        return self._query_embedding
 
 
 class RoutingPolicy(BaseModel):
@@ -544,9 +599,13 @@ def select_model(
         return RoutingDecision(model=policy.default_model, reason="static policy")
 
     query = np.asarray((embedder or policy.embedder.build()).embed([text])[0])
-    if policy.kind == "knn":
-        return knn_decision(policy, query)
-    return rank_decision(policy, query)
+    decision = knn_decision(policy, query) if policy.kind == "knn" else rank_decision(policy, query)
+    # Normalized separately rather than by normalizing `query` first: both decision functions do
+    # their own normalization in their own precision, and pre-normalizing here would perturb the
+    # champion's numerical path for the sake of a logging side effect.
+    norm = float(np.linalg.norm(query))
+    decision.attach_query_embedding(query / norm if norm > 0.0 else query)
+    return decision
 
 
 def rank_decision(policy: RoutingPolicy, query: np.ndarray) -> RoutingDecision:
@@ -643,6 +702,7 @@ def knn_decision(policy: RoutingPolicy, query: np.ndarray) -> RoutingDecision:
                 f"knn novelty abstain: best similarity {float(np.max(sims)):.3f} below the "
                 f"fit-bank floor {policy.floor_sim:.3f}, serving {baseline}"
             ),
+            evidence=RoutingEvidence(gate="novelty-abstain", propensity="fallback-forced"),
         )
 
     budget = min(policy.rag_num, sims.shape[0])
@@ -669,6 +729,7 @@ def knn_decision(policy: RoutingPolicy, query: np.ndarray) -> RoutingDecision:
         return RoutingDecision(
             model=baseline,
             reason=f"knn: {rows.size} neighbors carry no scored reward, serving {baseline}",
+            evidence=RoutingEvidence(propensity="fallback-forced"),
         )
     mean_cost = bank.mean_costs()
     # The cost knob prices each candidate in average-call units before the argmax; at
@@ -697,11 +758,15 @@ def knn_decision(policy: RoutingPolicy, query: np.ndarray) -> RoutingDecision:
                     f"{rows.size} neighbors on evidence (profile {profile[leader_index]:.3f} vs "
                     f"{profile[pick_index]:.3f}) but not on price"
                 ),
+                # Greedy: the baseline IS the argmax once the cost knob has priced the
+                # candidates, so nothing overrode the router's own preference.
+                evidence=RoutingEvidence(propensity="greedy"),
             )
         return RoutingDecision(
             model=baseline,
             reason=f"knn: baseline {baseline} leads {rows.size} neighbors "
             f"(profile {profile[pick_index]:.3f})",
+            evidence=RoutingEvidence(propensity="greedy"),
         )
 
     base_index = bank.models.index(baseline)
@@ -729,6 +794,13 @@ def knn_decision(policy: RoutingPolicy, query: np.ndarray) -> RoutingDecision:
         return RoutingDecision(
             model=baseline,
             reason=f"knn guard: reverted to {baseline}, evidence insufficient ({detail})",
+            evidence=RoutingEvidence(
+                mean_diff=mean_diff,
+                se=error,
+                n_pairs=pairs,
+                gate="reverted",
+                propensity="fallback-forced",
+            ),
         )
     knob = f", cost knob lam={policy.pick_lam:g}" if policy.pick_lam > 0.0 else ""
     # Only the symmetric bar doubles z for a pricier pick; the asymmetric one holds it at z.
@@ -739,4 +811,210 @@ def knn_decision(policy: RoutingPolicy, query: np.ndarray) -> RoutingDecision:
         model=pick,
         reason=f"knn: {rows.size} neighbors, delta={mean_diff:+.3f} > {z_effective:g}xSE"
         f"={needed:.3f}{price_note}{knob}",
+        evidence=RoutingEvidence(
+            mean_diff=mean_diff,
+            se=error,
+            n_pairs=pairs,
+            gate="passed",
+            propensity="greedy",
+        ),
+    )
+
+
+# --- `--embedder` resolution -------------------------------------------------------------
+# Lives beside `EmbedderSpec` (what it produces) rather than in the CLI, because two commands
+# now fit a policy: `wmo optimize route fit` and `wmo optimize model`. It raises ValueError so
+# the library stays free of the CLI framework; `route_app` translates that to
+# `typer.BadParameter` at the boundary.
+# What `--embedder auto` looks for. The project's standard Azure OpenAI convention, the same pair
+# `wmo.config` requires of an AZURE_OPENAI provider and that `.env.example` documents; auto does
+# not invent a new variable, it notices the one an operator has already set up.
+AZURE_EMBEDDER_ENV = ("AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT")
+AZURE_EMBEDDER_DEPLOYMENT = "text-embedding-3-large"
+AZURE_EMBEDDER_DIM = 3072  # the deployment's native width, and what the champion was measured at
+HASHING_EMBEDDER_DIM = 512
+
+# Quoted verbatim in the downgrade notice: the measured cost of routing on hashed features instead
+# of semantic ones. Both numbers are accuracy points over the best single model on
+# routerbench-ours9, so the gap is what auto is telling the operator they are leaving on the table.
+HASHING_DOWNGRADE_NOTICE = (
+    "hashing-512 measured +0.60pt (4/5 seeds) vs the semantic champion's +1.04pt (5/5) on the "
+    "full-power benchmark"
+)
+
+# Native output widths of the embedding models WMO knows about, matched as a SUBSTRING of the
+# deployment name because an Azure deployment is operator-named and usually carries the model
+# family in it. `dim` is not bookkeeping: it becomes the `dimensions` parameter of the embeddings
+# request, so asking a model for more than it has is an API error, and asking for less silently
+# truncates the vectors the policy is then fitted and served on.
+_NATIVE_EMBEDDING_DIMS: tuple[tuple[str, int], ...] = (
+    ("text-embedding-3-large", 3072),
+    ("text-embedding-3-small", 1536),
+    ("text-embedding-ada-002", 1536),
+)
+
+
+def _native_dim(deployment: str) -> tuple[int, bool]:
+    """(native width, whether the deployment name identified the model) for an azure deployment.
+
+    An unrecognized name assumes `text-embedding-3-large`, which is the deployment `auto`
+    provisions and the one the champion was measured on. The assumption is stated in the
+    resolution line rather than buried, and `--dim` overrides it, so the cost of guessing wrong
+    is one visible flag rather than a policy quietly fitted on truncated vectors.
+    """
+    for family, width in _NATIVE_EMBEDDING_DIMS:
+        if family in deployment:
+            return width, True
+    return AZURE_EMBEDDER_DIM, False
+
+
+def resolve_embedder(
+    choice: str,
+    *,
+    dim: int | None,
+    deployment: str | None,
+    endpoint: str | None,
+    api_key_env: str | None,
+) -> tuple[EmbedderSpec, str]:
+    """Turn `--embedder` into the spec to fit with, plus the one line explaining the choice.
+
+    `auto` is the default because the two backends are not equivalent and the difference is not
+    visible in the artifact: a policy fitted on hashed features routes on lexical overlap, and one
+    fitted on `text-embedding-3-large` routes on meaning. An operator who has already configured
+    an Azure resource should get the better one without having to know that, and one who has not
+    should be told what they are getting instead. So the resolution is ALWAYS printed, and the
+    downgrade quotes the measured gap rather than a vague warning.
+
+    Resolving to azure makes the fit BILL an embedding API, which is spend nobody typed a flag
+    for, so the resolution line says so. It also makes the fit depend on that resource actually
+    hosting an embedding deployment, which the env variables do not promise; `probe_embedder`
+    is what turns that from a mid-fit traceback into a usage error.
+
+    `--dim` defaults to the RESOLVED backend's native width on every path: 512 for hashing, and
+    the embedding model's own width for azure (see `_native_dim`). It used to default to 512
+    everywhere, which meant `--embedder azure --deployment text-embedding-3-large` silently
+    requested 512-dimensional vectors from a 3072-dimensional model and fitted the policy on the
+    truncation. An explicit `--dim` is still honored verbatim, including a deliberate reduction.
+
+    Returns:
+        The `EmbedderSpec` to fit with, and the resolution line to print.
+
+    Raises:
+        ValueError: An unknown `--embedder`, or an explicit azure spec missing a flag.
+            `route fit` re-raises these as `typer.BadParameter`.
+    """
+    if choice not in ("auto", "hashing", "azure"):
+        raise ValueError(f"unknown embedder '{choice}'; use auto, hashing or azure")
+
+    if choice == "auto":
+        present = all(os.environ.get(name) for name in AZURE_EMBEDDER_ENV)
+        if not present:
+            missing = [name for name in AZURE_EMBEDDER_ENV if not os.environ.get(name)]
+            spec = EmbedderSpec(dim=HASHING_EMBEDDER_DIM if dim is None else dim)
+            return spec, (
+                f"embedder: hashing-{spec.dim} (auto; {', '.join(missing)} unset). "
+                f"[yellow]{HASHING_DOWNGRADE_NOTICE}[/yellow]. Set "
+                f"{' and '.join(AZURE_EMBEDDER_ENV)} to fit on semantic embeddings instead."
+            )
+        resolved_endpoint = endpoint or os.environ["AZURE_OPENAI_ENDPOINT"]
+        resolved_deployment = deployment or AZURE_EMBEDDER_DEPLOYMENT
+        return _azure_spec(
+            deployment=resolved_deployment,
+            endpoint=resolved_endpoint,
+            api_key_env=api_key_env or AZURE_EMBEDDER_ENV[0],
+            dim=dim,
+            how=f"auto; {' and '.join(AZURE_EMBEDDER_ENV)} present",
+        )
+
+    if choice == "hashing":
+        spec = EmbedderSpec(dim=HASHING_EMBEDDER_DIM if dim is None else dim)
+        return spec, f"embedder: hashing-{spec.dim} (explicit). {HASHING_DOWNGRADE_NOTICE}"
+
+    if not (deployment and endpoint):
+        # EmbedderSpec would reject this too, but only after the matrix has been read; say which
+        # flag is missing, at the boundary, in the vocabulary the operator typed.
+        raise ValueError(
+            "--embedder azure needs --deployment and --endpoint (or use --embedder auto, which "
+            f"reads {' and '.join(AZURE_EMBEDDER_ENV)})"
+        )
+    return _azure_spec(
+        deployment=deployment,
+        endpoint=endpoint,
+        api_key_env=api_key_env,
+        dim=dim,
+        how="explicit",
+    )
+
+
+def _azure_spec(
+    *, deployment: str, endpoint: str, api_key_env: str | None, dim: int | None, how: str
+) -> tuple[EmbedderSpec, str]:
+    """One azure spec plus its resolution line, shared by the auto and explicit paths.
+
+    Shared so the two paths cannot drift on the thing that matters here, which is how the
+    embedding width is chosen when the operator did not name one.
+    """
+    native, recognized = _native_dim(deployment)
+    spec = EmbedderSpec(
+        kind="azure",
+        dim=native if dim is None else dim,
+        deployment=deployment,
+        endpoint=endpoint,
+        api_key_env=api_key_env,
+    )
+    hint = ""
+    if dim is not None:
+        width = f"{spec.dim}d as asked"
+    elif recognized:
+        width = f"{spec.dim}d native"
+    else:
+        width = f"{spec.dim}d assumed"
+        hint = (
+            f". Unrecognized deployment name, so the width is a guess: pass --dim if "
+            f"{deployment} is not {spec.dim}-dimensional"
+        )
+    # Stated because it is spend the operator did not type a flag for: `auto` reaching the azure
+    # branch means this fit BILLS an embedding API, and the probe below bills the first call.
+    return spec, (
+        f"embedder: azure {deployment} ({width}) at {endpoint} ({how}){hint}. "
+        "This calls the embedding API and is billed to that resource."
+    )
+
+
+def probe_embedder(spec: EmbedderSpec) -> None:
+    """Embed one short text before the fit does, so a broken backend fails cleanly and early.
+
+    `--embedder auto` turns the mere PRESENCE of `AZURE_OPENAI_*` into a network dependency, and
+    those variables routinely point at a resource that serves chat but hosts no embedding
+    deployment. Without this, the first thing an operator sees is a traceback wall from inside
+    the fit, after the matrix has been read and (for a large corpus) after real spend. One
+    throwaway embedding turns that into a usage error at the boundary, which is rule 9's bar:
+    say what went wrong and what to do about it.
+
+    Hashing specs are checked too. It costs nothing, and it keeps the failure shape identical on
+    both branches rather than leaving one path with a different error surface.
+
+    Raises:
+        ValueError: The embedder could not produce a vector, naming what was tried and
+            the escape hatch.
+    """
+    try:
+        vectors = spec.build().embed(["routing embedder probe"])
+    except Exception as exc:  # noqa: BLE001 - any backend failure here is a usage error
+        raise ValueError(_probe_failure(spec, str(exc) or type(exc).__name__)) from exc
+    if not vectors or not vectors[0]:
+        raise ValueError(_probe_failure(spec, "it returned an empty vector"))
+
+
+def _probe_failure(spec: EmbedderSpec, detail: str) -> str:
+    """What to tell an operator whose embedder does not work, in the vocabulary they typed."""
+    if spec.kind == "hashing":
+        return f"the hashing embedder failed to embed a probe text: {detail}"
+    return (
+        f"embedding deployment '{spec.deployment}' at {spec.endpoint} could not embed a probe "
+        f"text: {detail}. That resource may serve chat models without hosting an embedding "
+        f"deployment, or '{spec.deployment}' may be named differently there. Deploy "
+        f"{AZURE_EMBEDDER_DEPLOYMENT} on it, point --deployment/--endpoint at one that has it, "
+        "or fit on offline features with --embedder hashing (which needs no credentials and no "
+        "network, at the accuracy cost this command printed above)."
     )
