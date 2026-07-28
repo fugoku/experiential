@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 import subprocess
 import time
@@ -136,7 +137,8 @@ providers_app = typer.Typer(help="Manage and verify LLM providers.", no_args_is_
 examples_app = typer.Typer(
     help="List and launch self-contained task examples.", no_args_is_help=True
 )
-config_app = typer.Typer(help="Manage local harness config.", no_args_is_help=True)
+# "harness" here would collide with the `wmo harness` group, which manages a different object.
+config_app = typer.Typer(help="Manage project-local wmo settings.", no_args_is_help=True)
 research_app = typer.Typer(
     help="Research experiments over the harness (scaling laws, ablations).", no_args_is_help=True
 )
@@ -540,7 +542,10 @@ def examples_list() -> None:
         _console.print("[yellow]no examples found[/yellow]")
         return
     for example in examples:
-        _console.print(example.name)
+        # Data-only bundles (what `wmo download` fetches) have no launcher, so say so here
+        # rather than letting `wmo examples run` be the only way to find out.
+        note = "" if (example / "run.sh").exists() else "  [dim](data only — no run.sh)[/dim]"
+        _console.print(f"{example.name}{note}")
 
 
 @examples_app.command(
@@ -555,8 +560,30 @@ def examples_run(
     example_dir = _resolve_example(name)
     runner = example_dir / "run.sh"
     if not runner.exists():
-        raise typer.BadParameter(f"example {name!r} has no run.sh launcher")
-    result = subprocess.run([str(runner), *ctx.args], cwd=example_dir, check=False)
+        # A data-only bundle (`wmo download`) is listed but not runnable; name what it IS for.
+        traces = example_dir / "traces.otel.jsonl"
+        hint = (
+            "; it is a data-only bundle — build a world model from it with "
+            f"`wmo build --file {traces} --name {name}`"
+            if traces.exists()
+            else ""
+        )
+        raise typer.BadParameter(f"example {name!r} has no run.sh launcher{hint}")
+    if not os.access(runner, os.X_OK):
+        raise typer.BadParameter(
+            f"example {name!r} has a run.sh that is not executable; run `chmod +x {runner}`"
+        )
+    try:
+        result = subprocess.run([str(runner), *ctx.args], cwd=example_dir, check=False)
+    except OSError as exc:
+        # The exec itself failed, so there is no exit code to forward: the launcher has no
+        # shebang (ENOEXEC), or names an interpreter that is not installed (ENOENT, whose
+        # "No such file or directory" reads as a lie about a run.sh we just stat'd). Say which
+        # line to look at instead of letting the errno out as a traceback.
+        raise typer.BadParameter(
+            f"example {name!r} could not start {runner} ({exc.strerror or exc}); "
+            f"check its interpreter line with `head -1 {runner}`"
+        ) from exc
     raise typer.Exit(result.returncode)
 
 
@@ -1061,8 +1088,11 @@ def serve(
     """Run the local FastAPI backend so agents can step against world models over HTTP.
 
     Serves every built model by default, or just the `--name` ones, from one or more roots
-    (e.g. `--root .wmo --root examples/tau-bench`). Routes are namespaced:
-    `/world_models/{name}/sessions` and `.../step`.
+    (e.g. `--root .wmo --root packages/environment-capture/tau-bench`). Two surfaces are
+    exposed: the world-model step API, namespaced `/world_models/{name}/sessions` and
+    `.../step`; and, for every served model whose dir carries a `policy.json` (written by
+    `wmo optimize route fit --out` or `wmo optimize model`), the OpenAI-compatible endpoint
+    `POST /v1/chat/completions` with `model="<name>"`, listed by `GET /v1/models`.
     """
     names = list(name) if name else None
     # Bad --name input (unsafe segment, unknown model, nothing built) is a usage error,
@@ -2291,7 +2321,8 @@ def _load_model_any(name: str | None, root: str, *, max_fidelity: bool = False):
         label, store_root, resolved = matched[0]
     elif not candidates:
         raise typer.BadParameter(
-            "no world models found; run `wmo build` or try an example (examples/tau-bench)"
+            "no world models found; run `wmo build` or try an example "
+            "(packages/environment-capture/tau-bench)"
         )
     elif len(candidates) == 1:
         label, store_root, resolved = candidates[0]
