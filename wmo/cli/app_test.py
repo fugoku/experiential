@@ -31,9 +31,10 @@ from wmo.config import (
     load_settings,
     save_settings,
 )
-from wmo.core.types import Trace
+from wmo.core.types import Action, ActionKind, Observation, Step, Trace
 from wmo.engine.build import DEFAULT_TRAIN_SPLIT, split_traces, split_traces_3way
 from wmo.engine.eval_suites import EvalSuiteConfig
+from wmo.ingest import VendorPull
 from wmo.providers.base import (
     Completion,
     EmbedderKind,
@@ -1581,6 +1582,379 @@ def test_build_non_interactive_without_source_errors(tmp_path) -> None:  # noqa:
     # No --file/--vendor and --no-interactive: should fail fast rather than hang on input.
     result = runner.invoke(app, ["build", "--no-interactive", "--root", str(tmp_path / ".wmo")])
     assert result.exit_code != 0
+
+
+def _flat(output: str) -> str:
+    """CliRunner output with rich's panel borders and line wrapping removed, for substrings."""
+    return " ".join(output.replace("│", " ").split())
+
+
+def _pull_trace(trace_id: str, *, usable: bool) -> Trace:
+    """One single-step trace. `usable=False` makes it degenerate (empty observation)."""
+    return Trace(
+        trace_id=trace_id,
+        source="otel-genai:vendor",
+        steps=[
+            Step(
+                action=Action(kind=ActionKind.TOOL_CALL, name="get_user", arguments={"id": "u1"}),
+                observation=Observation(content="found u1" if usable else ""),
+            )
+        ],
+    )
+
+
+def _many_traces_file(tmp_path, count: int) -> str:  # noqa: ANN001 - pytest fixture path
+    """`count` copies of the single-trace export, each under its own trace id."""
+    base = Path(_traces_file(tmp_path)).read_text(encoding="utf-8").splitlines()
+    lines: list[str] = []
+    for i in range(count):
+        for line in base:
+            lines.append(json.dumps({**json.loads(line), "traceId": f"{i:032d}"}))
+    path = tmp_path / "many.jsonl"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return str(path)
+
+
+def test_build_with_a_name_but_no_trace_source_is_a_usage_error(tmp_path) -> None:  # noqa: ANN001
+    # `wmo list` prints `wmo build --name <name>` as its empty-state hint, and every non-TTY
+    # (CI, piped output) takes the scriptable path. It used to reach the ingest seam and raise
+    # a raw ValueError; the guard only fired when --name was ALSO omitted.
+    result = runner.invoke(
+        app, ["build", "--name", "x", "--root", str(tmp_path / ".wmo"), "--no-interactive"]
+    )
+    assert result.exit_code == 2
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert "provide --file <export> or --pull" in _flat(result.output)
+
+
+def test_list_empty_state_names_a_trace_export(tmp_path) -> None:  # noqa: ANN001
+    # The hint must be a runnable command: --name alone is a usage error (test above).
+    result = runner.invoke(app, ["list", "--root", str(tmp_path / ".wmo")])
+    assert result.exit_code == 0
+    assert "--file" in result.output
+
+
+def test_build_missing_trace_file_is_a_usage_error(tmp_path) -> None:  # noqa: ANN001
+    # A typo'd --file used to die with a raw FileNotFoundError from the adapter, and only after
+    # the provider ping had already run.
+    result = runner.invoke(
+        app,
+        [
+            "build",
+            "--name",
+            "x",
+            "--file",
+            str(tmp_path / "nope.jsonl"),
+            "--root",
+            str(tmp_path / ".wmo"),
+            "--no-interactive",
+        ],
+    )
+    assert result.exit_code == 2
+    assert not isinstance(result.exception, FileNotFoundError)
+    assert "trace file not found" in _flat(result.output)
+    # Rejected at the argument boundary: no provider was pinged.
+    assert "verifying" not in result.output
+
+
+def test_build_rejects_a_directory_as_the_trace_file(tmp_path) -> None:  # noqa: ANN001
+    result = runner.invoke(
+        app,
+        [
+            "build",
+            "--name",
+            "x",
+            "--file",
+            str(tmp_path),
+            "--root",
+            str(tmp_path / ".wmo"),
+            "--no-interactive",
+        ],
+    )
+    assert result.exit_code == 2
+    assert not isinstance(result.exception, IsADirectoryError)
+    assert "not a directory" in _flat(result.output)
+
+
+def test_build_rejects_the_postgres_source_and_names_wmo_ingest(tmp_path) -> None:  # noqa: ANN001
+    # `postgres` passes the adapter-name validator but can never work here: build has no
+    # --dsn/--table (those live on `wmo ingest`), so it must be rejected at the boundary.
+    result = runner.invoke(
+        app,
+        [
+            "build",
+            "--name",
+            "x",
+            "--file",
+            _traces_file(tmp_path),
+            "--source",
+            "postgres",
+            "--root",
+            str(tmp_path / ".wmo"),
+            "--no-interactive",
+        ],
+    )
+    assert result.exit_code == 2
+    assert not isinstance(result.exception, ValueError)
+    flat = _flat(result.output)
+    assert "wmo ingest --source postgres --dsn <dsn> --table <table>" in flat
+    assert "--dsn" not in _flat(runner.invoke(app, ["build", "--help"]).output)
+
+
+def test_build_wrong_source_names_the_detected_format(patched_provider, tmp_path) -> None:  # noqa: ANN001
+    # A chat-json export under the silent `--source otel-genai` default ingested nothing and
+    # raised ValueError('no traces ingested; nothing to build') as a traceback.
+    chat = tmp_path / "chat.json"
+    chat.write_text(json.dumps({"messages": [{"role": "user", "content": "hi"}]}), encoding="utf-8")
+    result = runner.invoke(
+        app,
+        [
+            "build",
+            "--name",
+            "x",
+            "--file",
+            str(chat),
+            "--root",
+            str(tmp_path / ".wmo"),
+            "--provider",
+            "bedrock",
+            "--fidelity",
+            "low",
+            "--no-interactive",
+        ],
+    )
+    assert result.exit_code == 2
+    assert not isinstance(result.exception, ValueError)
+    flat = _flat(result.output)
+    assert "--source otel-genai" in flat
+    assert "it looks like chat-json" in flat
+    # The path itself is wrapped by rich, so assert on the command, not the rendered path.
+    assert "wmo ingest --file" in flat
+
+
+def test_build_empty_trace_file_names_source_and_ingest(patched_provider, tmp_path) -> None:  # noqa: ANN001
+    empty = tmp_path / "empty.jsonl"
+    empty.write_text("", encoding="utf-8")
+    result = runner.invoke(
+        app,
+        [
+            "build",
+            "--name",
+            "x",
+            "--file",
+            str(empty),
+            "--root",
+            str(tmp_path / ".wmo"),
+            "--provider",
+            "bedrock",
+            "--fidelity",
+            "low",
+            "--no-interactive",
+        ],
+    )
+    assert result.exit_code == 2
+    assert not isinstance(result.exception, ValueError)
+    flat = _flat(result.output)
+    assert "--source otel-genai" in flat
+    assert "wmo ingest --file" in flat
+
+
+def test_build_limit_caps_a_file_corpus(patched_provider, tmp_path) -> None:  # noqa: ANN001
+    # --limit was wired only into the VendorPull branch, so it was silently ignored for --file
+    # builds while `wmo ingest --limit` capped both transports.
+    from wmo.config.card import load_card
+
+    root = tmp_path / ".wmo"
+    result = runner.invoke(
+        app,
+        [
+            "build",
+            "--name",
+            "capped",
+            "--file",
+            _many_traces_file(tmp_path, 6),
+            "--limit",
+            "2",
+            "--root",
+            str(root),
+            "--provider",
+            "bedrock",
+            "--fidelity",
+            "low",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    card = load_card(root / "models" / "capped")
+    assert card is not None
+    assert card.corpus.traces == 2
+
+
+def test_build_pull_limit_is_a_fetch_cap_applied_once(
+    patched_provider,  # noqa: ANN001 - pytest fixture
+    monkeypatch,  # noqa: ANN001 - pytest fixture
+    tmp_path,  # noqa: ANN001 - pytest fixture path
+) -> None:
+    """A pull spends `--limit` vendor-side, so `--drop-degenerate` can leave fewer than N.
+
+    `wmo.ingest.base.from_vendor` slices to `pull.limit` before `build` ever sees the corpus,
+    so re-applying the same cap after the degenerate filter cannot restore the dropped traces —
+    it would only read as a promise of N usable traces that this transport cannot keep. Pinning
+    both halves: the adapter receives the cap, and `build` is not handed it a second time.
+    """
+    import sys
+
+    from wmo.config.card import load_card
+
+    seen: list[VendorPull] = []
+    passed_to_build: dict[str, object] = {}
+
+    class _CappingAdapter:
+        """Mimics `base.from_vendor`: alternating junk/usable traces, sliced at `pull.limit`."""
+
+        name = "otel-genai"
+
+        def from_vendor(self, pull: VendorPull) -> list[Trace]:
+            seen.append(pull)
+            traces = [_pull_trace(f"{i:032d}", usable=bool(i % 2)) for i in range(6)]
+            return traces if pull.limit is None else traces[: pull.limit]
+
+    real_run_build = cli_app_module.run_build
+
+    def _spy(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202 - passthrough spy
+        passed_to_build.update(kwargs)
+        return real_run_build(*args, **kwargs)
+
+    monkeypatch.setattr(
+        sys.modules["wmo.engine.build"], "get_adapter", lambda name: _CappingAdapter()
+    )
+    monkeypatch.setattr(cli_app_module, "run_build", _spy)
+    root = tmp_path / ".wmo"
+    result = runner.invoke(
+        app,
+        [
+            "build",
+            "--name",
+            "pulled",
+            "--pull",
+            "--limit",
+            "4",
+            "--drop-degenerate",
+            "--root",
+            str(root),
+            "--provider",
+            "bedrock",
+            "--fidelity",
+            "low",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert [p.limit for p in seen] == [4]  # spent at fetch…
+    assert passed_to_build["limit"] is None  # …and not a second time after the filter
+    card = load_card(root / "models" / "pulled")
+    assert card is not None
+    assert card.corpus.traces == 2  # 4 fetched, 2 of them degenerate; the cap cannot refill
+
+
+def test_build_rejects_a_limit_below_one(tmp_path) -> None:  # noqa: ANN001
+    result = runner.invoke(
+        app,
+        [
+            "build",
+            "--name",
+            "x",
+            "--file",
+            _traces_file(tmp_path),
+            "--limit",
+            "0",
+            "--root",
+            str(tmp_path / ".wmo"),
+            "--no-interactive",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "--limit must be at least 1" in _flat(result.output)
+
+
+def test_build_unknown_chain_is_a_usage_error(tmp_path) -> None:  # noqa: ANN001
+    """`--chain` with no `.wmo/fallback.toml` must say how to create the file, not traceback.
+
+    Deliberately no `patched_provider`: that fixture stubs `providers.provider_or_chain`, which
+    is the seam under test. Chain resolution runs before the provider ping, so nothing here
+    reaches the network (`wmo/conftest.py` points the chain path at an empty tmp dir).
+    """
+    result = runner.invoke(
+        app,
+        [
+            "build",
+            "--name",
+            "x",
+            "--file",
+            _traces_file(tmp_path),
+            "--chain",
+            "fast",
+            "--root",
+            str(tmp_path / ".wmo"),
+            "--provider",
+            "bedrock",
+            "--fidelity",
+            "low",
+            "--no-interactive",
+        ],
+    )
+    assert result.exit_code == 2
+    assert not isinstance(result.exception, ValueError)
+    flat = _flat(result.output)
+    assert "chain 'fast' requested but" in flat
+    assert "fallback.toml" in flat
+    assert "[[chain.<name>]] rung tables" in flat
+    assert "docs/reference/failover.md" in flat
+
+
+def test_build_model_default_follows_the_provider(patched_provider, tmp_path) -> None:  # noqa: ANN001
+    # --provider openai with no --model used to persist the Anthropic id `claude-opus-4-8`.
+    root = tmp_path / ".wmo"
+    result = runner.invoke(
+        app,
+        [
+            "build",
+            "--name",
+            "oa",
+            "--file",
+            _traces_file(tmp_path),
+            "--provider",
+            "openai",
+            "--fidelity",
+            "low",
+            "--root",
+            str(root),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    config = load_config(root / "models" / "oa")
+    assert config.serve_provider is ProviderKind.OPENAI
+    assert config.serve_provider_config().model_type == "gpt-5.5"
+
+
+def test_build_requires_a_model_for_a_provider_without_a_default(tmp_path) -> None:  # noqa: ANN001
+    # openrouter/tinker/openai_responses have no curated model list: ask rather than guess,
+    # matching `wmo providers set`'s scriptable contract.
+    result = runner.invoke(
+        app,
+        [
+            "build",
+            "--name",
+            "x",
+            "--file",
+            _traces_file(tmp_path),
+            "--provider",
+            "openrouter",
+            "--root",
+            str(tmp_path / ".wmo"),
+            "--no-interactive",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "--provider openrouter has no default serve model" in _flat(result.output)
 
 
 def test_build_aborts_when_provider_sdk_missing(monkeypatch, tmp_path) -> None:  # noqa: ANN001
