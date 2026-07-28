@@ -363,7 +363,9 @@ def test_one_command_lands_every_artifact_where_serving_reads_it(
     assert RoutingPolicy.load(policy_path.parent / "policy.base.json").cost_quality is None
     report = ImprovementReport.model_validate_json(report_path.read_text(encoding="utf-8"))
     assert report.endpoint_id == "support"
-    assert report.headline.scenarios_compared == 3
+    assert report.headline.scenarios_compared == 1
+    assert set(policy.fit_scenario_ids).isdisjoint(report.scenario_ids)
+    assert len(policy.fit_scenario_ids) + report.scenario_count == 3
 
     manifest = RunManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
     assert [record.stage.value for record in manifest.stages] == ["sweep", "fit", "tune", "report"]
@@ -631,7 +633,10 @@ def test_the_plan_table_prices_the_sweep_and_labels_the_rest(
     assert "2candidate(s)x3scenario(s)x1episode(s)" in flat
     # The free stages say free rather than showing a fabricated number, and the estimate names
     # itself a projection with its assumption spelled out.
-    assert _says(result.output, "knn (guarded, fallback best single on the sweep)")
+    # 3 scenarios split 70/30 for router fit vs report: 2 fit, 1 reserved (PR #308).
+    assert _says(
+        result.output, "knn over 2 fit scenario(s) (guarded, fallback best single on the fit split)"
+    )
     assert _says(result.output, "cost_quality 0.25 (Balanced (default))")
     assert "aprojection" in flat and "assumedoutputtoken" in flat
     assert _says(result.output, "are NOT in that figure")
