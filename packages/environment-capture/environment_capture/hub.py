@@ -1,11 +1,17 @@
 """Fetch and list trace-corpus data bundles from the Hugging Face Hub (stdlib-only).
 
 Every publishable benchmark's bundle — the trace corpus plus its task data / gold / evidence
-dirs — lives in a dataset repo under the org. This module is the READ core every front-end
-shares: `wmo download`, `python -m environment_capture.hub fetch`, and the contract the
-website's serving trace-download endpoint adopts (PR #52). Plain-HTTP against the Hub's public
-REST API, so it needs no extra dependency and no token for public repos (pass ``token`` for
-private ones). Uploading lives in `environment_capture.hub_push` (the ``fetch`` extra).
+dirs — lives in a dataset repo under the org. This module is the READ core behind
+`python -m environment_capture.hub fetch` and the contract the website's serving
+trace-download endpoint adopts (PR #52). Plain-HTTP against the Hub's public REST API, so it
+needs no extra dependency and no token for public repos (pass ``token`` for private ones).
+Uploading lives in `environment_capture.hub_push` (the ``fetch`` extra).
+
+`wmo download` runs a VENDORED copy of the read half, `wmo/hub.py`: the flagship wheel must
+install with no dependency on anything under `packages/` (AGENTS.md § Monorepo). Registry,
+repo-id convention and data root are pinned across the two by
+`wmo/hub_test.py::test_the_two_copies_agree_on_the_registry_and_the_data_root`; the rest of the
+body is not, so mirror edits here into that copy by hand.
 
 Bundles are local-first: capture writes into the benchmark dir, nothing here deletes local
 files, and fetching never overwrites an existing file unless forced. Downloads stream to a
@@ -69,6 +75,11 @@ class CorpusSpec:
     # Data payload dirs published alongside the trace corpus (task indexes, gold sidecars,
     # evidence docs, ...). Same license as the corpus — they ARE the upstream-derived data.
     data_dirs: tuple[str, ...] = ()
+    # Whether a dataset repo for this bundle actually exists on the Hub yet. False means
+    # "registered here so the write side knows how to publish it, but nothing to download":
+    # reads must never advertise it, or `wmo download <name>` sends the user at a repo that
+    # can only answer 401. Flipping this to True is part of the push that publishes it.
+    published: bool = True
 
 
 # The publishable corpora. appworld is deliberately ABSENT: its protected data may only be
@@ -172,6 +183,9 @@ CORPORA: dict[str, CorpusSpec] = {
         ),
         CorpusSpec(
             benchmark="kimi-gui-control",
+            # Captured but never pushed: both candidate repo ids 401. Until the push lands,
+            # listing it as downloadable is a dead end, so reads hide it.
+            published=False,
             license_id="mit",
             upstream="mediar-ai/screenpipe gui-control (MIT); trajectories captured with "
             "Kimi-K2.6 via Azure AI Foundry",
@@ -290,6 +304,16 @@ def published_corpora(*, token: str | None = None) -> list[PublishedCorpus]:
     return sorted(by_benchmark.values(), key=lambda c: c.last_modified, reverse=True)
 
 
+def downloadable_benchmarks() -> list[str]:
+    """Registered benchmarks whose bundle really is on the Hub, sorted.
+
+    The offline answer to "what can I pass to ``wmo download``": every list of names a read path
+    offers comes from here rather than from ``CORPORA``, so it can never advertise a benchmark
+    whose only possible reply is a 401.
+    """
+    return sorted(name for name, spec in CORPORA.items() if spec.published)
+
+
 def fetch_corpus(
     benchmark: str,
     *,
@@ -314,8 +338,14 @@ def fetch_corpus(
     """
     spec = CORPORA.get(benchmark)
     if spec is None:
-        publishable = ", ".join(sorted(CORPORA))
-        raise ValueError(f"{benchmark!r} has no published corpus (available: {publishable})")
+        available = ", ".join(downloadable_benchmarks())
+        raise ValueError(f"{benchmark!r} has no published corpus (available: {available})")
+    if not spec.published:
+        available = ", ".join(downloadable_benchmarks())
+        raise ValueError(
+            f"{benchmark!r} is a registered benchmark but its data bundle has not been "
+            f"published to the Hub yet, so there is nothing to download; pick one of: {available}"
+        )
     token = token if token is not None else _default_token()
     root = _data_root()
     target = dest or corpus_path(benchmark)
@@ -362,7 +392,15 @@ def fetch_corpus(
                 time.sleep(delay_s)
                 done = file_base  # roll the bar back to the file boundary before re-streaming
             try:
-                written = _stream_to(url, local, token=token, chunk_done=chunk_done)
+                written = _stream_to(
+                    url,
+                    local,
+                    token=token,
+                    chunk_done=chunk_done,
+                    # `size` is 0 when the tree does not advertise one; there is nothing to
+                    # check against then, and 0 would read as "expect an empty file".
+                    expect_bytes=size or None,
+                )
                 break
             except urllib.error.HTTPError as error:
                 if error.code < 500:
@@ -370,14 +408,14 @@ def fetch_corpus(
                 last = error
             except urllib.error.URLError as error:
                 last = error
+            except OSError as error:
+                # A short transfer (or a local write failure). Not retried: `_stream_to` left
+                # the destination untouched, so re-running the whole fetch is the honest remedy
+                # and it costs nothing. Named with the file, since a bundle is many of them.
+                raise OSError(f"{remote_path}: {error}") from error
         if written < 0:
             assert last is not None
             raise last
-        if size and written != size:
-            raise OSError(
-                f"{remote_path}: downloaded {written} bytes but the Hub tree lists {size} — "
-                "truncated transfer; re-run the fetch"
-            )
     return target
 
 
@@ -519,12 +557,28 @@ def _repo_tree(repo_id: str, revision: str, *, token: str | None) -> list[tuple[
 
 
 def _stream_to(
-    url: str, dest: Path, *, token: str | None, chunk_done: Callable[[int], None]
+    url: str,
+    dest: Path,
+    *,
+    token: str | None,
+    chunk_done: Callable[[int], None],
+    expect_bytes: int | None = None,
 ) -> int:
     """Stream ``url`` to ``dest`` atomically; returns the byte count written.
 
     Writes a ``.part`` sibling and renames over, so a partially-downloaded corpus is never
     mistaken for a complete one by a concurrent reader; a failed stream removes its ``.part``.
+
+    ``expect_bytes`` is the size the Hub's tree advertises for this file, and it is verified
+    BEFORE the rename. Checking after would mean a short transfer had already replaced ``dest``,
+    which is only harmless when ``dest`` did not exist: under ``force`` it holds a corpus that
+    is currently valid, and clobbering it with a truncated one — or deleting it afterwards —
+    turns a failed refresh into data loss. Verifying first makes a short transfer a no-op:
+    ``dest`` keeps whatever it had, the ``.part`` is dropped, and the fetch is genuinely
+    re-runnable.
+
+    Raises:
+        OSError: fewer (or more) bytes arrived than ``expect_bytes``. ``dest`` is untouched.
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
     part = dest.with_name(dest.name + ".part")
@@ -539,6 +593,11 @@ def _stream_to(
                     sink.write(chunk)
                     written += len(chunk)
                     chunk_done(len(chunk))
+        if expect_bytes is not None and written != expect_bytes:
+            raise OSError(
+                f"downloaded {written} bytes but the Hub tree lists {expect_bytes} — truncated "
+                f"transfer; {dest} was left as it was, re-run the fetch"
+            )
     except BaseException:
         part.unlink(missing_ok=True)
         raise
@@ -557,7 +616,9 @@ def main() -> None:
     push.add_argument("--private", action="store_true")
 
     fetch = sub.add_parser("fetch", help="Download full data bundles into the benchmark dirs.")
-    fetch.add_argument("benchmark", help=f"Benchmark name, or 'all' ({', '.join(sorted(CORPORA))})")
+    fetch.add_argument(
+        "benchmark", help=f"Benchmark name, or 'all' ({', '.join(downloadable_benchmarks())})"
+    )
     fetch.add_argument(
         "--force", action="store_true", help="Overwrite existing local corpus/data files."
     )
@@ -569,7 +630,7 @@ def main() -> None:
             "`uv run python -m environment_capture.hub_push <benchmark>|all [--private]` "
             "(needs the fetch extra + a write token)"
         )
-    names = sorted(CORPORA) if args.benchmark == "all" else [args.benchmark]
+    names = downloadable_benchmarks() if args.benchmark == "all" else [args.benchmark]
     for name in names:
         existing = corpus_path(name).exists()
         path = fetch_corpus(name, force=args.force)

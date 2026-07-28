@@ -16,6 +16,7 @@ from environment_capture.hub import (
     CORPORA,
     CorpusRepoUnavailable,
     candidate_repo_ids,
+    downloadable_benchmarks,
     fetch_corpus,
     published_corpora,
     repo_id_for,
@@ -70,14 +71,27 @@ def _fake_hub(
         return listing, None
 
     def stream_to(
-        url: str, dest: Path, *, token: str | None, chunk_done: Callable[[int], None]
+        url: str,
+        dest: Path,
+        *,
+        token: str | None,
+        chunk_done: Callable[[int], None],
+        expect_bytes: int | None = None,
     ) -> int:
         calls.resolves.append(url.split("/datasets/", 1)[1].split("/resolve/", 1)[0])
         remote_path = urllib.parse.unquote(url.split("/resolve/main/", 1)[1])
         dest.parent.mkdir(parents=True, exist_ok=True)
         content = files[remote_path]
-        dest.write_bytes(content)
         chunk_done(len(content))
+        # The real streamer verifies the advertised size BEFORE renaming its `.part` over
+        # `dest`, so a short transfer leaves `dest` exactly as it was. A fake that wrote first
+        # would hide precisely the data-loss case this seam exists to prevent.
+        if expect_bytes is not None and len(content) != expect_bytes:
+            raise OSError(
+                f"downloaded {len(content)} bytes but the Hub tree lists {expect_bytes} — "
+                f"truncated transfer; {dest} was left as it was, re-run the fetch"
+            )
+        dest.write_bytes(content)
         return len(content)
 
     monkeypatch.setattr(hub, "_http_json_page", http_json_page)
@@ -215,6 +229,31 @@ def test_fetch_does_not_try_another_name_on_a_non_missing_hub_error(
 def test_fetch_unknown_benchmark_names_the_available_ones(data_root: Path) -> None:
     with pytest.raises(ValueError, match="no published corpus"):
         fetch_corpus("nope")
+
+
+def test_unknown_benchmark_never_offers_an_unpublished_name(data_root: Path) -> None:
+    # Offering a name the Hub can only answer 401 for sends the user down a dead end, so the
+    # "available:" list is the published subset, not the whole registry.
+    unpublished = sorted(name for name, spec in CORPORA.items() if not spec.published)
+    assert unpublished, "this test is meaningless once every registered corpus is published"
+    with pytest.raises(ValueError) as caught:
+        fetch_corpus("nope")
+    for name in unpublished:
+        assert name not in str(caught.value)
+        assert name not in downloadable_benchmarks()
+
+
+def test_fetch_of_an_unpublished_benchmark_fails_offline_and_says_why(
+    data_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # No Hub round trip at all: a registered-but-unpushed bundle is knowable locally, so the
+    # user gets the reason instead of a 401 they cannot act on.
+    def explode(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("must not touch the Hub for an unpublished benchmark")
+
+    monkeypatch.setattr(hub, "_resolve_repo", explode)
+    with pytest.raises(ValueError, match="has not been published to the Hub yet"):
+        fetch_corpus("kimi-gui-control")
 
 
 def test_stream_to_is_atomic(tmp_path: Path) -> None:
