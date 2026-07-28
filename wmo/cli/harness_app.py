@@ -462,7 +462,8 @@ def optimize(
         _console.print(f"  \\[{tag}] {escape(variant)}: success_rate={score:.3f} {state}")
 
     def _note(message: str) -> None:
-        # Dead proposals narrate here; scored proposals use the structured callback below.
+        # Lightweight search notes narrate dead proposals and perfect-score early stops.
+        # Scored proposals use the structured callback below.
         _console.print(f"  [dim]{message}[/dim]")
 
     def _proposal(record: ProposalRecord) -> None:
@@ -500,10 +501,16 @@ def optimize(
         on_note=_note,
         on_proposal=_proposal,
     )
-    saved = store.save_version(result.best, alias=CHAMPION_ALIAS)
+    champion_version = store.aliases(name).get(CHAMPION_ALIAS)
+    current = (
+        store.load(name, str(champion_version)) if champion_version is not None else None
+    )
+    unchanged = current is not None and current.doc_hash == result.best.doc_hash
+    saved = current if unchanged else store.save_version(result.best, alias=CHAMPION_ALIAS)
     selected = len(result.archive.accepted())
+    publication = "unchanged" if unchanged else "created"
     _console.print(
-        f"[green]created[/green] [bold]{name}[/bold] v{saved.version} (champion) "
+        f"[green]{publication}[/green] [bold]{name}[/bold] v{saved.version} (champion) "
         f"success_rate={result.best_score:.3f}: {len(result.archive.deltas)} delta(s) audited, "
         f"{selected} selected, {result.skipped} skipped -> {store.dir_for(name)}"
     )
