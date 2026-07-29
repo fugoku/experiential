@@ -42,6 +42,18 @@ copy of it. The only thing this script owns is durability:
 - SPEND. Both halves of each chunk's bill (candidate side, world-model serve/judge side) land in
   the ledger, and the run stops cleanly between chunks at the $850 cap Silen set. Reaching the cap
   stops the run and reports; it never trims an arm to fit.
+- REPORTING. Each arm is one run on the platform's runs panel (`wmo runs list/show/tail`), fed as
+  the grid works: the cohort, every ledger line, every measured cell, a whole-run heartbeat, and a
+  terminal status. It is on only when a platform credential with an organization resolves, and
+  `--no-emit` turns it off. It cannot FAIL the grid and cannot hang it: every call is buffered and
+  guarded, and none of them can raise (`wmo.runs.hooks`), so the no-hang property above still holds
+  with reporting on. It is not free, though, and the honest bound is worth knowing: pushes ride this
+  runner's own callbacks rather than a background thread, so an unreachable platform adds at most a
+  few bounded seconds at chunk boundaries while its requests time out. A `stop` command from the
+  panel is honored at the same boundary the spend cap uses, between chunks, because mid-chunk is the
+  one place stopping wastes money. A run that was never reported (or lost its reporting to an
+  outage) is recoverable afterwards with `wmo runs backfill <grid dir>`, which replays the same
+  events from these same artifacts.
 
 NO HANG DETECTION, deliberately. Nothing here imposes a per-call, per-episode or per-chunk
 deadline: the only clock is a `time.monotonic()` bracket around each `execute_sweep` whose result
@@ -95,7 +107,9 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict
 
-from wmo.config import load_env_file
+from wmo.runs.ledger import Calibration, LedgerLine
+
+from wmo.config import ARTIFACT_DIR, load_env_file
 from wmo.core.types import ActionKind, Trace
 from wmo.engine import load_world_model, split_holdout
 from wmo.engine.world_model import WorldModel
@@ -124,6 +138,8 @@ from wmo.optimize.sweep import (
     resolve_config,
 )
 from wmo.providers.pool import ModelPool
+from wmo.runs.hooks import GridEmitter, GridSnapshot
+from wmo.runs.schema import RunStatus, cell_band, grid_relpath
 
 log = logging.getLogger("tau-grid")
 
@@ -255,64 +271,6 @@ class Cohort(BaseModel):
         return "; ".join(differences) if differences else None
 
 
-class Calibration(BaseModel):
-    """The ratio match between the learned compressor and its truncation control.
-
-    Persisted per grid directory because three arm processes must agree on truncate's dial: two
-    processes that each calibrated their own would produce two different controls and there would
-    be no single ratio-matched arm to compare the method against.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    sample_size: int
-    sample_tokens_raw: int
-    endpoint_aggressiveness: float
-    endpoint_achieved_ratio: float
-    searched: list[tuple[float, float]]  # (truncate aggressiveness, achieved keep ratio)
-    chosen_aggressiveness: float
-    chosen_achieved_ratio: float
-    tolerance: float
-    measured_at: str
-    tip_sha: str
-
-
-class LedgerLine(BaseModel):
-    """One appended fact about the grid's progress and its bill.
-
-    Append-only JSONL rather than a rewritten summary: the ledger has to survive the SIGKILL that
-    the thing it is tracking might not, and a partially written line is one bad line rather than a
-    lost file.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    event: str  # chunk | chunk-skipped | retry | calibration | merge | stop
-    arm: str
-    chunk: int | None = None
-    cells: int = 0
-    scored: int = 0
-    candidate_usd: float = 0.0
-    compressor_usd: float = 0.0
-    wm_usd: float = 0.0
-    wall_s: float = 0.0
-    ts: str
-    cumulative_usd: float = 0.0
-    tip_sha: str
-    max_steps: int
-    episodes: int
-    note: str = ""
-    calibration: Calibration | None = None
-
-
-# `from __future__ import annotations` makes the `Calibration` above a string, and pydantic resolves
-# it against the module in `sys.modules`. Running this file as a script registers it as `__main__`
-# so that works, but loading it through `importlib` under any other name does not, and the failure
-# is a confusing "not fully defined" the first time a ledger line is parsed. Resolving eagerly here
-# means an analysis script can `import` this module and read a ledger without knowing that.
-LedgerLine.model_rebuild()
-
-
 class GridConfig(BaseModel):
     """Everything one invocation of this runner was told to do."""
 
@@ -382,11 +340,53 @@ def cell_key(outcome: ScenarioOutcome) -> str:
     return f"{outcome.scenario_id}|{outcome.model}|{outcome.episode}"
 
 
+def arm_snapshot(state: GridState, arm: str, *, total: int | None) -> GridSnapshot:
+    """One arm's whole-run progress and spend, re-read from the shared ledger.
+
+    Re-read rather than counted locally for the same reason `spend_to_date` is: several processes
+    feed one arm, so a snapshot built from this process's own cells would report a fraction of the
+    run and the panel's numbers would jump with whichever writer spoke last.
+    """
+    lines = [line for line in state.ledger_lines() if line.arm == arm]
+    # Progress counts the LAST chunk|chunk-skipped line per chunk index, the same rule the
+    # backfill applies: a resumed arm's ledger holds the original `chunk` line AND the resume's
+    # `chunk-skipped` line for the same chunk, and summing both would report done > the arm's
+    # real cell count. Spend still sums every line: every attempt's dollars were really spent.
+    latest_per_chunk: dict[int, LedgerLine] = {}
+    rescued: dict[int, int] = {}
+    for line in lines:
+        if line.event in ("chunk", "chunk-skipped") and line.chunk is not None:
+            latest_per_chunk[line.chunk] = line
+            # A later attempt's own count supersedes the rescues that preceded it.
+            rescued[line.chunk] = 0
+        elif line.event == "retry" and line.chunk is not None:
+            # A retry rescues a cell the chunk line already counted in `cells` but
+            # recorded as unscored. It raises `scored` without raising `done`, and
+            # only until a later chunk line for that index restates both. Without
+            # this an arm that finishes on a rescue under-reports scored forever,
+            # because no later line ever arrives to correct it.
+            rescued[line.chunk] = rescued.get(line.chunk, 0) + line.scored
+    return GridSnapshot(
+        done=sum(line.cells for line in latest_per_chunk.values()),
+        scored=sum(line.scored for line in latest_per_chunk.values()) + sum(rescued.values()),
+        total=total,
+        candidate_usd=sum(line.candidate_usd for line in lines),
+        compressor_usd=sum(line.compressor_usd for line in lines),
+        wm_usd=sum(line.wm_usd for line in lines),
+    )
+
+
 # --------------------------------------------------------------------------- ledger + cohort state
 
 
 class GridState:
     """The grid directory's durable state: cohort pins, spend ledger, calibration, retry record."""
+
+    # Set by main() once the arm's emitter exists, and left None whenever run telemetry is off
+    # (`--no-emit`, or no platform credential). `append` is the ONE place a ledger line is written,
+    # which is why hanging the hook here covers chunks, retries, calibration, merges and stops with
+    # no second call site to keep in sync.
+    emitter: GridEmitter | None = None
 
     def __init__(self, grid_dir: Path, cohort: Cohort) -> None:
         self._dir = grid_dir
@@ -492,6 +492,52 @@ class GridState:
         )
         with (self._dir / LEDGER_FILE).open("a", encoding="utf-8") as handle:
             handle.write(stamped.model_dump_json() + "\n")
+        # After the durable write, never before: the ledger is what the grid's budget state is read
+        # from, and telemetry is not allowed to sit between a paid chunk and the record of it.
+        # `on_ledger_line` cannot raise (`wmo.runs.hooks`), so nothing here needs a guard.
+        # Only this arm's lines: one process walks several arms in turn and each arm is its own run,
+        # so reporting a sibling arm's line here would file it under the wrong run AND at a seq that
+        # collides with this arm's own line at the same position.
+        # `enabled` first: `arm_line_position` re-reads the whole ledger, which is pure waste when
+        # telemetry is off (--no-emit, or no credential).
+        if self.emitter is not None and self.emitter.enabled and stamped.arm == self.emitter.arm:
+            position = self.arm_line_position(stamped)
+            if position is not None:
+                self.emitter.on_ledger_line(
+                    stamped.model_dump(mode="json"), ts=stamped.ts, position=position
+                )
+
+    def arm_line_position(self, line: LedgerLine) -> int | None:
+        """Where a just-appended line sits among its ARM's ledger lines, 1-based.
+
+        That position is what its telemetry seq is derived from, so it has to be the position in the
+        FILE rather than a counter this process keeps: a line's index is fixed the moment it is
+        appended, which is what lets two arm processes and a later backfill agree on one seq for it
+        instead of each inventing their own and the platform keeping three copies.
+
+        Every arm line is walked and the LAST content match wins, so if an identical line was
+        appended earlier (a retry of the same cell recorded twice, say) the position reported is the
+        one just written rather than its older twin. None when the line cannot be found at all (a
+        torn write, a file replaced underneath us), which the caller treats as "do not report this
+        line" rather than reporting it at a guessed position.
+        """
+        wanted = line.model_dump(mode="json")
+        position = 0
+        found: int | None = None
+        for recorded in self.ledger_lines():
+            if recorded.arm != line.arm:
+                continue
+            position += 1
+            if recorded.model_dump(mode="json") == wanted:
+                found = position
+        if found is None:
+            log.warning(
+                "could not locate the ledger line just written for %s in %s, so it is not "
+                "reported to the runs panel (the ledger itself is intact)",
+                line.arm,
+                self._dir / LEDGER_FILE,
+            )
+        return found
 
     def calibration(self) -> Calibration | None:
         """The persisted ratio match, if an earlier process in this grid already measured it."""
@@ -904,6 +950,11 @@ class ArmRunner:
             scenarios = self.chunk_scenarios(index)
             if not scenarios:
                 continue
+            # A stop asked for from the platform is honored HERE and nowhere finer: mid-chunk is
+            # the one place stopping wastes money, because a chunk that does not finish is a chunk
+            # whose cells were paid for and not persisted. Same boundary the spend cap uses.
+            if self.state.emitter is not None and self.state.emitter.stop_requested:
+                self.stop(f"the platform asked this run to stop before {self.arm} chunk {index}")
             existing = self.loaded_chunk(index)
             if existing is not None:
                 scored = sum(1 for outcome in existing.outcomes if outcome.scored)
@@ -962,7 +1013,7 @@ class ArmRunner:
             plan.total_usd,
         )
         started = time.monotonic()
-        run = self.execute(plan)
+        run = self.execute(plan, chunk=index)
         wall = time.monotonic() - started
         scored = sum(1 for outcome in run.matrix.outcomes if outcome.scored)
         gap = run.metering_gap
@@ -1004,25 +1055,40 @@ class ArmRunner:
                 "across every process in this grid)"
             )
 
-    def execute(self, plan: SweepPlan) -> SweepRun:
-        """One `execute_sweep`, with this arm's own runs directory for the world-model records."""
+    def execute(self, plan: SweepPlan, *, chunk: int) -> SweepRun:
+        """One `execute_sweep`, with this arm's own runs directory for the world-model records.
+
+        `chunk` is which chunk's band the cells report under, so live emission and a later
+        backfill of the same chunk file number the same cells the same way.
+        """
         world_model = self.world_model
         return execute_sweep(
             plan,
             world_model=world_model,
             env_factory=lambda: WorldModelEnv(world_model, score_on_close=True),
-            on_outcome=lambda outcome: log.info(
-                "  cell %s / %s ep%d: %s ($%.5f, %d step(s))%s",
-                outcome.model,
-                outcome.scenario_id,
-                outcome.episode,
-                "unscored" if outcome.reward is None else f"reward {outcome.reward:.3f}",
-                outcome.cost_usd + outcome.compressor_cost_usd,
-                outcome.steps,
-                f" error={outcome.error}" if outcome.error else "",
-            ),
+            on_outcome=lambda outcome: self.report_cell(outcome, chunk=chunk),
             runs_dir=self.dir / "runs",
         )
+
+    def report_cell(self, outcome: ScenarioOutcome, *, chunk: int) -> None:
+        """Log one measured cell, and report it if run telemetry is on.
+
+        The sweep already serializes this callback under one lock, so the emitter's buffer is only
+        ever appended to from one thread at a time. Emission is buffered and cannot raise, so the
+        log line below is never at the mercy of the network.
+        """
+        log.info(
+            "  cell %s / %s ep%d: %s ($%.5f, %d step(s))%s",
+            outcome.model,
+            outcome.scenario_id,
+            outcome.episode,
+            "unscored" if outcome.reward is None else f"reward {outcome.reward:.3f}",
+            outcome.cost_usd + outcome.compressor_cost_usd,
+            outcome.steps,
+            f" error={outcome.error}" if outcome.error else "",
+        )
+        if self.state.emitter is not None:
+            self.state.emitter.on_outcome(outcome, chunk=chunk)
 
     def stop(self, reason: str) -> None:
         """Record and raise a clean stop, with the command that resumes it."""
@@ -1162,7 +1228,7 @@ class ArmRunner:
                 f"${self.config.cap_usd:.0f} cap (spent ${spent:.2f} across all processes)"
             )
         started = time.monotonic()
-        run = self.execute(plan)
+        run = self.execute(plan, chunk=chunk)
         wall = time.monotonic() - started
         rows = run.matrix.outcomes
         if not rows:
@@ -1488,6 +1554,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "elsewhere (the compressor endpoint's WMO_COMPRESSOR_* live in the compression lane's "
         ".env). Already-set variables are never overridden. Repeatable.",
     )
+    parser.add_argument(
+        "--no-emit",
+        action="store_true",
+        help="Do not report progress to the platform's runs panel. Reporting is on whenever a "
+        "platform credential with an organization resolves (`wmo login`); it never changes what the "
+        "grid measures and can never fail it, and when the platform is unreachable it costs at most "
+        "a few bounded seconds around chunk boundaries.",
+    )
     return parser.parse_args(argv)
 
 
@@ -1607,21 +1681,60 @@ def main(argv: Sequence[str] | None = None) -> int:
                 runner.chunk_count,
                 base_plan.cells,
             )
-        if not args.merge_only:
-            log.info(
-                "=== arm %s (%s) ===",
-                arm,
-                "raw text (no compression)"
-                if compression is None
-                else f"{compression.compressor_id} v{compression.compressor_version} "
-                f"@ {compression.aggressiveness:g}",
-            )
-            runner.run_chunks()
-            if config.inject_fake_error:
-                runner.inject_fake_error()
-            if config.retry:
-                runner.retry_pass()
-        runner.merge()
+        # One platform run per ARM, because an arm is what a matrix is evidence about. The
+        # run-level band is the band of the FIRST chunk this process owns, so two processes given
+        # disjoint --chunks ranges of one arm never write into the same seq band (the cells of
+        # chunk k always report in band k+1, which is also what a later backfill uses).
+        owned = runner.owned_chunks()
+        state.emitter = GridEmitter.create(
+            grid_relpath=grid_relpath(config.grid_dir),
+            arm=arm,
+            band=cell_band(owned[0] if owned else 0),
+            snapshot=lambda: arm_snapshot(state, arm, total=base_plan.cells),
+            requested=not args.no_emit,
+        )
+        state.emitter.on_arm_start(
+            cohort=state.cohort.model_dump(mode="json"),
+            world_model=config.model_dir.name,
+            created=state.cohort.created,
+        )
+        try:
+            if not args.merge_only:
+                log.info(
+                    "=== arm %s (%s) ===",
+                    arm,
+                    "raw text (no compression)"
+                    if compression is None
+                    else f"{compression.compressor_id} v{compression.compressor_version} "
+                    f"@ {compression.aggressiveness:g}",
+                )
+                runner.run_chunks()
+                if config.inject_fake_error:
+                    runner.inject_fake_error()
+                if config.retry:
+                    runner.retry_pass()
+            merged = runner.merge()
+        except GridStopped as exc:
+            # A clean stop: the cap, a platform stop command, an incomplete cohort. Every finished
+            # chunk is on disk, so the run is resumable and the panel should say `stopped`, not
+            # `failed`.
+            state.emitter.on_status(RunStatus.STOPPED, error=str(exc))
+            state.emitter.close()
+            state.emitter = None
+            raise
+        except Exception as exc:
+            state.emitter.on_status(RunStatus.FAILED, error=f"{type(exc).__name__}: {exc}")
+            state.emitter.close()
+            state.emitter = None
+            raise
+        # `merge` returns None while chunks are still missing, which is the normal state of an arm
+        # another process is still driving: that arm is not finished, so its run stays running.
+        if merged is not None:
+            state.emitter.on_status(RunStatus.COMPLETED)
+        # One arm is one run, so its telemetry connection is released here rather than held for the
+        # rest of a multi-arm process.
+        state.emitter.close()
+        state.emitter = None
 
     log.info(
         "grid spend so far: $%.4f all-in across every process (cap $%.0f)",
