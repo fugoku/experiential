@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
+from typing import cast
 
 import pytest
 from pydantic import BaseModel, ConfigDict
@@ -21,10 +22,14 @@ from wmo.runs.hooks import (
     CONTROL_FORCE_FROM_STAGE,
     CONTROL_RETRY_UNSCORED,
     CONTROL_STOP,
+    FRONTIER_PAGE,
+    FrontierReader,
     GridEmitter,
     GridSnapshot,
     PipelineEmitter,
+    frontier_from_reader,
 )
+from wmo.runs.reader import EventPage, EventRow, RunsReader
 from wmo.runs.schema import (
     CELL_BATCH_CAP,
     RUN_LEVEL_BAND,
@@ -93,6 +98,13 @@ class FakeTransport:
         # here is what lets a test fail on a collision at all: a double that accepts everything
         # cannot distinguish the band design working from the band design being broken.
         self.held: set[int] = set(range(1, held_last_seq + 1)) if held_last_seq else set()
+        # Type per held seq, so the double can answer the frontier read the way the platform's
+        # type-filtered tail does.
+        self.held_types: dict[int, str] = {}
+        # Arrival order, which is what `pos` orders by. Kept so a reader over this double can page
+        # and TRUNCATE exactly like the route: a double that answers the whole log at once hides
+        # every bug that only appears when a window is too small to reach back far enough.
+        self.arrivals: list[tuple[int, str]] = []
 
     def push_run_events(
         self,
@@ -125,7 +137,13 @@ class FakeTransport:
         self.pushes.append([Pushed.model_validate(event) for event in events])
         seqs = [int(str(event["seq"])) for event in events]
         fresh = [seq for seq in seqs if seq not in self.held]
+        fresh_set = set(fresh)
         self.held.update(seqs)
+        for event in events:
+            seq, kind = int(str(event["seq"])), str(event["type"])
+            self.held_types.setdefault(seq, kind)
+            if seq in fresh_set:
+                self.arrivals.append((seq, kind))
         return {
             "accepted": len(fresh) if self._accepted is None else self._accepted,
             "last_seq": max(self.held),
@@ -174,6 +192,53 @@ def _no_retry_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("wmo.runs.client.PUSH_BACKOFF_SECONDS", 0.0)
 
 
+class _EventReader:
+    """The events route over a `FakeTransport`, with the semantics that matter here.
+
+    Honest about the three things the production read depends on: `pos` orders by ARRIVAL (so a
+    sibling band's traffic really does sit between this band's events), `tail=True` returns the
+    NEWEST `limit` of that type (so a window can be too small to reach this band at all), and
+    `after_pos`/`last_pos` page forward.
+    """
+
+    def __init__(self, transport: FakeTransport) -> None:
+        self._transport = transport
+        self.reads = 0
+
+    def list_events(
+        self,
+        external_id: str,
+        *,
+        after_pos: int = 0,
+        limit: int = 500,
+        tail: bool = False,
+        event_type: str | None = None,
+    ) -> EventPage:
+        self.reads += 1
+        rows = [
+            EventRow(pos=pos, seq=seq, type=kind, payload={}, ts=_ts(0))
+            for pos, (seq, kind) in enumerate(self._transport.arrivals, start=1)
+            if event_type is None or kind == event_type
+        ]
+        window = rows[-limit:] if tail else [row for row in rows if row.pos > after_pos][:limit]
+        return EventPage(events=tuple(window), last_pos=window[-1].pos if window else after_pos)
+
+
+def _frontier_of(transport: FakeTransport) -> FrontierReader:
+    """The frontier read, answered from what the double holds.
+
+    Same rule as `platform_frontier`: the LOWEST heartbeat or `run.status` seq inside the band,
+    which is where the previous invocation's descending walk stopped.
+    """
+
+    def read(external_id: str, band: int) -> int | None:
+        # The real function over a faithful reader, not a re-implementation of its answer: a double
+        # that computes the frontier its own way cannot catch the frontier being computed wrongly.
+        return frontier_from_reader(cast("RunsReader", _EventReader(transport)), external_id, band)
+
+    return read
+
+
 def _sink(transport: FakeTransport) -> RunsSink:
     return RunsSink(transport, org_id=ORG, emitter_id="test")
 
@@ -186,6 +251,7 @@ def _grid(
         arm=ARM,
         band=band,
         factory=lambda: _sink(transport),
+        frontier=_frontier_of(transport),
         snapshot=lambda: GridSnapshot(done=4, scored=3, total=10, candidate_usd=1.5, wm_usd=3.0),
         flush_cells=flush_cells,
     )
@@ -724,11 +790,144 @@ def test_an_unreachable_probe_is_not_read_as_a_fresh_run() -> None:
     assert transport.of_type("heartbeat")[0].seq > 7
 
 
-def test_an_unknown_status_is_reported_rather_than_raised() -> None:
-    """Telemetry may not end a paid run, not even over a status this build has not heard of."""
+def test_an_unknown_status_is_skipped_rather_than_raised_or_sent() -> None:
+    """Telemetry may not end a paid run, and may not cost a batch, over an unknown status.
+
+    Two wrong answers are available here. Raising ends a paid run through the telemetry path.
+    Sending the value as text is refused by the platform's closed vocabulary as a permanent 4xx,
+    and a permanent refusal drops the whole batch, so one unknown status would take the ledger
+    lines and cells riding with it. Skipping the event costs only the event.
+    """
     transport = FakeTransport()
     emitter = _declared(transport)
+    ledger_before = len(transport.of_type("ledger.line"))
 
-    emitter.on_status("canceled")  # type: ignore[arg-type]
+    # Cast rather than ignore: the point is a value OUTSIDE the vocabulary, which a correct caller
+    # cannot produce but a future platform status could.
+    emitter.on_status(cast("RunStatus", "canceled"))
+    emitter.on_ledger_line({"event": "merge", "arm": ARM}, ts=_ts(9), position=9)
 
-    assert transport.of_type("run.status")[0].payload["status"] == "canceled"
+    assert transport.of_type("run.status") == []
+    # The batch behind it is untouched: skipping the event is not skipping the run.
+    assert len(transport.of_type("ledger.line")) == ledger_before + 1
+
+
+def test_a_resumed_arm_with_several_descending_events_does_not_re_use_any() -> None:
+    """The frontier of a descending walk is its MINIMUM, and `last_seq` is a maximum.
+
+    A maximum cannot locate a minimum, so rebasing from `last_seq - 1` re-issues every descending
+    seq the previous invocation used except its first: two heartbeats and a terminal status become
+    two heartbeats and a terminal status the platform discards. The terminal one is the expensive
+    loss, because a finished run then reads `running` forever.
+    """
+    transport = FakeTransport()
+    first = _declared(transport, band=cell_band(0))
+    first.on_ledger_line({"event": "chunk", "arm": ARM}, ts=_ts(1), position=1)
+    first.on_ledger_line({"event": "chunk", "arm": ARM}, ts=_ts(2), position=2)
+    first.on_status(RunStatus.STOPPED)
+    spent = {event.seq for event in transport.events if event.seq > RUN_SEQ_BAND}
+    assert len(spent) >= 3, "the first invocation must spend several descending seqs"
+
+    resumed = _declared(transport, band=cell_band(0))
+    resumed.on_ledger_line({"event": "merge", "arm": ARM}, ts=_ts(3), position=3)
+    resumed.on_status(RunStatus.COMPLETED)
+
+    issued = [
+        event.seq
+        for push in transport.pushes
+        for event in push
+        if event.seq > RUN_SEQ_BAND and event.type in ("heartbeat", "run.status")
+    ]
+    assert len(issued) == len(set(issued)), f"a descending seq was re-issued: {sorted(issued)}"
+    terminal = [event for event in transport.of_type("run.status") if event.seq > RUN_SEQ_BAND]
+    assert terminal[-1].payload["status"] == RunStatus.COMPLETED.value
+
+
+def test_three_invocations_never_re_use_a_descending_seq() -> None:
+    """Resume has to hold for the THIRD invocation, not just the second.
+
+    This is what rules out every scheme derived from a fixed point. `last_seq` stays pinned at the
+    first invocation's ceiling (the highest seq the run ever held), so any constant offset below it
+    hands the second and third invocations the same answer and the third collides with the second.
+    Only reading the descending walk's own frontier survives repetition, which is why the fix costs
+    a read.
+    """
+    transport = FakeTransport()
+    issued: list[int] = []
+    for invocation in range(3):
+        emitter = _declared(transport, band=cell_band(0))
+        emitter.on_ledger_line(
+            {"event": "chunk", "arm": ARM, "chunk": invocation},
+            ts=_ts(invocation + 1),
+            position=invocation + 1,
+        )
+        emitter.on_status(RunStatus.STOPPED if invocation < 2 else RunStatus.COMPLETED)
+        issued.extend(
+            event.seq
+            for push in transport.pushes
+            for event in push
+            if event.seq > RUN_SEQ_BAND
+            and event.type in (RunEventType.HEARTBEAT, RunEventType.RUN_STATUS)
+        )
+        transport.pushes.clear()
+
+    assert len(issued) >= 6, "each invocation spends at least one heartbeat and one status"
+    assert len(issued) == len(set(issued)), f"a descending seq was re-issued: {sorted(issued)}"
+    # Each invocation's terminal status landed, which is the fact the whole exercise protects: a
+    # discarded one leaves a finished run reading `running` on the panel forever.
+    assert sum(1 for kind in transport.held_types.values() if kind == RunEventType.RUN_STATUS) == 3
+
+
+def test_a_busy_sibling_cannot_hide_a_dead_processs_frontier() -> None:
+    """A chunked arm's siblings share one log, and their traffic must not hide this band's frontier.
+
+    The frontier read's newest-page fast path returns the newest events of a type across EVERY band.
+    A live sibling emitting heartbeats under its own band can fill that page completely, and reading
+    "nothing for my band" as "no frontier" leaves the ceiling spent: the restarted process then
+    re-issues its predecessor's seqs and the platform discards them, terminal status included. So
+    finding nothing in the newest page has to mean "look further", not "there is none".
+    """
+    transport = FakeTransport()
+    # A crashed process on band 1: it spent descending seqs and never reported a terminal status.
+    dead = _declared(transport, band=cell_band(0))
+    dead.on_ledger_line({"event": "chunk", "arm": ARM, "chunk": 0}, ts=_ts(1), position=1)
+    spent = sorted(seq for seq in transport.held if seq > RUN_SEQ_BAND)
+    assert spent, "the crashed process must have spent descending seqs"
+
+    # A sibling on band 6 (chunks 5+) then floods the log with more than one page of heartbeats.
+    sibling = _declared(transport, band=cell_band(5))
+    for beat in range(FRONTIER_PAGE + 10):
+        sibling.on_ledger_line(
+            {"event": "retry", "arm": ARM, "chunk": 5}, ts=_ts(beat % 60), position=beat + 2
+        )
+
+    # The crashed process restarts on its own band and reports its terminal status.
+    resumed = _declared(transport, band=cell_band(0))
+    resumed.on_status(RunStatus.COMPLETED)
+
+    landed = [
+        seq
+        for seq, kind in transport.held_types.items()
+        if kind == RunEventType.RUN_STATUS and seq > RUN_SEQ_BAND
+    ]
+    assert landed, "the resumed arm's terminal status was discarded as a replay"
+    assert not set(landed) & set(spent), "it re-used a seq the crashed process had already spent"
+
+
+def test_a_pending_stop_is_acked_even_when_the_status_cannot_be_named() -> None:
+    """The stop was honored whether or not this build can name the status the run ended with.
+
+    Leaving it unacked shows the operator a stop still in flight on a run that has already finished,
+    and the row stays pending forever because only the runner that owns the run ever acks it.
+    """
+    transport = FakeTransport(control=[{"id": "c5", "command": CONTROL_STOP, "args": {}}])
+    emitter = _declared(transport)
+    assert emitter.stop_requested is True
+
+    emitter.on_status(cast("RunStatus", "canceled"))
+
+    assert transport.of_type("run.status") == [], "an unnameable status is still not sent"
+    assert [(control, status) for control, status, _note in transport.acks] == [
+        ("c5", ACK_ACKED),
+        ("c5", ACK_DONE),
+    ]
