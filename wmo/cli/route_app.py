@@ -64,7 +64,13 @@ from wmo.optimize.outcomes import (
     load_matrix_with_digest,
     split_router_scenarios,
 )
-from wmo.optimize.pareto import PARETO_FILENAME, held_out_curve
+from wmo.optimize.pareto import (
+    DEFAULT_WM_JUDGE,
+    PARETO_FILENAME,
+    REAL_EPISODE,
+    WM_SIMULATED,
+    held_out_curve,
+)
 from wmo.optimize.policy import (
     AZURE_EMBEDDER_DIM,
     AZURE_EMBEDDER_ENV,
@@ -1228,6 +1234,18 @@ def pin(
             f"no pool model named '{model}' in {pool_path}; available: {available}"
         )
     out_path = Path(out) if out else model_dir / POLICY_FILENAME
+    if out and out_path.resolve() != (model_dir / POLICY_FILENAME).resolve():
+        # The foot-gun that bit both bench-defaults lanes (2026-07-29): an --out
+        # anywhere but <model dir>/policy.json succeeds, prints the same cheerful
+        # line, and leaves the file serving actually reads holding whatever policy
+        # it held before (a different FILENAME in the right dir misses identically).
+        # The pin still lands where asked; the operator is told serving will not
+        # see it.
+        _console.print(
+            f"[yellow]![/yellow] --out is outside {model_dir}; `wmo serve --name "
+            f"{model_dir.name}` and GET /config read {model_dir / POLICY_FILENAME}, "
+            "which this pin does NOT update"
+        )
     if out_path.is_file() and not yes and not _confirm_overwrite(out_path):
         _console.print(f"left {out_path} in place")
         raise typer.Exit(0)
@@ -1334,8 +1352,35 @@ def report(
     ),
     endpoint: str = typer.Option("endpoint", "--endpoint", help="Endpoint id for the report."),
     out: str = typer.Option("report.json", "--out", help="Where to write the report JSON."),
+    provenance: str = typer.Option(
+        WM_SIMULATED,
+        "--provenance",
+        help=f"How this matrix's rewards were produced: {WM_SIMULATED} (closed-loop against a "
+        f"world model, the default) or {REAL_EPISODE} (episodes of the real benchmark). It rides "
+        "on the pareto curve and must never be wrong: consumers refuse to blend the two.",
+    ),
+    judge: str = typer.Option(
+        DEFAULT_WM_JUDGE,
+        "--judge",
+        help="What scored the episodes, printed beside every rendering of the curve. Pass the "
+        "real scorer for a real-benchmark matrix (for example \\[tau2 reward]).",
+    ),
+    scenario_label: str = typer.Option(
+        "",
+        "--scenario-label",
+        help="The report's customer-facing sentence describing WHAT was measured. Defaults to the "
+        "world-model phrasing ('reconstructed from your traces'), which is false for a real "
+        "benchmark, so pass the truth there (for example 'on the 20 pinned tau2-bench eval "
+        "tasks').",
+    ),
 ) -> None:
     """Build the improvement report for a fitted policy over a matrix."""
+    if provenance not in {WM_SIMULATED, REAL_EPISODE}:
+        # A typo here would silently label real measurements as simulated, which is the one
+        # mistake the curve's provenance field exists to prevent.
+        raise typer.BadParameter(
+            f"--provenance must be {WM_SIMULATED} or {REAL_EPISODE}, not {provenance!r}"
+        )
     matrix, matrix_source = _load_matrix(matrix_file)
     policy = _load_policy(policy_file)
     try:
@@ -1345,6 +1390,7 @@ def report(
             baseline=baseline,
             endpoint=endpoint,
             generated_at=datetime.now(tz=UTC).isoformat(),
+            scenario_label=scenario_label or None,
         )
     except KeyError as exc:
         # `--baseline` is a pool entry handle; the KeyError already lists the ones this matrix
@@ -1365,10 +1411,19 @@ def report(
     # The measured cost/quality curve rides beside every report (D-PARETO): GET /config
     # serves it from the model dir so the platform's graph renders this workload's frontier.
     try:
-        curve = held_out_curve(matrix, policy, judge="world-model verifier")
+        curve = held_out_curve(matrix, policy, judge=judge, provenance=provenance)
         pareto_out = Path(out).parent / PARETO_FILENAME
         write_artifact_atomically(pareto_out, curve.model_dump_json(indent=2).encode("utf-8"))
         _console.print(f"[green]✓[/green] pareto curve -> {pareto_out}")
+        # Same foot-gun as `pin --out`: serving loads policy.json and pareto.json from ONE
+        # model dir, so a curve written apart from the policy it describes is a curve
+        # `wmo serve` and GET /config never show. Succeeding silently here is what hid it.
+        if Path(policy_file).resolve().parent != pareto_out.resolve().parent:
+            _console.print(
+                f"[yellow]![/yellow] the curve landed apart from {policy_file}; serving reads "
+                "pareto.json from the same directory as the policy it mounts, so point --out "
+                "there for the endpoint to show this curve"
+            )
     except (ValueError, FileNotFoundError) as exc:
         _console.print(f"[yellow]![/yellow] pareto curve skipped: {exc}")
     headline = improvement.headline
