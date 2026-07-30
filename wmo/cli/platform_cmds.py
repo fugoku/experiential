@@ -229,21 +229,41 @@ def push(
 
 
 def pull(
-    name: Annotated[str, typer.Argument(help="Remote world model or harness name.")],
+    name: Annotated[str, typer.Argument(help="Remote world model, endpoint, or harness name.")],
     org: Annotated[str | None, _ORG] = None,
     kind: Annotated[str | None, _KIND] = None,
     version: Annotated[int | None, _PULL_VERSION] = None,
     force: Annotated[bool, _PULL_FORCE] = False,
     root: Annotated[str, _ROOT] = ".wmo",
 ) -> None:
-    """Fetch a world model or harness from the platform registry."""
+    """Fetch the CURRENT platform state of a model, endpoint, or harness.
+
+    A model pull restores the bundle as pushed, then overwrites policy.json,
+    report.json, and the knn bank with what the same-named endpoint serves NOW,
+    so a hosted optimizer's fit comes home with the pull. A name that is only
+    an endpoint (platform-created, never pushed) pulls those artifacts into the
+    model directory by themselves. The artifact overwrite is the point of the
+    command and does not need --force; --force still governs replacing an
+    existing local bundle.
+    """
     if kind is not None and kind not in ("model", "harness"):
         raise typer.BadParameter("--kind must be 'model' or 'harness'")
     credentials, org_id = _require_connection(org)
     with _connected(credentials, "Pull failed") as client:
-        resolved_kind = kind or _detect_remote_kind(client, org_id, name)
+        resolved_kind = kind or _detect_pullable_kind(client, org_id, name)
         if resolved_kind == "model":
             _pull_model(client, org_id, name, root, force=force)
+            _pull_endpoint_artifacts(client, org_id, name, WorldModelStore(root).model_dir(name))
+        elif resolved_kind == "endpoint":
+            dest_dir = WorldModelStore(root).model_dir(name)
+            if not _pull_endpoint_artifacts(client, org_id, name, dest_dir):
+                raise typer.BadParameter(
+                    f"the organization has no world model, endpoint, or harness named {name!r}"
+                )
+            _console.print(
+                "no simulation to pull: the endpoint's evidence came from a real benchmark "
+                "or a hosted fit, so only its measured artifacts live locally"
+            )
         else:
             _pull_harness(client, org_id, name, root, version=version)
 
@@ -342,16 +362,48 @@ def _nothing_local(name: str, root: str, *, kind: str | None) -> str:
     return f"no local {label} named {name!r} under {root} ({found}); {hint}, or pass --root <dir>"
 
 
-def _detect_remote_kind(client: PlatformClient, org_id: str, name: str) -> str:
+def _detect_pullable_kind(client: PlatformClient, org_id: str, name: str) -> str:
+    """What a pull by this name reaches: model, harness, or endpoint-only.
+
+    The endpoint probe runs only after the model and harness reads both come
+    up empty, so a genuine model/harness ambiguity still refuses with the
+    pass-`--kind` message instead of silently selecting a same-named endpoint.
+    An endpoint with no same-named simulation (platform-created, or its
+    evidence is a real benchmark) is still pullable: its measured artifacts
+    are the whole point of fetching current state.
+    """
+    # The model list goes first ON PURPOSE: a dead credential fails here with
+    # the platform's own sentence, so the tolerant harness probe below never
+    # masks a real auth problem.
     model_names = {model.name for model in client.list_world_models(org_id)}
-    harness_names = {harness.name for harness in client.list_harnesses(org_id)}
+    try:
+        harness_names = {harness.name for harness in client.list_harnesses(org_id)}
+    except PlatformError as error:
+        if error.status_code in (401, 403, 404):
+            # This platform exposes no harness registry to this credential
+            # (the hosted platform serves none at all, and the customer-key
+            # allowlist ends before it). The credential could not pull a
+            # harness either way, so the model proceeds - but never silently,
+            # in case a registry this credential cannot see does hold the name.
+            harness_names = set()
+            if error.status_code != 404:
+                _console.print(
+                    "harness registry not readable with this credential; "
+                    "assuming the name is not also a harness"
+                )
+        else:
+            raise
     if name in model_names and name in harness_names:
         raise typer.BadParameter("both a model and a harness have this name remotely; pass --kind")
     if name in model_names:
         return "model"
     if name in harness_names:
         return "harness"
-    raise typer.BadParameter(f"the organization has no world model or harness named {name!r}")
+    if client.get_endpoint(org_id, name) is not None:
+        return "endpoint"
+    raise typer.BadParameter(
+        f"the organization has no world model, endpoint, or harness named {name!r}"
+    )
 
 
 def _push_model(client: PlatformClient, org_id: str, remote_name: str, model_dir: Path) -> str:
@@ -528,6 +580,54 @@ def _pull_model(client: PlatformClient, org_id: str, name: str, root: str, *, fo
         except FileExistsError as error:
             raise typer.BadParameter(str(error)) from error
     _console.print(f"{_CHECK} Pulled world model [bold]{name}[/bold] into {dest_dir}")
+
+
+def _pull_endpoint_artifacts(
+    client: PlatformClient, org_id: str, name: str, dest_dir: Path
+) -> bool:
+    """Overwrite the local dir's measured artifacts with the endpoint's CURRENT state.
+
+    The pull half of D-LOCAL-PUSH: policy.json, report.json, and the knn bank
+    reflect what the endpoint serves NOW (a hosted optimizer's fit included),
+    not what was last pushed. Overwriting is the point, so no --force gate.
+
+    Returns:
+        Whether the org had an endpoint by this name at all.
+    """
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    payload = client.download_endpoint_policy(
+        org_id, name, bank_dest=dest_dir / "policy.json.bank.npz"
+    )
+    if payload is None:
+        _console.print(f"no endpoint named {name!r}; the bundle is all there is to pull")
+        return False
+    (dest_dir / "policy.json").write_text(
+        json.dumps(payload["policy"], indent=2) + "\n", encoding="utf-8"
+    )
+    wrote = ["policy.json"]
+    report = payload.get("report")
+    report_path = dest_dir / "report.json"
+    if report is not None:
+        report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        wrote.append("report.json")
+    elif report_path.is_file():
+        # Same rule as the bank below: a reportless current endpoint must not
+        # keep an as-pushed or earlier-pull report reading as current evidence.
+        report_path.unlink()
+        _console.print("removed a stale report.json from an earlier state")
+    bank_path = dest_dir / "policy.json.bank.npz"
+    if isinstance(payload.get("bank"), dict):
+        wrote.append("policy.json.bank.npz")
+    elif bank_path.is_file():
+        # A bankless current policy must not leave an older fit's sidecar
+        # beside it; the pair would disagree the next time anything reads them.
+        bank_path.unlink()
+        _console.print("removed a stale policy.json.bank.npz from an earlier fit")
+    _console.print(
+        f"{_CHECK} Pulled endpoint [bold]{name}[/bold]'s current {' + '.join(wrote)} "
+        f"into {dest_dir}"
+    )
+    return True
 
 
 def _pull_harness(
