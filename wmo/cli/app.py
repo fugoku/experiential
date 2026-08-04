@@ -11,9 +11,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import logging
-import os
 import random
-import subprocess
 import time
 import urllib.error
 import uuid
@@ -73,9 +71,6 @@ app = typer.Typer(
 
 
 providers_app = typer.Typer(help="Manage and verify LLM providers.", no_args_is_help=True)
-examples_app = typer.Typer(
-    help="List and launch self-contained task examples.", no_args_is_help=True
-)
 # "harness" here would collide with the `wmo harness` group, which manages a different object.
 config_app = typer.Typer(help="Manage project-local wmo settings.", no_args_is_help=True)
 research_app = typer.Typer(
@@ -86,29 +81,20 @@ scenarios_app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(providers_app, name="providers")
-app.add_typer(examples_app, name="examples")
 app.add_typer(config_app, name="config")
 app.add_typer(research_app, name="research")
 app.add_typer(scenarios_app, name="scenarios")
 add_deferred_typer(
     app,
-    name="harness",
-    module="wmo.cli.harness_app",
-    attr="harness_app",
-    help="Inspect and initialize named, versioned agent harnesses.",
-    known_names=("list", "show", "init"),
-)
-add_deferred_typer(
-    app,
     name="optimize",
-    module="wmo.cli.harness_app",
+    module="wmo.cli.optimize_app",
     attr="optimize_app",
     help=(
         "Optimizers behind one switch. `model` is the staged one-command path (preflight, "
-        "sweep, fit, tune, report); `route` is those steps individually; `harness` searches the "
-        "agent scaffold; `distill` trains an adapter."
+        "sweep, fit, tune, report); `route` is those steps individually; `distill` trains "
+        "an adapter."
     ),
-    known_names=("route", "distill", "model", "harness"),
+    known_names=("route", "distill", "model"),
 )
 add_deferred_typer(
     app,
@@ -135,13 +121,9 @@ def _register_ingest() -> None:
 
 
 def _register_side_commands() -> None:
-    from wmo.cli.agent_session import register as register_agent_session_commands
-    from wmo.cli.e2b_cmds import register as register_e2b_commands
     from wmo.cli.platform_cmds import register as register_platform_commands
 
     register_platform_commands(app)
-    register_agent_session_commands(app)
-    register_e2b_commands(app)
 
 
 _register_ingest()
@@ -550,59 +532,6 @@ def _print_verify_result(result: VerifyResult, sources: list[str], *, prefix: st
         _console.print(f"  [yellow]{hint}[/yellow]")
 
 
-@examples_app.command("list")
-def examples_list() -> None:
-    """List self-contained example tasks."""
-    examples = _discover_examples()
-    if not examples:
-        _console.print("[yellow]no examples found[/yellow]")
-        return
-    for example in examples:
-        # Data-only bundles (what `wmo download` fetches) have no launcher, so say so here
-        # rather than letting `wmo examples run` be the only way to find out.
-        note = "" if (example / "run.sh").exists() else "  [dim](data only — no run.sh)[/dim]"
-        _console.print(f"{example.name}{note}")
-
-
-@examples_app.command(
-    "run",
-    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
-)
-def examples_run(
-    ctx: typer.Context,
-    name: str = typer.Argument(..., help="Example task name."),
-) -> None:
-    """Run an example's local launcher, forwarding any extra args after `--`."""
-    example_dir = _resolve_example(name)
-    runner = example_dir / "run.sh"
-    if not runner.exists():
-        # A data-only bundle (`wmo download`) is listed but not runnable; name what it IS for.
-        traces = example_dir / "traces.otel.jsonl"
-        hint = (
-            "; it is a data-only bundle — build a world model from it with "
-            f"`wmo build --file {traces} --name {name}`"
-            if traces.exists()
-            else ""
-        )
-        raise typer.BadParameter(f"example {name!r} has no run.sh launcher{hint}")
-    if not os.access(runner, os.X_OK):
-        raise typer.BadParameter(
-            f"example {name!r} has a run.sh that is not executable; run `chmod +x {runner}`"
-        )
-    try:
-        result = subprocess.run([str(runner), *ctx.args], cwd=example_dir, check=False)
-    except OSError as exc:
-        # The exec itself failed, so there is no exit code to forward: the launcher has no
-        # shebang (ENOEXEC), or names an interpreter that is not installed (ENOENT, whose
-        # "No such file or directory" reads as a lie about a run.sh we just stat'd). Say which
-        # line to look at instead of letting the errno out as a traceback.
-        raise typer.BadParameter(
-            f"example {name!r} could not start {runner} ({exc.strerror or exc}); "
-            f"check its interpreter line with `head -1 {runner}`"
-        ) from exc
-    raise typer.Exit(result.returncode)
-
-
 # The serve provider `wmo build` falls back to when neither `--provider` nor a configured worker
 # role names one.
 _BUILD_PROVIDER = "bedrock"
@@ -918,10 +847,7 @@ def build(
         ) from None
     # A provider-backed embedder needs an embeddings model; fail fast, not deep inside embed().
     # The in-process kinds need none: hashing has no model, local carries its own default.
-    if (
-        embed_kind not in (EmbedderKind.HASHING, EmbedderKind.LOCAL)
-        and not params.embed_model
-    ):
+    if embed_kind not in (EmbedderKind.HASHING, EmbedderKind.LOCAL) and not params.embed_model:
         raise typer.BadParameter(
             f"--embed-provider {embed_kind.value} requires --embed-model "
             "(the embeddings model id / Azure embedding deployment)"
@@ -1195,13 +1121,16 @@ def download(
     benchmarks: list[str] = _DOWNLOAD_BENCHMARKS,
     force: bool = typer.Option(False, "--force", help="Overwrite existing local files."),
 ) -> None:
-    """Download benchmark data bundles (trace corpus + task data) from the Hub.
+    """Download benchmark data bundles (traces, task data, prebuilt model, evals) from the Hub.
 
     With no arguments, lists the org's published datasets (live, via the Hub API) and offers a
-    picker. Bundles land in `environment-capture-data/<benchmark>/` under the current directory
-    (in a git checkout, in `packages/environment-capture/<benchmark>/` instead); set
-    `ENVCAP_DATA_ROOT` to put them somewhere else. Existing local files are kept unless
+    picker. Bundles land in `environment-capture-data/<benchmark>/` under the current directory;
+    set `ENVCAP_DATA_ROOT` to put them somewhere else. Existing local files are kept unless
     `--force`.
+
+    A bundle arrives ready to use, not just ready to build from: its `models/` are prebuilt world
+    models `wmo play`/`demo`/`eval --mode closed-loop` resolve by name, and its `evals/` are the
+    named suites `wmo eval list` discovers.
     """
     from wmo.cli.ui import select_option
     from wmo.hub import corpus_path, published_corpora
@@ -1356,7 +1285,7 @@ def serve(
     """Run the local FastAPI backend so agents can step against world models over HTTP.
 
     Serves every built model by default, or just the `--name` ones, from one or more roots
-    (e.g. `--root .wmo --root packages/environment-capture/tau-bench`). Two surfaces are
+    (e.g. `--root .wmo --root environment-capture-data/tau-bench`). Two surfaces are
     exposed: the world-model step API, namespaced `/world_models/{name}/sessions` and
     `.../step`; and, for every served model whose dir carries a `policy.json` (written by
     `wmo optimize route fit --out` or `wmo optimize model`), the OpenAI-compatible endpoint
@@ -1509,8 +1438,8 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     out: str | None = typer.Option(None, help="Optional path to write the full JSON report."),
     examples_root: str | None = typer.Option(
         None,
-        help="Directory containing eval suites. Default: repo-local examples/ AND "
-        "packages/environment-capture/ (where the shipped suites live).",
+        help="Directory containing eval suites. Default: the downloaded benchmark data root "
+        "(environment-capture-data/, where the shipped suites live).",
     ),
     results_root: str = typer.Option(
         f"{ARTIFACT_DIR}/evals", help="Local directory for named eval result JSON."
@@ -1584,7 +1513,7 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
       otherwise the agent shares the world model's provider. `--harness-backend e2b` moves the
       pi-node harness process into pooled E2B sandboxes while the environment stays the world
       model. Score task success against gold assertions (see docs/reference/closed_loop.md).
-    - `wmo eval list`: list named suites under `packages/environment-capture/<task>/evals/`.
+    - `wmo eval list`: list named suites under `environment-capture-data/<task>/evals/`.
     - `wmo eval run <suite>`: run a suite and save a local JSON result.
     - `wmo eval results optional-suite`: summarize local suite results.
     - `wmo eval grid <suite>`: run the model x condition grid for a suite and chart it (needs the
@@ -1600,7 +1529,7 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     (bedrock/claude-opus-4-8 when no role is configured); `--provider`/`--model` override it.
     """
     from wmo.cli.eval_closed_loop import run_agreement, run_closed_loop
-    from wmo.cli.harness_app import _explicit
+    from wmo.cli.ui import explicit_param as _explicit
     from wmo.telemetry import capture_eval_completed
 
     args = tokens or []
@@ -2755,8 +2684,6 @@ def demo(
 ) -> None:
     """Replay a randomly sampled recorded scenario against the world model, open loop."""
 
-    from llm_waterfall import is_capacity_error
-
     import wmo.providers as providers
     from wmo.cli.ui import select_provider_and_model
     from wmo.engine.build import ingest
@@ -2764,6 +2691,7 @@ def demo(
     from wmo.engine.world_model import WorldModel
     from wmo.providers import verify_all
     from wmo.providers.retry import wrap_provider_with_retries
+    from wmo.utils.waterfall import is_capacity_error
 
     wm, resolved_name, _provider, model_root = _load_model_any(
         name, root, max_fidelity=max_fidelity
@@ -2992,8 +2920,8 @@ def _resolve_model_any(name: str | None, root: str) -> tuple[Path, str]:
     """Which artifact a read command should open, as `(store_root, resolved_name)`.
 
     A `--root` pointing somewhere other than the default project dir keeps single-root behavior.
-    Otherwise the search spans `<root>/models/*` plus the shipped `examples/*/models/*` and
-    `packages/environment-capture/*/models/*`, so `demo`, `play` and `knowledge` all agree on
+    Otherwise the search spans `<root>/models/*` plus the downloaded `<data root>/*/models/*`,
+    so `demo`, `play` and `knowledge` all agree on
     which models exist.
     """
     if not _is_default_project_dir(root):
@@ -3088,9 +3016,20 @@ def _resolve_name(store: WorldModelStore, name: str | None) -> str:
 
 
 def _benchmark_roots() -> tuple[Path, ...]:
-    """Every root holding self-contained task dirs: examples/ + the capture member's data dirs."""
-    repo = Path(__file__).resolve().parents[2]
-    return (repo / "examples", repo / "packages" / "environment-capture")
+    """Every root holding self-contained task dirs.
+
+    Benchmark data is not vendored in this repo: `wmo download` writes bundles through
+    `wmo.hub`, which owns where they land (`$ENVCAP_DATA_ROOT` if set, else
+    `environment-capture-data/` under the working directory). Deriving the root from
+    `corpus_path` instead of hardcoding one keeps discovery pointed wherever download wrote,
+    including when the override moves it.
+    """
+    # Imported here per this module's deferred-import rule (#373): the CLI's startup
+    # latency budget forbids eager imports, and this function runs only on discovery.
+    from wmo.hub import CORPORA, corpus_path
+
+    # corpus_path is `<root>/<benchmark>/traces.otel.jsonl`, so its grandparent is the root.
+    return (corpus_path(next(iter(CORPORA))).parent.parent,)
 
 
 def _discover_examples() -> list[Path]:
@@ -3109,7 +3048,11 @@ def _discover_examples() -> list[Path]:
 
 
 def _is_safe_example_name(name: str) -> bool:
-    """Whether `name` would resolve via `wmo examples run` — keeps list/hint/run in agreement."""
+    """Whether `name` is resolvable at all — discovery must not surface what lookup would reject.
+
+    A downloaded dir whose name `validate_name` rejects can never be named on a command line, so
+    listing it as a model candidate or in an "available:" hint would only offer a dead end.
+    """
     try:
         validate_name(name)
     except ValueError:
@@ -3177,7 +3120,9 @@ def research_concurrency(
         None, "--real-timeout", help="Abort a real sandbox run after N seconds."
     ),
     out: str | None = typer.Option(None, help="Path to write the ConcurrencyScalingReport JSON."),
-    examples_root: str | None = typer.Option(None, help="Examples dir. Default: repo-local."),
+    examples_root: str | None = typer.Option(
+        None, help="Examples dir. Default: the downloaded benchmark data root."
+    ),
 ) -> None:
     """Measure the concurrency scaling law: batch wall-clock vs. how many scenarios run at once.
 
@@ -3417,9 +3362,7 @@ def research_plot_concurrency_combined(
 # so a reader sees the decision-rule difference instead of hunting for it: its router picked the
 # CHEAPEST arm whose predicted solve odds cleared a threshold (cost first, quality as the
 # constraint), measured over 6 seeded 80/20 repo splits.
-_DEEPSWE_LAB_REFERENCE = (
-    "cost ratio median 3.18x (range 0.90-5.25), graded delta median -0.015"
-)
+_DEEPSWE_LAB_REFERENCE = "cost ratio median 3.18x (range 0.90-5.25), graded delta median -0.015"
 
 
 @research_app.command("deepswe-holdout")
@@ -3480,9 +3423,7 @@ def research_deepswe_holdout(
                 "`wmo optimize route convert-deepswe` (or the downloaded published bundle)"
             )
     matrix = OutcomeMatrix.load(root / "matrix.json")
-    groups: dict[str, str] = json.loads(
-        (root / "scenario_groups.json").read_text(encoding="utf-8")
-    )
+    groups: dict[str, str] = json.loads((root / "scenario_groups.json").read_text(encoding="utf-8"))
     built = CachedTaskEmbedder(matrix, root / "task_embeddings.npy")
     spec = EmbedderSpec(kind="local", dim=built.dim)
 
@@ -3710,7 +3651,7 @@ def _exit_serve_provider_failure(
 
 
 # Top-level modules whose exceptions mean "the backend refused", not "wmo has a bug": the provider
-# SDKs plus the HTTP transports they raise through. llm-waterfall gates its capacity/client
+# SDKs plus the HTTP transports they raise through. waterfall gates its capacity/client
 # classification on the same set; this one answers a different question (is a credential hint the
 # right thing to print?), so it stays a local literal rather than importing a private name.
 _PROVIDER_SDK_MODULES = frozenset(
