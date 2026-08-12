@@ -28,8 +28,6 @@ from wmo.cli.cli_fixtures_test import app, runner
         ["optimize", "route", "student", "--help"],
         ["optimize", "route", "pin", "--help"],
         ["optimize", "route", "convert-deepswe", "--help"],
-        ["scenarios", "build", "--help"],
-        ["scenarios", "verify", "--help"],
     ],
     ids=[
         "root",
@@ -50,8 +48,6 @@ from wmo.cli.cli_fixtures_test import app, runner
         "route-student",
         "route-pin",
         "route-deepswe",
-        "scenarios-build",
-        "scenarios-verify",
     ],
 )
 def test_help_renders_only_user_facing_descriptions(argv: list[str]) -> None:
@@ -74,3 +70,24 @@ def test_route_student_help_preserves_literal_pool_table_name() -> None:
 
     assert result.exit_code == 0, result.output
     assert "[[model]]" in result.output
+
+
+def test_readme_route_sweep_invocation_parses_without_a_provider() -> None:
+    """The documented downloaded-root task-set sweep requires no provider for help."""
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "route",
+            "sweep",
+            "my-model",
+            "--project",
+            "my-project",
+            "--root",
+            "environment-capture-data/bird-sql",
+            "--help",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "--project" in result.output and "--root" in result.output

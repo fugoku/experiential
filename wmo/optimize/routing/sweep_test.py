@@ -7,17 +7,20 @@ cases are cheaper to state than to stage through a command.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 import pytest
 
 from wmo.common.config import HarnessConfig, save_config
+from wmo.common.core.artifacts import ArtifactInput, canonical_json_bytes
 from wmo.common.core.types import Action, ActionKind, EnvState, Observation, Step, Trace
 from wmo.common.judging.episode import EpisodeScore
 from wmo.common.observability import Phase, RunRecord, UsageTotals
@@ -30,6 +33,7 @@ from wmo.common.providers.base import (
     VerifyResult,
 )
 from wmo.common.providers.pool import PoolEntry, load_pool
+from wmo.common.tasks import LoadedTaskSet, TaskCase, TaskSet, ToolSchema
 from wmo.optimize.routing.compression import CompressionConfig
 from wmo.optimize.routing.evaluation import CellKey
 from wmo.optimize.routing.outcomes import OutcomeMatrix, ScenarioOutcome
@@ -42,13 +46,10 @@ from wmo.optimize.routing.sweep import (
     execute_sweep,
     plan_sweep,
     preflight_pool,
-    resolve_config,
     resumable_cells,
     unevenness,
 )
-from wmo.optimize.routing.sweep_partial import partial_path
-from wmo.simulation.ingest.otel_writer import write_traces_jsonl
-from wmo.simulation.serving.traces_source import TRACES_FILENAME
+from wmo.optimize.routing.sweep_partial import PartialWriter, partial_path
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -73,7 +74,7 @@ def _traces(count: int = 30) -> list[Trace]:
     ]
 
 
-def _model_dir(tmp_path: Path, *, with_corpus: bool = True) -> Path:
+def _model_dir(tmp_path: Path) -> Path:
     model_dir = tmp_path / ".wmo" / "models" / "support"
     save_config(
         HarnessConfig(
@@ -83,9 +84,52 @@ def _model_dir(tmp_path: Path, *, with_corpus: bool = True) -> Path:
         ),
         model_dir,
     )
-    if with_corpus:
-        write_traces_jsonl(_traces(), model_dir / TRACES_FILENAME)
     return model_dir
+
+
+def _task_set(count: int = 30) -> LoadedTaskSet:
+    """Build direct immutable task data without reopening a trace corpus."""
+    traces = sorted(_traces(count), key=lambda trace: trace.trace_id)
+    tasks = tuple(
+        TaskCase(
+            task_id=trace.trace_id,
+            lineage_group_id=f"lineage-{trace.trace_id}",
+            partition="held_out" if index % 5 == 0 else "fit",
+            instruction=trace.steps[0].task or trace.trace_id,
+            workload_weight=1.0,
+            source_trace_ids=(trace.trace_id,),
+        )
+        for index, trace in enumerate(traces)
+    )
+    return _loaded_task_set(tasks)
+
+
+def _loaded_task_set(
+    tasks: tuple[TaskCase, ...],
+    *,
+    task_set_id: str = "task-set-sweep",
+    inputs: tuple[ArtifactInput, ...] | None = None,
+) -> LoadedTaskSet:
+    """Build the verified TaskSet boundary the planner receives from artifact storage."""
+    payload = b"\n".join(canonical_json_bytes(task) for task in tasks) + b"\n"
+    task_inputs = (
+        (ArtifactInput(artifact_id="trace-dataset-sweep", sha256="1" * 64),)
+        if inputs is None
+        else inputs
+    )
+    return LoadedTaskSet(
+        task_set=TaskSet(
+            schema_version=1,
+            created_at=datetime(2026, 8, 11, tzinfo=UTC),
+            inputs=task_inputs,
+            code_revision="test",
+            task_set_id=task_set_id,
+            task_ids=tuple(task.task_id for task in tasks),
+            tasks_path="tasks.jsonl",
+            tasks_sha256=hashlib.sha256(payload).hexdigest(),
+        ),
+        tasks=tasks,
+    )
 
 
 def _pool_file(tmp_path: Path) -> Path:
@@ -111,14 +155,14 @@ def _plan(
     compression: CompressionConfig | None = None,
     max_concurrency: int = 1,
     out_name: str = "matrix.json",
+    task_set: LoadedTaskSet | None = None,
 ) -> SweepPlan:
     model_dir = _model_dir(tmp_path)
     return plan_sweep(
         model_dir=model_dir,
-        config=resolve_config(model_dir),
         pool=load_pool(_pool_file(tmp_path)),
         out_path=tmp_path / out_name,
-        traces_file=None,
+        task_set=task_set or _task_set(),
         assume_input_tokens=2000,
         assume_output_tokens=250,
         scenarios=scenarios,
@@ -134,11 +178,9 @@ def test_the_plan_cuts_the_same_held_out_prefix_every_time(tmp_path: Path) -> No
     # a matrix is only comparable to another one measured on the same scenario set.
     first = _plan(tmp_path)
     second = _plan(tmp_path)
-    assert [scenario.task for scenario in first.scenarios] == [
-        scenario.task for scenario in second.scenarios
-    ]
-    assert len(first.scenarios) == 3
-    assert not first.tiny_corpus
+    assert [task.instruction for task in first.tasks] == [task.instruction for task in second.tasks]
+    assert len(first.tasks) == 3
+    assert not first.underfilled
 
 
 def test_the_cost_projection_multiplies_real_cell_counts_by_the_assumed_tokens(
@@ -160,15 +202,19 @@ def test_a_bigger_step_budget_projects_proportionally_more(tmp_path: Path) -> No
     )
 
 
-def test_a_corpus_the_build_did_not_keep_says_where_to_pass_it(tmp_path: Path) -> None:
-    model_dir = _model_dir(tmp_path, with_corpus=False)
+def test_a_task_set_without_held_out_tasks_is_refused(tmp_path: Path) -> None:
+    model_dir = _model_dir(tmp_path)
+    task_set = _task_set(5)
+    task_set = LoadedTaskSet(
+        task_set=task_set.task_set,
+        tasks=tuple(task.model_copy(update={"partition": "fit"}) for task in task_set.tasks),
+    )
     with pytest.raises(SweepError) as caught:
         plan_sweep(
             model_dir=model_dir,
-            config=resolve_config(model_dir),
             pool=load_pool(_pool_file(tmp_path)),
             out_path=tmp_path / "matrix.json",
-            traces_file=None,
+            task_set=task_set,
             scenarios=3,
             episodes=1,
             max_steps=4,
@@ -176,7 +222,7 @@ def test_a_corpus_the_build_did_not_keep_says_where_to_pass_it(tmp_path: Path) -
             assume_output_tokens=250,
         )
     message = str(caught.value)
-    assert "no trace corpus" in message and "--traces" in message
+    assert "no held-out task" in message and "task-set-sweep" in message
 
 
 def test_an_unwritable_destination_is_refused_before_anything_is_spent(tmp_path: Path) -> None:
@@ -186,10 +232,9 @@ def test_an_unwritable_destination_is_refused_before_anything_is_spent(tmp_path:
     with pytest.raises(SweepError, match="cannot write the outcome matrix"):
         plan_sweep(
             model_dir=model_dir,
-            config=resolve_config(model_dir),
             pool=load_pool(_pool_file(tmp_path)),
             out_path=blocker / "matrix.json",
-            traces_file=None,
+            task_set=_task_set(),
             scenarios=3,
             episodes=1,
             max_steps=4,
@@ -599,6 +644,98 @@ def test_a_crash_keeps_its_paid_cells_and_the_resume_buys_only_the_rest(
     assert len(resumed.matrix.outcomes) == 3
     assert resumed.episodes_metered == 1  # this attempt's world-model spend, not the last one's
     assert not partial_path(plan.out_path).exists()
+
+
+def test_an_identical_immutable_task_set_resumes_its_paid_cells(tmp_path: Path) -> None:
+    original = _task_set()
+    plan = _plan(tmp_path, task_set=original)
+    task = plan.tasks[0]
+    with PartialWriter(partial_path(plan.out_path), plan.identity) as writer:
+        writer.append(
+            ScenarioOutcome(
+                scenario_id=task.task_id,
+                task=task.instruction,
+                model="cheap",
+                episode=0,
+                reward=0.5,
+            )
+        )
+    reloaded = _loaded_task_set(
+        original.tasks,
+        task_set_id=original.task_set.task_set_id,
+        inputs=original.task_set.inputs,
+    )
+    identical = _plan(tmp_path, task_set=reloaded)
+    assert identical.identity == plan.identity
+    assert resumable_cells(identical) == 1
+
+
+@pytest.mark.parametrize(
+    ("change", "expected"),
+    [
+        ("instruction", "task payload changed"),
+        ("initial_context", "task payload changed"),
+        ("tools", "task payload changed"),
+        ("workload_weight", "task payload changed"),
+        ("task_set_id", "immutable task set changed"),
+        ("tasks_sha256", "task payload changed"),
+        ("input_digest", "input artifacts changed"),
+    ],
+)
+def test_same_task_ids_with_changed_immutable_evidence_cannot_resume(
+    tmp_path: Path, change: str, expected: str
+) -> None:
+    original = _task_set()
+    original_plan = _plan(tmp_path, task_set=original)
+    task = original_plan.tasks[0]
+    with PartialWriter(partial_path(original_plan.out_path), original_plan.identity) as writer:
+        writer.append(
+            ScenarioOutcome(
+                scenario_id=task.task_id,
+                task=task.instruction,
+                model="cheap",
+                episode=0,
+                reward=0.5,
+            )
+        )
+
+    tasks = list(original.tasks)
+    task_set_id = original.task_set.task_set_id
+    inputs = original.task_set.inputs
+    if change == "instruction":
+        tasks[0] = tasks[0].model_copy(update={"instruction": "changed instruction"})
+    elif change == "initial_context":
+        tasks[0] = tasks[0].model_copy(update={"initial_context": {"account": "changed"}})
+    elif change == "tools":
+        tasks[0] = tasks[0].model_copy(
+            update={
+                "tools": (
+                    ToolSchema(
+                        name="lookup",
+                        description="Look up changed evidence.",
+                        input_schema={"type": "object"},
+                    ),
+                )
+            }
+        )
+    elif change == "workload_weight":
+        tasks[0] = tasks[0].model_copy(update={"workload_weight": 2.0})
+    elif change == "task_set_id":
+        task_set_id = "task-set-changed"
+    elif change == "input_digest":
+        inputs = (ArtifactInput(artifact_id="trace-dataset-sweep", sha256="2" * 64),)
+
+    changed = _loaded_task_set(tuple(tasks), task_set_id=task_set_id, inputs=inputs)
+    if change == "tasks_sha256":
+        changed = LoadedTaskSet(
+            task_set=changed.task_set.model_copy(update={"tasks_sha256": "3" * 64}),
+            tasks=changed.tasks,
+        )
+    changed_plan = _plan(tmp_path, task_set=changed)
+    assert changed.task_set.task_ids == original.task_set.task_ids
+    assert changed_plan.identity != original_plan.identity
+    with pytest.raises(SweepError, match=expected):
+        resumable_cells(changed_plan)
 
 
 def test_a_resumed_run_says_its_world_model_figure_is_this_attempt_only(
