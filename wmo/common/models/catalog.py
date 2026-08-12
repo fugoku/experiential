@@ -5,20 +5,44 @@ from __future__ import annotations
 import re
 import tomllib
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 import tomli_w
 from pydantic import Field, field_validator, model_validator
 
 from wmo.common.core.artifacts import (
     ContractModel,
+    JsonObject,
     SecretBoundaryError,
+    Sha256,
     assert_secret_free,
+    sha256_json,
     validate_artifact_id,
 )
 from wmo.common.core.files import write_text_atomic
+from wmo.common.models.model import ModelCapabilities
 
 _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_FIXED_ORIGIN_PROVIDERS = frozenset({"anthropic", "gemini", "openai", "openrouter", "tinker"})
+
+
+def _normalize_base_url(value: str) -> str:
+    """Return the stable endpoint spelling used for connection identity."""
+    parsed = urlsplit(value)
+    hostname = parsed.hostname
+    if hostname is None:
+        raise ValueError("base_url must include a hostname")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("base_url must use a valid port") from exc
+    scheme = parsed.scheme.lower()
+    host = hostname.lower()
+    if ":" in host:
+        host = f"[{host}]"
+    default_port = 443 if scheme == "https" else 80
+    netloc = host if port in {None, default_port} else f"{host}:{port}"
+    return urlunsplit((scheme, netloc, parsed.path.rstrip("/"), "", ""))
 
 
 class ModelCatalogError(ValueError):
@@ -51,23 +75,48 @@ class ConnectionConfig(ContractModel):
             raise ValueError("base_url must not embed credentials")
         if parsed.query or parsed.fragment:
             raise ValueError("base_url must not include query parameters or fragments")
+        _normalize_base_url(value)
         return value
 
     @model_validator(mode="after")
     def _require_secret_free_connection_metadata(self) -> ConnectionConfig:
+        if self.provider in _FIXED_ORIGIN_PROVIDERS and self.base_url is not None:
+            raise ValueError(
+                f"native provider {self.provider!r} uses its built-in official endpoint; "
+                "use provider='openai-compatible' for a trusted custom endpoint"
+            )
         try:
             assert_secret_free({"provider": self.provider, "base_url": self.base_url})
         except SecretBoundaryError as exc:
             raise ValueError("connection metadata must not contain credential values") from exc
         return self
 
+    def identity_sha256(self) -> Sha256:
+        """Return a deterministic digest of the secret-free provider endpoint identity.
+
+        Returns:
+            A SHA-256 digest over the provider and normalized base URL. Credential values and
+            credential-environment metadata are deliberately excluded.
+        """
+        identity: JsonObject = {
+            "provider": self.provider,
+            "base_url": None if self.base_url is None else _normalize_base_url(self.base_url),
+        }
+        return sha256_json(identity)
+
 
 class ModelRecord(ContractModel):
-    """A stable local model alias's connection and provider-side model name."""
+    """A stable local alias, exact capability snapshot, and provider-side model name.
+
+    An omitted capability declaration means the catalog cannot prove any optional protocol
+    feature or token limit. Callers may still resolve the alias for an unconstrained completion,
+    but capability preflight fails closed instead of inferring support from a provider name.
+    """
 
     connection: str = Field(min_length=1, max_length=128)
     model: str = Field(min_length=1, max_length=512)
     revision: str | None = Field(default=None, max_length=256)
+    capabilities: ModelCapabilities | None = None
 
     @model_validator(mode="after")
     def _require_secret_free_model_identity(self) -> ModelRecord:
@@ -77,6 +126,11 @@ class ModelRecord(ContractModel):
                     "connection": self.connection,
                     "model": self.model,
                     "revision": self.revision,
+                    "capabilities": (
+                        self.capabilities.model_dump(mode="json")
+                        if self.capabilities is not None
+                        else None
+                    ),
                 }
             )
         except SecretBoundaryError as exc:
@@ -137,6 +191,12 @@ class ModelCatalog(ContractModel):
             if record.connection not in self.connections:
                 raise ValueError(
                     f"model alias {alias!r} names unknown connection {record.connection!r}"
+                )
+            connection = self.connections[record.connection]
+            if connection.provider == "openai-compatible" and record.capabilities is None:
+                raise ValueError(
+                    f"OpenAI-compatible model alias {alias!r} needs an explicit capabilities "
+                    "declaration because its endpoint cannot be discovered safely"
                 )
         assigned_aliases = self.roles.candidates + tuple(
             alias
