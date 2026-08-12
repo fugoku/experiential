@@ -1,17 +1,10 @@
 """`wmo optimize distill`: train the agent MODEL, leaving its harness pinned.
 
-The third member of the optimizer family, beside `wmo optimize harness`
-(prompt surfaces) and `wmo optimize route` (routing policy). Where those
-produce a `prompt` or a `routing_policy` artifact, this one produces an
-`adapter`: `run` drives one distillation of a Tinker LoRA student from real
+This command family produces an `adapter`: `run` drives one distillation of a
+Tinker LoRA student from real
 benchmark rollouts (the config selects the source: harbor's own terminus-2
 agent, or tau2-bench's own harness), and `report` reads a finished run dir
 back.
-
-`probe` comes BEFORE either of those and costs nothing: it reads the routing
-sweep's outcome matrix and answers whether this workload has a teacher gap at
-all (`wmo.optimize.routing.teacher`). Most workloads do not, and the cheapest run is
-the one the evidence says to skip.
 
 `run` owns the run's CLI lifecycle: load and pin the inputs (config, task
 splits, the harness document supplying the rollout params), project the run
@@ -44,42 +37,33 @@ from rich.prompt import Confirm
 from rich.table import Table
 
 from wmo.cli.consent import can_prompt, require_spend_consent
+from wmo.cli.model_report import (
+    _load_gate,
+    _print_paired_delta,
+    _print_trained_artifact,
+    _print_training_summary,
+    _solve_rate_table,
+)
 from wmo.common.config import ARTIFACT_DIR
 
 if TYPE_CHECKING:
     # Type-only: real imports are local to the commands and helpers that construct or inspect
     # these values, so importing this module never pulls the distill/harness/optimize bodies
     # behind it.
-    from wmo.common.core.types import JsonObject
     from wmo.optimize.model.config import DistillConfig
     from wmo.optimize.model.cost import CostEstimate
-    from wmo.optimize.model.gate import DistillGateRecord
-    from wmo.optimize.model.loop import DistillEvalReport, DistillProgress, DistillResult
+    from wmo.optimize.model.loop import DistillProgress, DistillResult
     from wmo.optimize.model.store import AdapterStore, DistillRunStore
-    from wmo.optimize.routing.teacher import TeacherSearchVerdict
     from wmo.runtime.harness.doc import HarnessDoc
     from wmo.runtime.harness.e2b_reap import CapacityCheck
 
-# Literal mirrors of constants that otherwise live behind a heavy import (`wmo.optimize.model.loop`,
-# `wmo.optimize.routing.teacher`). Typer evaluates Option defaults at command-definition time,
-# so these have to be values, not names imported from those modules; the real constants are
-# re-imported inside the command bodies that need their behavior.
+# Literal mirror of the constant that otherwise lives behind the heavy
+# `wmo.optimize.model.loop` import. Typer evaluates Option defaults at command-definition time,
+# so this has to be a value, not a name imported from that module.
 _DEFAULT_DISTILL_HARNESS = "pi"
-_DEFAULT_MIN_GAP = 0.10
 
 DISTILL_RUN_RECORD = "distill-run.json"
 """The CLI-level pin file inside the run dir (see `DistillCliRunRecord`)."""
-
-PROBE_EXIT_NO_GAP = 3
-"""`probe` exit code: the matrix shows no teacher gap, so training is refused."""
-
-PROBE_EXIT_INSUFFICIENT = 4
-"""`probe` exit code: the matrix is too thin to decide either way.
-
-Distinct from `PROBE_EXIT_NO_GAP` because the two call for opposite actions (ship the cheap model
-against sweep more scenarios), and distinct from 1 and 2 so a script can tell a verdict from a
-crash or a usage error.
-"""
 
 _PI_NODE_RUNTIME = "pi-node"
 
@@ -92,7 +76,6 @@ model_app = typer.Typer(
 _console = Console()
 
 
-@model_app.command("run")
 def _load_harbor_task_ids(path: Path) -> tuple[str, ...]:
     """Load the exact ordered task-id list, validated by the canonical score request rules."""
     from wmo.runtime.harness.scoring import ScoreRequest
@@ -110,6 +93,7 @@ def _load_harbor_task_ids(path: Path) -> tuple[str, ...]:
     return request.task_ids
 
 
+@model_app.command("run")
 def run(
     ctx: typer.Context,
     config: str = typer.Option(
@@ -226,137 +210,6 @@ def report(
     _print_trained_artifact(_console, store)
     _print_paired_delta(_console, store, gate)
     _print_training_summary(_console, store)
-
-
-@model_app.command("probe")
-def probe(
-    matrix_file: str = typer.Argument(
-        ...,
-        help="The outcome matrix to read: `<model>/optimize/matrix.json`, or wherever "
-        "`wmo optimize route sweep --out` put one.",
-    ),
-    student: str = typer.Option(
-        None,
-        "--student",
-        help="Pool model the distillation would train. Default: the cheapest measured model, "
-        "which is the one whose price makes distillation worth doing at all.",
-    ),
-    min_gap: float = typer.Option(
-        _DEFAULT_MIN_GAP,
-        "--min-gap",
-        min=0.0,
-        max=1.0,
-        help="Reward points (as a fraction of 1.0) a teacher must beat the student by. The "
-        "default 0.10 is 10 points.",
-    ),
-) -> None:
-    """Ask a measured matrix whether this workload has a teacher worth distilling from.
-
-    Free and read-only: the sweep already bought this evidence, so the gate is arithmetic over
-    the file.
-
-        wmo optimize distill probe .wmo/models/tau-bench/optimize/matrix.json
-
-    It prints every candidate's paired gain over the student, with a 95% interval and the price
-    it would teach at, then one verdict line to act on. Exit codes, so a script can branch
-    without parsing the text: 0 = distill (the gap is real; the named teacher is the cheapest
-    sufficient one), 3 = do not distill (no gap, so training has nothing to teach), 4 =
-    insufficient evidence (this matrix is too thin to say either way; sweep more scenarios).
-    Anything else is the usual usage or IO failure.
-    """
-    from wmo.optimize.routing.outcomes import OutcomeMatrix
-    from wmo.optimize.routing.teacher import select_teacher
-
-    path = Path(matrix_file)
-    if not path.is_file():
-        raise typer.BadParameter(
-            f"no outcome matrix at {path}; a sweep writes one to "
-            f"`<model>/optimize/matrix.json`, so run `wmo optimize model <world-model>` (or "
-            f"`wmo optimize route sweep`) before probing it"
-        )
-    try:
-        matrix = OutcomeMatrix.load(path)
-    except ValidationError as exc:
-        raise typer.BadParameter(f"{path} is not a readable outcome matrix: {exc}") from exc
-    try:
-        verdict = select_teacher(matrix, student=student, min_gap=min_gap)
-    except ValueError as exc:
-        raise typer.BadParameter(str(exc)) from exc
-
-    _console.print(_teacher_gain_table(verdict, path))
-    color = "green" if verdict.should_distill else "yellow"
-    _console.print(f"[{color}]{verdict.decision}[/{color}] {escape(verdict.reason)}")
-    if verdict.unmeasured_models:
-        _console.print(
-            f"[dim]not compared (no scenario scored alongside '{escape(verdict.student)}'): "
-            f"{escape(', '.join(verdict.unmeasured_models))}[/dim]"
-        )
-    if verdict.decision == "do_not_distill":
-        raise typer.Exit(code=PROBE_EXIT_NO_GAP)
-    if verdict.decision == "insufficient_evidence":
-        raise typer.Exit(code=PROBE_EXIT_INSUFFICIENT)
-
-
-def _teacher_gain_table(verdict: TeacherSearchVerdict, matrix_file: Path) -> Table:
-    """Every candidate's paired gain over the student, best first.
-
-    Six columns, not nine: a gain and its interval belong in one cell (they are one measurement),
-    and the student's own reward is the same on every row, so it goes in the title. At an
-    80-column terminal the wider layout truncated every cell to an ellipsis, which is worse than
-    omitting the columns outright.
-
-    The price column carries its unit in its header, because the ladder is measured dollars per
-    completed task when the matrix recorded spend and list dollars per Mtok when it did not, and
-    a bare number would be read as the wrong one.
-    """
-    unit = "$/task" if verdict.price_basis == "measured" else "$/Mtok"
-    measured = verdict.price_basis == "measured"
-    unit_note = (
-        "this matrix's own cost per completed task"
-        if measured
-        else "list price per 1M tokens, input + output, which is the fallback whenever some "
-        "model has no measured cost per completed task (an unpriced entry, or a model that "
-        "completed nothing)"
-    )
-    table = Table(
-        title=f"Teacher search against '{verdict.student}' "
-        f"({verdict.n_scenarios} scored scenarios, {matrix_file})",
-        caption=f"n = scenarios shared with the student; gains are paired over those. "
-        f"{unit} is {unit_note}. Bar: {verdict.min_gap * 100:.1f} points over "
-        f"{verdict.min_scenarios}+ shared scenarios, interval excluding zero. "
-        f"A teacher (*) keeps {verdict.sufficiency * 100:.0f}% of the best gain.",
-        caption_justify="left",
-    )
-    table.add_column("Model", overflow="fold")
-    table.add_column("Tier")
-    table.add_column("n", justify="right")
-    table.add_column("Reward", justify="right")
-    table.add_column("Gain in points (95% CI)", justify="right")
-    table.add_column(unit, justify="right")
-    table.add_column("Gap?")
-    for row in verdict.gains:
-        interval = (
-            f"({row.ci_low * 100:+.1f} to {row.ci_high * 100:+.1f})"
-            if row.ci_low is not None and row.ci_high is not None
-            else "(no interval: one scenario)"
-        )
-        table.add_row(
-            f"{row.model} *" if row.model == verdict.teacher else row.model,
-            row.tier,
-            str(row.n_scenarios),
-            f"{row.mean_reward:.3f}",
-            f"{row.mean_gain * 100:+.1f} {interval}",
-            _probe_price(row.price, measured=measured),
-            "yes" if row.clears_gap else "no",
-        )
-    return table
-
-
-def _probe_price(price: float | None, *, measured: bool) -> str:
-    """A ladder key at the precision its unit deserves: fractions of a cent, or dollars a Mtok."""
-    if price is None:
-        return "unpriced"
-    return f"{price:.4f}" if measured else f"{price:.2f}"
 
 
 def _explicit(ctx: typer.Context, param: str) -> bool:
@@ -1102,215 +955,3 @@ def _maybe_promote(console: Console, result: DistillResult, cfg: DistillConfig, 
         f"[green]wrote[/green] \\[models.agent] -> {path} (set WMO_ENDPOINT_API_KEY to "
         "your Tinker API key before running the agent)"
     )
-
-
-# -- report ------------------------------------------------------------------------------------
-
-# Literal mirrors of `wmo.optimize.model.loop`'s eval keys, kept here so importing this module for
-# `--help` does not pull the distill loop's own heavy dependencies.
-_REPORT_ROWS: tuple[tuple[str, str], ...] = (
-    ("teacher", "baseline-teacher"),
-    ("student before", "baseline-student-before"),
-    ("student after", "student-after"),
-)
-"""The three held-out measurements the gate compares, in table order, paired
-with the `evals/<key>.json` each one was written to."""
-
-
-def _load_gate(store: DistillRunStore) -> DistillGateRecord:
-    """Read the run's `gate.json`, turning a missing or corrupt file into a usage error."""
-    from wmo.optimize.model.gate import DistillGateRecord
-
-    try:
-        text = store.gate_path.read_text(encoding="utf-8")
-    except FileNotFoundError as exc:
-        raise typer.BadParameter(
-            f"no {store.gate_path}: this run has not reached its gate yet (or "
-            f"{store.run_dir} is not a distillation run dir). Finish or resume it with "
-            "`wmo optimize distill run --run-dir <dir> --resume`"
-        ) from exc
-    try:
-        return DistillGateRecord.model_validate_json(text)
-    except ValidationError as exc:
-        raise typer.BadParameter(f"cannot load {store.gate_path}: {exc}") from exc
-
-
-def _load_eval_report(store: DistillRunStore, key: str) -> DistillEvalReport | None:
-    """Read one `evals/<key>.json`, or None when the run never wrote it.
-
-    A missing report is normal (an imported baseline is copied in, but an
-    aborted run may have none), so the table degrades to the rates gate.json
-    already carries rather than failing.
-    """
-    from wmo.optimize.model.loop import DistillEvalReport
-
-    try:
-        text = (store.evals_dir / f"{key}.json").read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return None
-    try:
-        return DistillEvalReport.model_validate_json(text)
-    except ValidationError as exc:
-        raise typer.BadParameter(
-            f"cannot load {store.evals_dir / f'{key}.json'}: {exc}; delete the file to "
-            "report from gate.json alone"
-        ) from exc
-
-
-def _solve_rate_table(store: DistillRunStore, gate: DistillGateRecord) -> Table:
-    """The teacher / student-before / student-after held-out comparison."""
-    rates = (
-        gate.teacher_solve_rate,
-        gate.student_before_solve_rate,
-        gate.student_after_solve_rate,
-    )
-    table = Table(title=f"Held-out solve rates ({store.run_dir})")
-    table.add_column("Measurement", no_wrap=True)
-    # Fold rather than ellipsize. A tinker:// sampler path is wider than the ~22 columns
-    # this cell gets at an 80-column terminal, and rich's default would truncate it to
-    # `tinker://weights/pi...`, silently dropping the identity of the artifact. Folding
-    # keeps every character; the copyable form is printed on its own line below.
-    table.add_column("Model", overflow="fold")
-    table.add_column("Solve", justify="right")
-    table.add_column("Graded", justify="right")
-    table.add_column("Executed", justify="right")
-    table.add_column("Scaffold", justify="right")
-    for (label, key), rate in zip(_REPORT_ROWS, rates, strict=True):
-        eval_report = _load_eval_report(store, key)
-        if eval_report is None:
-            table.add_row(label, "unknown", f"{rate:.3f}", "-", "-", "-")
-            continue
-        graded = (
-            f"{eval_report.graded_solve_rate:.3f}" if eval_report.graded_trials else "unmeasured"
-        )
-        table.add_row(
-            label,
-            eval_report.provider_model,
-            f"{rate:.3f}",
-            graded,
-            f"{eval_report.executed_trials}/{eval_report.trials}",
-            f"{eval_report.scaffold_loss_rate:.0%}",
-        )
-    return table
-
-
-def _print_trained_artifact(console: Console, store: DistillRunStore) -> None:
-    """Print the sampler path the student-after numbers came from, on its own line.
-
-    The table names it too, but a `tinker://` path is wider than the cell it gets at an
-    80-column terminal, so there it folds across lines. This line is the copyable one: it
-    is what you paste into a pool entry or a follow-on run's `init_from_state`.
-
-    Args:
-        console: Where to print.
-        store: The run store to read the student-after eval report from.
-    """
-    after = _load_eval_report(store, "student-after")
-    if after is None or not after.provider_model:
-        return
-    console.print(f"trained artifact: {escape(after.provider_model)}")
-
-
-def _print_paired_delta(console: Console, store: DistillRunStore, gate: DistillGateRecord) -> None:
-    """Print what training moved, on the same holdout split the gate read."""
-    binary = gate.student_after_solve_rate - gate.student_before_solve_rate
-    console.print(f"paired delta (after - before): {binary:+.3f} solve rate")
-    before = _load_eval_report(store, "baseline-student-before")
-    after = _load_eval_report(store, "student-after")
-    if before is not None and after is not None and before.graded_trials and after.graded_trials:
-        graded = after.graded_solve_rate - before.graded_solve_rate
-        console.print(f"  graded (same trials at test resolution): {graded:+.3f}")
-    fraction = (
-        gate.student_after_solve_rate / gate.teacher_solve_rate
-        if gate.teacher_solve_rate > 0
-        else None
-    )
-    reached = "unmeasurable (teacher solved nothing)" if fraction is None else f"{fraction:.3f}"
-    verdict = "passed" if gate.accepted else "FAILED"
-    console.print(
-        f"  after / teacher: {reached} against gate minimum "
-        f"{gate.min_teacher_fraction:.2f}; gate {verdict}"
-    )
-
-
-def _read_metrics(console: Console, store: DistillRunStore) -> list[JsonObject]:
-    """Every metrics row, surviving the half-written last line an aborted run leaves.
-
-    `report` advertises itself as safe on a live or aborted run dir, so a torn final row (all a
-    run killed mid-append can leave behind) must not end the command: drop it, say so, and
-    report what is complete. Every other shape of damage -- a broken row above the last one, or
-    a last line that parses into something other than a JSON object, which no truncated append
-    can produce -- means the file lost or gained content, so it stays an error; it is just a
-    usage error now, the way `_load_gate` and `_load_eval_report` already treat the same class
-    of damage, rather than a traceback.
-
-    Args:
-        console: Where to print the note about a dropped final line.
-        store: The run store to read `metrics.jsonl` from.
-
-    Returns:
-        Every complete row, in append order.
-
-    Raises:
-        typer.BadParameter: If the damage is anything but a half-written last line.
-    """
-    try:
-        return store.read_metrics()
-    except ValueError:
-        pass  # the tolerant read below decides whether the damage is only the torn tail
-    try:
-        rows = store.read_metrics(tolerate_partial_tail=True)
-    except ValueError as fatal:
-        raise typer.BadParameter(str(fatal)) from fatal
-    console.print(
-        f"[yellow]note[/yellow] ignoring a half-written last line in "
-        f"{escape(str(store.metrics_path))} (a run killed mid-append leaves one); "
-        f"reporting the {len(rows)} complete row(s)"
-    )
-    return rows
-
-
-def _print_training_summary(console: Console, store: DistillRunStore) -> None:
-    """Print the last training row's health metrics, or say the run trained nothing.
-
-    Turns per episode is deliberately absent: nothing in the run dir records
-    it. `mean_generation_tokens` is the per-episode series the loop does
-    measure (sampled tokens, pooled over the batch's span-bearing episodes).
-    """
-    rows = [row for row in _read_metrics(console, store) if row.get("phase") is None]
-    if not rows:
-        console.print("no training step recorded in metrics.jsonl")
-        return
-    last = rows[-1]
-    step = _row_int(last, "step")
-    parts = [f"{len(rows)} training step(s) recorded"]
-    for label, key, spec in (
-        ("reverse KL/token", "reverse_kl_per_token", ".4f"),
-        ("entropy ratio", "entropy_ratio", ".2f"),
-        ("tokens/episode", "mean_generation_tokens", ".0f"),
-        ("tokens/episode ratio", "generation_tokens_ratio", ".2f"),
-    ):
-        value = _row_float(last, key)
-        if value is not None:
-            parts.append(f"{label} {value:{spec}}")
-    spent = _row_float(last, "cumulative_usd")
-    if spent is not None:
-        parts.append(f"${spent:.2f} spent")
-    head = "training" if step is None else f"training (last row step {step})"
-    console.print(f"{head}: {', '.join(parts)}")
-
-
-def _row_float(row: JsonObject, key: str) -> float | None:
-    """One metrics-row number, or None when absent or not numeric."""
-    value = row.get(key)
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        return None
-    return float(value)
-
-
-def _row_int(row: JsonObject, key: str) -> int | None:
-    """One metrics-row integer, or None when absent or not an integer."""
-    value = row.get(key)
-    if isinstance(value, bool) or not isinstance(value, int):
-        return None
-    return value
