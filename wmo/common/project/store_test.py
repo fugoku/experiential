@@ -154,8 +154,8 @@ def test_read_bytes_rejects_a_symlink_swapped_after_full_verification(
         store.artifacts.read_bytes("task-set-v1", "tasks.json")
 
 
-def test_secret_boundary_and_only_mutable_review_file(tmp_path: Path) -> None:
-    """Artifacts reject credentials while review JSON may be atomically replaced as a draft."""
+def test_secret_boundary_review_draft_and_write_once_model_config_binding(tmp_path: Path) -> None:
+    """Artifacts reject credentials; review is mutable and the SFT config pointer is write-once."""
     store = _store(tmp_path)
     with pytest.raises(ArtifactStoreError, match="api_key_env"):
         store.artifacts.write_json(
@@ -193,4 +193,32 @@ def test_secret_boundary_and_only_mutable_review_file(tmp_path: Path) -> None:
     with pytest.raises(ProjectStoreError, match="different immutable"):
         store.initialize(
             ProjectConfig(project_id="support-project", redacted_field_names=("email",))
+        )
+    manifest = store.artifacts.write_json(
+        artifact_id="sft-model-optimization-config-a",
+        artifact_type="sft-model-optimization-config",
+        envelope=_envelope(),
+        files={"config.json": {"config_id": "sft-model-optimization-config-a"}},
+    )
+    config_input = artifact_input(manifest)
+    assert store.bind_model_optimization_config(
+        config_input, artifact_type="sft-model-optimization-config"
+    ) == (
+        ProjectConfig(
+            project_id="support-project",
+            model_optimization_config=config_input,
+        )
+    )
+    assert store.bind_model_optimization_config(
+        config_input, artifact_type="sft-model-optimization-config"
+    ).project_id == ("support-project")
+    different_manifest = store.artifacts.write_json(
+        artifact_id="sft-model-optimization-config-b",
+        artifact_type="sft-model-optimization-config",
+        envelope=_envelope(),
+        files={"config.json": {"config_id": "sft-model-optimization-config-b"}},
+    )
+    with pytest.raises(ProjectStoreError, match="different immutable model optimization config"):
+        store.bind_model_optimization_config(
+            artifact_input(different_manifest), artifact_type="sft-model-optimization-config"
         )
