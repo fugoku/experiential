@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 import pytest
 from pydantic import ValidationError
 
+from wmo.common.core.artifacts import ArtifactInput
 from wmo.common.judging import (
     DimensionScoreMap,
     JudgeCalibration,
@@ -41,6 +42,7 @@ def test_rubric_and_calibration_round_trip() -> None:
     rubric = Rubric(
         schema_version=1,
         created_at=approved_at,
+        inputs=(ArtifactInput(artifact_id="task-set-v1", sha256=_DIGEST),),
         code_revision="e7aad17",
         rubric_id="support-rubric-v1",
         dimensions=(_dimension(),),
@@ -61,17 +63,21 @@ def test_rubric_and_calibration_round_trip() -> None:
             connection_sha256=_DIGEST,
         ),
         judge_prompt_id="judge-prompt-v1",
+        judge_prompt_sha256=_DIGEST,
         label_set_id="label-set-v1",
         calibration_lineage_ids=("lineage-fit-1",),
         excluded_router_held_out_lineage_ids=("lineage-held-out-1",),
         validation_method="grouped_k_fold",
         out_of_fold_report_id="judge-report-v1",
+        out_of_fold_report_sha256=_DIGEST,
         score_maps=(
             DimensionScoreMap(
                 dimension_id="task-success",
                 calibrated_scores=(0.0, 1.0, 2.0, 3.0, 4.0, 5.0),
             ),
         ),
+        label_count=10,
+        status="human_calibrated",
         approved_at=approved_at,
     )
 
@@ -92,6 +98,7 @@ def test_rubric_requires_ordered_complete_anchors_and_approval_time() -> None:
         Rubric(
             schema_version=1,
             created_at=datetime(2026, 8, 11, tzinfo=UTC),
+            inputs=(ArtifactInput(artifact_id="task-set-v1", sha256=_DIGEST),),
             code_revision="e7aad17",
             rubric_id="support-rubric-v1",
             dimensions=(_dimension(),),
@@ -112,11 +119,13 @@ def test_rubric_requires_ordered_complete_anchors_and_approval_time() -> None:
                 connection_sha256=_DIGEST,
             ),
             judge_prompt_id="judge-prompt-v1",
+            judge_prompt_sha256=_DIGEST,
             label_set_id="label-set-v1",
             calibration_lineage_ids=("lineage-1",),
             excluded_router_held_out_lineage_ids=("lineage-1",),
             validation_method="grouped_k_fold",
             out_of_fold_report_id="judge-report-v1",
+            out_of_fold_report_sha256=_DIGEST,
             score_maps=(
                 DimensionScoreMap(
                     dimension_id="task-success",
