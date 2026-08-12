@@ -66,6 +66,7 @@ class TextCellLease(ContractModel):
     expires_at: datetime
     status: TextCellLeaseStatus = TextCellLeaseStatus.ACTIVE
     unknown_spend_blocks_budget: bool = False
+    dispatch_intent_recorded: bool = False
 
     @field_validator("claimed_at", "expires_at")
     @classmethod
@@ -232,7 +233,7 @@ class TextCellLeaseStore:
         """Remove this owner's claim after its immutable rollout is safely persisted.
 
         Args:
-            lease: Exact claim obtained from ``acquire``.
+            lease: Exact active claim obtained from ``acquire`` or its durable intent successor.
 
         Raises:
             TextCellLeaseError: The durable claim changed before its owner could release it.
@@ -244,7 +245,8 @@ class TextCellLeaseStore:
                 existing = self._read_optional(path)
                 if existing is None:
                     return
-                if existing != lease:
+                intended = lease.model_copy(update={"dispatch_intent_recorded": True})
+                if existing != lease and existing != intended:
                     raise TextCellLeaseError(
                         f"text-cell lease {lease.lease_id!r} changed before its owner released it"
                     )
@@ -254,6 +256,38 @@ class TextCellLeaseStore:
                 "could not release text-cell lease %s after immutable rollout persistence: %s",
                 lease.lease_id,
                 exc,
+            )
+
+    def record_dispatch_intent(self, lease: TextCellLease) -> TextCellLease:
+        """Durably record intent before a candidate or environment dispatch can begin.
+
+        Args:
+            lease: Exact active claim that owns the imminent external dispatch.
+
+        Returns:
+            The exact lease record with durable dispatch intent set.
+
+        Raises:
+            TextCellLeaseError: The claim is absent, changed, or not active before intent records.
+        """
+        if lease.status != TextCellLeaseStatus.ACTIVE:
+            raise TextCellLeaseError("only active text-cell leases can record dispatch intent")
+        self._ensure_directory()
+        path = self._path(lease.lease_id)
+        intended = lease.model_copy(update={"dispatch_intent_recorded": True})
+        with file_write_lock(self._admission_path(), what="text simulation cell admission"):
+            existing = self._read_optional(path)
+            if existing is None:
+                raise TextCellLeaseError(
+                    f"text-cell lease {lease.lease_id!r} disappeared before dispatch intent"
+                )
+            if existing == intended:
+                return existing
+            if existing == lease:
+                self._replace_exact(path, expected=existing, replacement=intended)
+                return intended
+            raise TextCellLeaseError(
+                f"text-cell lease {lease.lease_id!r} changed before dispatch intent"
             )
 
     def _admit_once(
