@@ -68,11 +68,9 @@ def test_sandbox_persists_each_rollout_and_resumes_without_reexecution(tmp_path:
         agent_factory=_ToolAgent,
     )
     spec = _spec(plan_input, task_input, ("cell-a",))
-
     first = simulator.run(spec)
     rollout = _load_rollout(store, first.artifact_ids[0])
     resumed = simulator.run(spec)
-
     assert resumed == first
     assert runtime.opened_task_ids == ["task-a"]
     assert runtime.close_calls == 1
@@ -80,9 +78,8 @@ def test_sandbox_persists_each_rollout_and_resumes_without_reexecution(tmp_path:
     assert rollout.sandbox_binding is not None
     assert rollout.sandbox_binding.environment_sha256 == _ENVIRONMENT_DIGEST
     assert rollout.sandbox_binding.task_lineage_group_id == "lineage-task-a"
-    assert {span.kind for span in rollout.spans}.issuperset(
-        {RolloutEventKind.TOOL_CALL, RolloutEventKind.OBSERVATION}
-    )
+    kinds = {span.kind for span in rollout.spans}
+    assert kinds.issuperset({RolloutEventKind.TOOL_CALL, RolloutEventKind.OBSERVATION})
     assert rollout.candidate_economics.cost_usd is None
     assert rollout.sandbox_economics is not None
     assert rollout.sandbox_economics.cost_usd is None
@@ -581,14 +578,17 @@ def _persist_fixture(
         _cell(index, task_id, execution=execution) for index, task_id in enumerate(task_ids)
     )
     plan = EvaluationPlan(
-        schema_version=1,
+        schema_version=2,
         created_at=_TIME,
         code_revision="test-revision",
         plan_id="plan-1",
         task_set_id=task_set.task_set_id,
         candidate_snapshots=(RoutedCandidateSnapshot(alias="candidate-a", model=_snapshot()),),
-        fidelity_gate_id="fidelity-gate-1",
-        fidelity_gate_sha256="f" * 64,
+        pricing_snapshot_id="pricing-1",
+        pricing_snapshot_sha256="d" * 64,
+        fidelity_thresholds_id="fidelity-thresholds-1",
+        fidelity_thresholds_sha256="f" * 64,
+        fidelity_protocol_sha256="e" * 64,
         cells=selected_cells,
     )
     plan_manifest = store.write_json(

@@ -405,15 +405,18 @@ def _persist_plan(
         for task, suffix in zip(tasks, ("a", "b"), strict=True)
     )
     plan = EvaluationPlan(
-        schema_version=1,
+        schema_version=2,
         created_at=_BEFORE_LOCK,
         inputs=(task_input,),
         code_revision="fixture-revision",
         plan_id=f"{label}-plan-1",
         task_set_id="task-set-1",
         candidate_snapshots=(RoutedCandidateSnapshot(alias="candidate-a", model=_candidate()),),
-        fidelity_gate_id="fidelity-gate-1",
-        fidelity_gate_sha256="f" * 64,
+        pricing_snapshot_id="pricing-1",
+        pricing_snapshot_sha256="d" * 64,
+        fidelity_thresholds_id="fidelity-thresholds-1",
+        fidelity_thresholds_sha256="f" * 64,
+        fidelity_protocol_sha256="e" * 64,
         cells=cells,
     )
     manifest = store.write_json(

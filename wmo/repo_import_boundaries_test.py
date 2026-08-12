@@ -16,12 +16,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BASELINE_REVISION = "e7aad17b2f5041769ad8107ab25e77d4e88729ca"
 PR_BASE_REVISION = "origin/main"
-SPLIT_PUBLIC_MODULES: Final[frozenset[str]] = frozenset(
-    {
-        "wmo.cli.optimize_model_app",
-        "wmo.optimize.routing.scorecard",
-    }
-)
+SPLIT_PUBLIC_MODULES: Final[frozenset[str]] = frozenset()
 
 FORBIDDEN_IMPORTS: Final[dict[str, frozenset[str]]] = {
     "common": frozenset({"runtime", "simulation", "optimize", "cli"}),

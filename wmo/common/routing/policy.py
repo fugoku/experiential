@@ -15,9 +15,9 @@ class KnnGuard(ContractModel):
     """Conservative evidence thresholds used by the offline guarded kNN policy."""
 
     maximum_neighbors: int = Field(gt=0)
-    minimum_paired_observations: int = Field(gt=0)
+    minimum_paired_observations: int = Field(ge=8)
     relative_similarity_threshold: float = Field(ge=0, le=1)
-    uncertainty_multiplier: float = Field(ge=0)
+    uncertainty_multiplier: float = Field(gt=0)
     quality_tolerance: float
 
     @field_validator("relative_similarity_threshold", "uncertainty_multiplier", "quality_tolerance")
@@ -46,7 +46,7 @@ class RoutingDecision(ContractModel):
     baseline_alias: ModelAlias
     neighbor_count: int = Field(ge=0)
     paired_count: int = Field(ge=0)
-    best_similarity: float | None = Field(default=None, ge=0, le=1)
+    best_similarity: float | None = Field(default=None, ge=-1, le=1)
     estimated_quality_difference: float | None = None
     uncertainty: float | None = Field(default=None, ge=0)
     fallback_reason: str | None = Field(default=None, max_length=512)
@@ -74,14 +74,22 @@ class KnnRouterPolicy(ArtifactEnvelope):
     policy_id: ArtifactId
     baseline_alias: ModelAlias
     candidates: tuple[RoutedCandidateSnapshot, ...]
+    embedder_alias: ModelAlias
     embedder: ModelSnapshot
     feature_extractor_id: ArtifactId
     feature_schema_sha256: Sha256
     pricing_snapshot_id: ArtifactId
+    pricing_snapshot_sha256: Sha256
     bank_artifact_id: ArtifactId
     bank_sha256: Sha256
     guard: KnnGuard
     fit_evaluation_id: ArtifactId
+    evaluation_plan_id: ArtifactId
+    evaluation_plan_sha256: Sha256
+    task_set_id: ArtifactId
+    task_set_sha256: Sha256
+    evaluation_protocols_sha256: Sha256
+    fidelity_report_ids: tuple[ArtifactId, ...] = ()
     judgment_status: Literal["provisional", "human_calibrated"]
 
     @model_validator(mode="after")

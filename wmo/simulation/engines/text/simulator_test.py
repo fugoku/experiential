@@ -154,14 +154,17 @@ def _task(task_id: str, *, tools: tuple[ToolSchema, ...] = ()) -> TaskCase:
 def _plan(cells: tuple[EvaluationCell, ...]) -> EvaluationPlan:
     candidate = RoutedCandidateSnapshot(alias="candidate-a", model=_snapshot("candidate-a"))
     return EvaluationPlan(
-        schema_version=1,
+        schema_version=2,
         created_at=_TIME,
         code_revision="test-revision",
         plan_id="evaluation-plan",
         task_set_id="task-set",
         candidate_snapshots=(candidate,),
-        fidelity_gate_id="fidelity-gate",
-        fidelity_gate_sha256="c" * 64,
+        pricing_snapshot_id="pricing-1",
+        pricing_snapshot_sha256="d" * 64,
+        fidelity_thresholds_id="fidelity-thresholds",
+        fidelity_thresholds_sha256="c" * 64,
+        fidelity_protocol_sha256="e" * 64,
         cells=cells,
     )
 

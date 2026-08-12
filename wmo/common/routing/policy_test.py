@@ -33,6 +33,7 @@ def _policy() -> KnnRouterPolicy:
         policy_id="router-policy-v1",
         baseline_alias="candidate-incumbent",
         candidates=(_candidate("candidate-economy"), _candidate("candidate-incumbent")),
+        embedder_alias="embedder",
         embedder=ModelSnapshot(
             provider="openai",
             model_id="text-embedding-3-small",
@@ -42,6 +43,7 @@ def _policy() -> KnnRouterPolicy:
         feature_extractor_id="request-visible-v1",
         feature_schema_sha256=_DIGEST,
         pricing_snapshot_id="pricing-v1",
+        pricing_snapshot_sha256=_DIGEST,
         bank_artifact_id="bank-v1",
         bank_sha256=_DIGEST,
         guard=KnnGuard(
@@ -52,6 +54,11 @@ def _policy() -> KnnRouterPolicy:
             quality_tolerance=0,
         ),
         fit_evaluation_id="evaluation-v1",
+        evaluation_plan_id="plan-v1",
+        evaluation_plan_sha256=_DIGEST,
+        task_set_id="task-set-v1",
+        task_set_sha256=_DIGEST,
+        evaluation_protocols_sha256=_DIGEST,
         judgment_status="provisional",
     )
 
@@ -113,3 +120,28 @@ def test_policy_rejects_unpinned_baseline_and_nonfinite_guard_values() -> None:
             neighbor_count=2,
             paired_count=3,
         )
+
+
+def test_stored_policy_rejects_a_pre_design_threshold_guard() -> None:
+    """Loading an older policy cannot bypass the enforced eight-pair design threshold."""
+    payload = _policy().model_dump(mode="json")
+    payload["guard"]["minimum_paired_observations"] = 2
+
+    with pytest.raises(ValidationError, match="minimum_paired_observations"):
+        KnnRouterPolicy.model_validate(payload)
+
+
+@pytest.mark.parametrize("multiplier", [0, -0.5, float("inf"), float("nan")])
+def test_guard_and_stored_policy_reject_nonpositive_or_nonfinite_uncertainty(
+    multiplier: float,
+) -> None:
+    """New guards and persisted policy payloads cannot erase the uncertainty floor."""
+    guard_payload = _policy().guard.model_dump(mode="json")
+    guard_payload["uncertainty_multiplier"] = multiplier
+    with pytest.raises(ValidationError, match="uncertainty_multiplier|finite"):
+        KnnGuard.model_validate(guard_payload)
+
+    policy_payload = _policy().model_dump(mode="json")
+    policy_payload["guard"]["uncertainty_multiplier"] = multiplier
+    with pytest.raises(ValidationError, match="uncertainty_multiplier|finite"):
+        KnnRouterPolicy.model_validate(policy_payload)
