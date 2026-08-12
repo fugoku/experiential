@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime
 from typing import Literal
 
@@ -180,18 +181,18 @@ class HumanScoreReview:
         Raises:
             ValueError: The saved review data is not a valid JSON object or score history.
         """
-        root_review = _read_root_review(store)
-        saved = root_review.get("human_score_history")
-        if saved is None:
-            history = HumanScoreHistory()
-        else:
-            try:
-                history = HumanScoreHistory.model_validate(saved)
-            except ValueError as exc:
-                raise ValueError("review.json contains an invalid human score history") from exc
-        review = cls(store, root_review, history)
-        review._save()
-        return review
+        selected: list[tuple[JsonObject, HumanScoreHistory]] = []
+
+        def initialize(current: JsonValue | None) -> JsonObject:
+            root = _root_review_from_value(current)
+            history = _history_from_root(root)
+            root["human_score_history"] = history.model_dump(mode="json")
+            selected.append((root, history))
+            return root
+
+        store.update_review(initialize)
+        root, history = selected[0]
+        return cls(store, root, history)
 
     @property
     def history(self) -> HumanScoreHistory:
@@ -204,8 +205,7 @@ class HumanScoreReview:
         Args:
             score: New score with no correction predecessor.
         """
-        self._history = self._history.append(score)
-        self._save()
+        self._mutate(lambda history: history.append(score))
 
     def correct(self, score: HumanScore) -> None:
         """Persist one correction while retaining its superseded historical label.
@@ -213,10 +213,148 @@ class HumanScoreReview:
         Args:
             score: New score that names the earlier label it supersedes.
         """
-        self._history = self._history.correct(score)
-        self._save()
+        self._mutate(lambda history: history.correct(score))
+
+    def upsert(
+        self,
+        *,
+        rubric_id: ArtifactId,
+        rollout_id: ArtifactId,
+        lineage_id: ArtifactId,
+        dimension_id: ArtifactId,
+        score: Literal[0, 1, 2, 3, 4, 5],
+        submission_id: str,
+        created_at: datetime,
+    ) -> HumanScore:
+        """Append or correct one score with a stable client delivery identity under the lock.
+
+        Args:
+            rubric_id: Immutable finalized rubric that owns the score.
+            rollout_id: Persisted rollout receiving the score.
+            lineage_id: Frozen task lineage retained for calibration.
+            dimension_id: Rubric dimension receiving the zero-to-five score.
+            score: Human score on the finalized dimension scale.
+            submission_id: Stable identifier for this one UI submission and all of its retries.
+            created_at: Time at which the local human decision is recorded.
+
+        Returns:
+            The stored original score, immutable correction, or existing identical score.
+
+        Raises:
+            ValueError: The supplied submission identity is empty, or score timestamp has no
+                timezone.
+        """
+        if created_at.tzinfo is None or created_at.utcoffset() is None:
+            raise ValueError("human score timestamps must include a timezone")
+        if not submission_id.strip():
+            raise ValueError("human score submission IDs must be nonempty")
+        result: list[HumanScore] = []
+
+        def update(current: JsonValue | None) -> JsonObject:
+            root = _root_review_from_value(current)
+            history = _history_from_root(root)
+            submissions = _score_submissions_from_root(root)
+            target = (rubric_id, rollout_id, lineage_id, dimension_id)
+            saved_label_id = submissions.get(submission_id)
+            if saved_label_id is not None:
+                saved = next(
+                    (item for item in history.scores if item.label_id == saved_label_id),
+                    None,
+                )
+                if saved is None:
+                    raise ValueError("human score submission refers to a missing label")
+                if _target_key(saved) != target or saved.score != score:
+                    raise ValueError(
+                        "human score submission IDs cannot be reused for a different decision"
+                    )
+                result.append(saved)
+                selected.append((root, history))
+                return root
+            existing = next(
+                (
+                    item
+                    for item in history.active_scores()
+                    if (
+                        item.rubric_id,
+                        item.rollout_id,
+                        item.lineage_id,
+                        item.dimension_id,
+                    )
+                    == (rubric_id, rollout_id, lineage_id, dimension_id)
+                ),
+                None,
+            )
+            if existing is not None and existing.score == score:
+                label = existing
+                next_history = history
+            else:
+                label = HumanScore(
+                    label_id=stable_id(
+                        "human-score",
+                        {
+                            "rubric_id": rubric_id,
+                            "rollout_id": rollout_id,
+                            "lineage_id": lineage_id,
+                            "dimension_id": dimension_id,
+                            "score": score,
+                            "sequence": len(history.scores),
+                        },
+                    ),
+                    rubric_id=rubric_id,
+                    rollout_id=rollout_id,
+                    lineage_id=lineage_id,
+                    dimension_id=dimension_id,
+                    score=score,
+                    created_at=created_at,
+                    supersedes_label_id=None if existing is None else existing.label_id,
+                )
+                next_history = history.append(label) if existing is None else history.correct(label)
+            submissions[submission_id] = label.label_id
+            result.append(label)
+            root["human_score_history"] = next_history.model_dump(mode="json")
+            root["human_score_submissions"] = submissions
+            selected.append((root, next_history))
+            return root
+
+        selected: list[tuple[JsonObject, HumanScoreHistory]] = []
+        self._store.update_review(update)
+        self._root_review, self._history = selected[0]
+        return result[0]
 
     def finalize(
+        self,
+        *,
+        rubric_id: ArtifactId,
+        code_revision: str,
+        created_at: datetime,
+    ) -> HumanLabelSet:
+        """Freeze the latest locked score history as an immutable calibration input.
+
+        Args:
+            rubric_id: Immutable finalized rubric whose labels are being frozen.
+            code_revision: Exact code revision producing the label-set artifact.
+            created_at: Time at which the frozen label set is materialized.
+
+        Returns:
+            The immutable label set containing the complete correction history.
+        """
+        result: list[HumanLabelSet] = []
+
+        def transition(history: HumanScoreHistory) -> HumanScoreHistory:
+            self._history = history
+            result.append(
+                self._finalize(
+                    rubric_id=rubric_id,
+                    code_revision=code_revision,
+                    created_at=created_at,
+                )
+            )
+            return history
+
+        self._mutate(transition)
+        return result[0]
+
+    def _finalize(
         self,
         *,
         rubric_id: ArtifactId,
@@ -293,15 +431,26 @@ class HumanScoreReview:
             label_set = stored
         return label_set
 
-    def _save(self) -> None:
-        """Persist this namespace while preserving rubric and future review state."""
-        self._root_review["human_score_history"] = self._history.model_dump(mode="json")
-        self._store.write_review(self._root_review)
+    def _mutate(
+        self,
+        transition: Callable[[HumanScoreHistory], HumanScoreHistory],
+    ) -> None:
+        """Reload and apply one score-history transition while the review lock is held."""
+        selected: list[tuple[JsonObject, HumanScoreHistory]] = []
+
+        def update(current: JsonValue | None) -> JsonObject:
+            root = _root_review_from_value(current)
+            history = transition(_history_from_root(root))
+            root["human_score_history"] = history.model_dump(mode="json")
+            selected.append((root, history))
+            return root
+
+        self._store.update_review(update)
+        self._root_review, self._history = selected[0]
 
 
-def _read_root_review(store: ProjectStore) -> JsonObject:
-    """Read the mutable review root as a JSON object for namespace-preserving writes."""
-    review: JsonValue | None = store.read_review()
+def _root_review_from_value(review: JsonValue | None) -> JsonObject:
+    """Validate one locked review value as an object for namespace-preserving updates."""
     if review is None:
         return {}
     if not isinstance(review, dict):
@@ -312,6 +461,33 @@ def _read_root_review(store: ProjectStore) -> JsonObject:
             raise ValueError("review.json must use string field names")
         root[key] = value
     return root
+
+
+def _history_from_root(root: JsonObject) -> HumanScoreHistory:
+    """Validate the score namespace from the latest locked review root."""
+    saved = root.get("human_score_history")
+    if saved is None:
+        return HumanScoreHistory()
+    try:
+        return HumanScoreHistory.model_validate(saved)
+    except ValueError as exc:
+        raise ValueError("review.json contains an invalid human score history") from exc
+
+
+def _score_submissions_from_root(root: JsonObject) -> dict[str, str]:
+    """Validate the local retry map from a locked review root."""
+    saved = root.get("human_score_submissions")
+    if saved is None:
+        return {}
+    if not isinstance(saved, dict) or any(
+        not isinstance(submission_id, str)
+        or not submission_id
+        or not isinstance(label_id, str)
+        or not label_id
+        for submission_id, label_id in saved.items()
+    ):
+        raise ValueError("review.json contains an invalid human score submission map")
+    return dict(saved)
 
 
 def _same_label_set_identity(left: HumanLabelSet, right: HumanLabelSet) -> bool:

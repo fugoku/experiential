@@ -134,6 +134,75 @@ def test_human_score_review_persists_history_without_overwriting_other_review_st
     assert saved["other_review"] == {"status": "draft"}
 
 
+def test_human_score_review_upsert_is_idempotent_for_duplicate_delivery(tmp_path: Path) -> None:
+    """A retried score submission returns its original label without recording a correction."""
+    store = _store(tmp_path)
+    first = HumanScoreReview.open(store).upsert(
+        rubric_id="rubric-1",
+        rollout_id="rollout-1",
+        lineage_id="lineage-fit-1",
+        dimension_id="task-success",
+        score=3,
+        submission_id="submission-1",
+        created_at=_TIME,
+    )
+    duplicate = HumanScoreReview.open(store).upsert(
+        rubric_id="rubric-1",
+        rollout_id="rollout-1",
+        lineage_id="lineage-fit-1",
+        dimension_id="task-success",
+        score=3,
+        submission_id="submission-1",
+        created_at=_TIME + timedelta(seconds=1),
+    )
+
+    resumed = HumanScoreReview.open(store)
+
+    assert duplicate == first
+    assert resumed.history.scores == (first,)
+    assert resumed.history.active_scores() == (first,)
+
+
+def test_human_score_review_keeps_a_delayed_retry_from_reverting_a_correction(
+    tmp_path: Path,
+) -> None:
+    """A repeated delivery returns its original label after a newer correction is active."""
+    store = _store(tmp_path)
+    first = HumanScoreReview.open(store).upsert(
+        rubric_id="rubric-1",
+        rollout_id="rollout-1",
+        lineage_id="lineage-fit-1",
+        dimension_id="task-success",
+        score=2,
+        submission_id="submission-1",
+        created_at=_TIME,
+    )
+    corrected = HumanScoreReview.open(store).upsert(
+        rubric_id="rubric-1",
+        rollout_id="rollout-1",
+        lineage_id="lineage-fit-1",
+        dimension_id="task-success",
+        score=4,
+        submission_id="submission-2",
+        created_at=_TIME + timedelta(seconds=1),
+    )
+    delayed = HumanScoreReview.open(store).upsert(
+        rubric_id="rubric-1",
+        rollout_id="rollout-1",
+        lineage_id="lineage-fit-1",
+        dimension_id="task-success",
+        score=2,
+        submission_id="submission-1",
+        created_at=_TIME + timedelta(seconds=2),
+    )
+
+    resumed = HumanScoreReview.open(store)
+
+    assert delayed == first
+    assert resumed.history.scores == (first, corrected)
+    assert resumed.history.active_scores() == (corrected,)
+
+
 def test_human_score_review_finalizes_an_idempotent_immutable_label_set(tmp_path: Path) -> None:
     """Finalized labels retain corrections and can safely resume without a second artifact."""
     store = _store(tmp_path)
