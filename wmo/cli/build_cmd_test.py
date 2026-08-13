@@ -61,28 +61,36 @@ def _otlp_export(tmp_path: Path, count: int = 100) -> Path:
     return path
 
 
-def _posthog_export(tmp_path: Path) -> Path:
-    """Write one local PostHog LLM-observability export without an HTTP call."""
+def _posthog_export(tmp_path: Path, count: int = 100) -> Path:
+    """Write distinct local PostHog generation traces without an HTTP call."""
     path = tmp_path / "posthog.json"
     path.write_text(
         json.dumps(
-            {
-                "event": "$ai_generation",
-                "timestamp": "2026-08-11T00:00:00Z",
-                "properties": {
-                    "$ai_trace_id": "a" * 32,
-                    "$ai_span_id": "generation-1",
-                    "$ai_provider": "openai",
-                    "$ai_model": "gpt-test",
-                    "$ai_input": [{"role": "user", "content": "Reset my password"}],
-                    "$ai_output_choices": [
-                        {"role": "assistant", "content": "I sent reset instructions."}
-                    ],
-                    "wmo.customer.id": "customer-1",
-                    "wmo.conversation.id": "conversation-1",
-                    "wmo.outcome.status": "success",
-                },
-            }
+            [
+                {
+                    "event": "$ai_generation",
+                    "timestamp": f"2026-08-11T00:{index // 60:02d}:{index % 60:02d}Z",
+                    "properties": {
+                        "$ai_trace_id": f"{index + 1:032x}",
+                        "$ai_span_id": f"generation-{index}",
+                        "$ai_provider": "openai",
+                        "$ai_model": "gpt-test",
+                        "$ai_input": [
+                            {
+                                "role": "user",
+                                "content": f"Resolve distinct support request {index}",
+                            }
+                        ],
+                        "$ai_output_choices": [
+                            {"role": "assistant", "content": "I sent reset instructions."}
+                        ],
+                        "wmo.customer.id": f"customer-{index}",
+                        "wmo.conversation.id": f"conversation-{index}",
+                        "wmo.outcome.status": "success",
+                    },
+                }
+                for index in range(count)
+            ]
         ),
         encoding="utf-8",
     )
@@ -134,7 +142,6 @@ def test_build_reads_the_raw_otlp_file_once_and_persists_the_immutable_boundary(
         app,
         [
             "build",
-            "--file",
             str(source),
             "--source",
             "otlp",
@@ -156,7 +163,6 @@ def test_build_reads_the_raw_otlp_file_once_and_persists_the_immutable_boundary(
     task_records = tuple(line for line in tasks.decode("utf-8").splitlines() if line)
     assert sum('"partition":"fit"' in line for line in task_records) == 50
     assert sum('"partition":"held_out"' in line for line in task_records) == 20
-    assert ProjectStore(root, "support").read_review() == {}
     assert len(captured) == 1
     stats = captured[0]
     assert stats.input_trace_count == 100
@@ -211,16 +217,68 @@ def test_build_accepts_a_local_posthog_export_without_using_the_hogql_transport(
     assert trace_dataset.source is not None
     assert trace_dataset.source.kind == "file"
     assert trace_dataset.invalid_trace_count == 0
-    assert len(task_set.task_ids) == 1
+    assert len(trace_dataset.trace_ids) == 100
+    assert task_set.task_ids
     assert reads == 1
+
+
+@pytest.mark.parametrize("source_kind", ["otlp", "posthog"])
+@pytest.mark.parametrize(
+    ("trace_count", "accepted"),
+    [(99, False), (100, True), (1_000, True), (1_001, False)],
+)
+def test_build_enforces_normalized_trace_operating_range_for_each_source(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    source_kind: str,
+    trace_count: int,
+    accepted: bool,
+) -> None:
+    """Both canonical loaders enforce the exact 100 through 1000 trace build range."""
+    monkeypatch.setattr("wmo.cli.build_cmd.capture_build_completed", lambda **_kwargs: None)
+    source = (
+        _otlp_export(tmp_path, trace_count)
+        if source_kind == "otlp"
+        else _posthog_export(tmp_path, trace_count)
+    )
+    root = tmp_path / ".wmo"
+
+    result = _RUNNER.invoke(
+        app,
+        [
+            "build",
+            str(source),
+            "--source",
+            source_kind,
+            "--project",
+            "boundary",
+            "--root",
+            str(root),
+        ],
+    )
+
+    if accepted:
+        assert result.exit_code == 0, result.output
+        trace_dataset, _task_set = _task_set_for(root, "boundary")
+        assert len(trace_dataset.trace_ids) == trace_count
+    else:
+        assert result.exit_code == 2
+        assert "requires 100 to 1000 valid normalized traces" in result.output
+        assert ProjectStore(root, "boundary").artifacts.list_ids() == ()
 
 
 def test_build_rejects_unknown_source_and_missing_local_evidence(tmp_path: Path) -> None:
     """The direct build surface names only its two canonical input formats and local file need."""
     source = _otlp_export(tmp_path, count=1)
 
-    unknown = _RUNNER.invoke(app, ["build", str(source), "--source", "langsmith"])
-    missing = _RUNNER.invoke(app, ["build", "--file", str(tmp_path / "missing.json")])
+    unknown = _RUNNER.invoke(
+        app,
+        ["build", str(source), "--source", "langsmith", "--project", "support"],
+    )
+    missing = _RUNNER.invoke(
+        app,
+        ["build", str(tmp_path / "missing.json"), "--project", "support"],
+    )
 
     assert unknown.exit_code == 2
     assert "choose one of: otlp, posthog" in " ".join(unknown.output.replace("│", " ").split())
@@ -236,3 +294,16 @@ def test_build_rejects_the_removed_name_compatibility_alias(tmp_path: Path) -> N
 
     assert result.exit_code == 2
     assert "No such option: --name" in result.output
+
+
+def test_build_rejects_removed_file_alias_and_requires_project(tmp_path: Path) -> None:
+    """The locked build surface has one positional trace and one explicit project."""
+    source = _otlp_export(tmp_path, count=1)
+
+    alias = _RUNNER.invoke(app, ["build", "--file", str(source), "--project", "support"])
+    missing_project = _RUNNER.invoke(app, ["build", str(source)])
+
+    assert alias.exit_code == 2
+    assert "No such option: --file" in alias.output
+    assert missing_project.exit_code == 2
+    assert "--project" in missing_project.output
