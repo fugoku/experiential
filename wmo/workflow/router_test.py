@@ -453,15 +453,33 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
         maximum_simulation_cost_usd=10.0,
         maximum_judgments=100,
     )
+    attempts = []
+    emitted = []
+    receipts: set[str] = set()
 
-    crash = True
+    def capture(event, completion_id, properties, *, root):  # noqa: ANN001, ANN202
+        attempt = (event, completion_id, properties, root)
+        attempts.append(attempt)
+        if completion_id in receipts:
+            return False
+        receipts.add(completion_id)
+        emitted.append(attempt)
+        return True
+
+    monkeypatch.setattr("wmo.workflow.router.capture_completion_once", capture)
+
+    crash_after_policy = True
+    crash_after_report = True
 
     def crash_after_lock(phase: str) -> None:
-        nonlocal crash
+        nonlocal crash_after_policy, crash_after_report
         phases.append(phase)
-        if phase == "policy_locked" and crash:
-            crash = False
+        if phase == "policy_locked" and crash_after_policy:
+            crash_after_policy = False
             raise RuntimeError("simulated crash after policy lock")
+        if phase == "report_complete" and crash_after_report:
+            crash_after_report = False
+            raise RuntimeError("simulated crash after telemetry receipt")
 
     with pytest.raises(RuntimeError, match="after policy lock"):
         compose_router(
@@ -481,6 +499,17 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
         "fit_router",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("fit repeated")),
     )
+    with pytest.raises(RuntimeError, match="after telemetry receipt"):
+        compose_router(
+            project,
+            normalized,
+            services=services,
+            budget=budget,
+            created_at=_TIME,
+            code_revision="test-revision",
+            phase_hook=crash_after_lock,
+        )
+    assert len(emitted) == 1
     first = compose_router(
         project,
         normalized,
@@ -524,6 +553,25 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
     assert phases.index("fidelity_fit_started") < phases.index("policy_locked")
     assert phases.index("policy_locked") < phases.index("heldout_opened")
     assert phases.index("heldout_opened") < phases.index("report_complete")
+    assert len(attempts) == 3
+    assert len(emitted) == 1
+    assert attempts[0][0] == "wmo simulation completed"
+    assert all(
+        completion_id == first.optimization.optimization.report.report_id
+        for _event, completion_id, _properties, _root in attempts
+    )
+    assert all(
+        event_root == tmp_path for _event, _completion_id, _properties, event_root in attempts
+    )
+    assert all(
+        properties["rollout_count"]
+        == len(first.simulation_spec.cell_ids) + len(first.held_out_simulation_spec.cell_ids)
+        for _event, _completion_id, properties, _root in attempts
+    )
+    assert all(
+        properties["cost_usd"] == pytest.approx(first.total_simulation_spend_usd)
+        for _event, _completion_id, properties, _root in attempts
+    )
     purposes = {cell.cell_id: cell.purpose for cell in first.plan.cells}
     assert all(
         locked or all(purposes[cell_id] in {"fit", "fidelity"} for cell_id in cell_ids)

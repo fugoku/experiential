@@ -11,9 +11,25 @@ WMO_DIR = COMMON_DIR.parent
 
 def test_common_domains_are_nested() -> None:
     """Shared infrastructure stays under one leaf package."""
-    expected_dirs = {"config", "core", "observability", "providers", "vendor"}
-    missing_dirs = sorted(name for name in expected_dirs if not (COMMON_DIR / name).is_dir())
-    assert not missing_dirs, f"common packages missing under wmo/common: {missing_dirs}"
+    expected_dirs = {
+        "config",
+        "core",
+        "evaluations",
+        "judging",
+        "models",
+        "observability",
+        "project",
+        "rollouts",
+        "routing",
+        "tasks",
+        "traces",
+    }
+    actual_dirs = {
+        path.name for path in COMMON_DIR.iterdir() if path.is_dir() and path.name != "__pycache__"
+    }
+    assert actual_dirs == expected_dirs, (
+        f"common packages are {sorted(actual_dirs)}, expected {sorted(expected_dirs)}"
+    )
 
     legacy_dirs = sorted(
         name
@@ -38,6 +54,34 @@ def test_common_and_runtime_imports_point_inward() -> None:
     )
     assert not common_violations, f"common imports product domains: {common_violations}"
     assert not runtime_violations, f"runtime imports outer domains: {runtime_violations}"
+
+
+def test_retired_provider_imports_do_not_return() -> None:
+    """Callers use canonical model contracts and HTTP clients, never the retired provider stack."""
+    violations = _banned_imports(
+        WMO_DIR,
+        {
+            "anthropic",
+            "boto3",
+            "botocore",
+            "environment_capture",
+            "mlx",
+            "mlx_lm",
+            "openai",
+            "opentelemetry",
+            "sklearn",
+            "transformers",
+            "wmo.common.providers",
+            "wmo.common.vendor",
+        },
+    )
+    assert not violations, f"retired provider imports returned: {violations}"
+
+
+def test_retired_provider_packages_are_absent() -> None:
+    """The removed provider stack has no package directory to import accidentally."""
+    assert not (COMMON_DIR / "providers").exists()
+    assert not (COMMON_DIR / "vendor").exists()
 
 
 def _banned_imports(root: Path, banned: set[str]) -> list[str]:

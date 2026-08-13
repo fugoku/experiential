@@ -1,86 +1,34 @@
 [project]
 name = "world-model-optimizer"
 version = "0.3.0"
-description = "Run agents, build world models from traces, and optimize agent harnesses."
+description = "Build simulations and optimize model routing from agent traces."
 readme = "README.md"
-# harbor 0.20.0 requires Python >=3.12; the harbor evaluator is a first-class optimize
-# environment, so the whole package moves to 3.12 (deliberate 3.11 drop, noted in the PR body).
 requires-python = ">=3.12"
 dependencies = [
-    # Cross-platform advisory file locking for the durable registries wmo edits in place (the
-    # candidate pool, the harness and adapter alias tables). Declared directly because
-    # `wmo.common.core.locks` imports it; it was already in the resolved graph via torch/datasets/
-    # huggingface-hub/harbor. It is what keeps a Unix-only `fcntl` off wmo's import path.
+    # Cross-platform advisory locking for durable registries edited in place. Declared directly
+    # because `wmo.common.core.locks` imports it and Unix-only `fcntl` is not a portable boundary.
     "filelock>=3.12",
-    # typer/rich/fastapi/uvicorn floors match harbor 0.20.0's requirements so the harbor
-    # extra resolves against the core install without downgrades.
     "typer>=0.16",
     "click>=8.2",  # pins no_args_is_help semantics: help + usage-error exit 2 (<8.2 exited 0)
     "fastapi>=0.128",
     "uvicorn>=0.38",
     "pydantic>=2.6",
     "numpy>=1.26",
-    # The routing optimizer's clustering stack (KMeans + Normalizer), matching the Avengers
-    # reference implementation it replicates; serving only reads fitted centroids (numpy).
-    "scikit-learn>=1.4",
     "httpx>=0.27",
     "rich>=14.1",
-    "gepa>=0.1.1",
-    "tomli-w>=1.0",  # writing .wmo/config.toml (stdlib tomllib reads); every `wmo build` needs it
+    "tomli-w>=1.0",  # writing project and telemetry TOML; every `wmo build` needs it
     "posthog>=7.0",
-    # Provider SDKs ship with the core install: a fresh `uv sync` must serve every provider the
-    # wizard offers without a "No module named ..." follow-up step.
-    "anthropic>=0.39",
-    "openai>=1.40",
-    "boto3>=1.34",
 ]
 
 [project.optional-dependencies]
-otel = ["opentelemetry-proto>=1.24"]
-# The e2b harness backend (`--harness-backend e2b`): the pi-node harness PROCESS executes in
-# pooled E2B microVMs while the environment stays the world model. Only those runs need it —
-# local runs stay sandbox-free — so it is an optional extra imported lazily
-# (wmo.runtime.harness.e2b_sandbox / wmo.runtime.harness.pi_e2b). Exact pin: the harbor E2B
-# environment
-# (wmo.runtime.evaluation.harbor.e2b_environment) depends on version-sensitive template-build API behavior
-# and embeds the e2b version in template alias derivation.
-e2b = ["e2b==2.31.0"]
-# The harbor evaluator (`wmo.runtime.evaluation.harbor`): scores harness candidates on real
-# Terminal-Bench-2-style tasks through the harbor runner. Imported lazily, same contract as
-# the e2b extra. Exact pin: our E2B template alias derivation embeds harbor's version and
-# tracks its build behavior. Running harbor task environments ON E2B additionally needs
-# `wmo[harbor,e2b]` plus harbor's own e2b extra (`harbor[e2b]`, for dockerfile-parse).
-harbor = ["harbor==0.20.0"]
 # Persisted supervised fine-tuning uses the native Tinker SDK and cookbook renderer surface.
 sft = ["tinker>=0.23,<0.24", "tinker-cookbook>=0.4.3,<0.5"]
-# The in-process local embedder (`wmo.common.providers.local_embed`, EmbedderKind.LOCAL): Qwen3
-# embeddings with no embedding API in the loop. mlx-lm exists only on Apple silicon, hence the
-# marker; it is imported via importlib there (a static import would break the type gate
-# everywhere else), while torch/transformers install on every platform and stay static-lazy.
-local = [
-    "mlx-lm>=0.24; sys_platform == 'darwin' and platform_machine == 'arm64'",
-    "torch>=2.4",
-    "transformers>=4.51",
-]
-# dev pulls in every backend SDK so `ty check` and the full test suite resolve over the whole
-# project (the providers import anthropic/openai/boto3 lazily, but type-checking needs them present).
 dev = [
     "pytest>=8.0",
     "ruff>=0.5",
     "ty>=0.0.1a1",
-    "world-model-optimizer[otel,e2b,harbor,sft,local]",
+    "world-model-optimizer[sft]",
 ]
-
-[dependency-groups]
-# environment-capture joins the dev environment (uv syncs the `dev` group by default) with its
-# heavy extras, so the root gate can exercise the tests that import it directly.
-#
-# A dependency GROUP is not published metadata, so nothing here reaches a `pip install
-# world-model-optimizer`. That is the whole point for environment-capture: it is a development
-# dependency only, and shipped `wmo/` imports nothing from it (`wmo/simulation/hub.py` vendors the
-# bundle-fetch read core `wmo download` needs). llm-waterfall is no longer a dependency in any
-# form: its source is vendored under `wmo/common/vendor/waterfall/` and ships inside the flagship wheel.
-dev = ["environment-capture[bedrock,fetch]"]
 
 [project.scripts]
 wmo = "wmo.cli:main"
@@ -93,12 +41,9 @@ build-backend = "hatchling.build"
 packages = ["wmo"]
 # Test-only code is named for pytest discovery, and `wmo/conftest.py` is a pytest fixture module.
 exclude = ["**/*_test.py", "wmo/conftest.py"]
-# The vendored waterfall utility's MIT notice at wmo/common/vendor/waterfall/LICENSE needs no
-# force-include: `packages = ["wmo"]` already ships every non-Python file under wmo/.
 
 [tool.hatch.build.targets.sdist]
-# One flagship distribution: everything importable lives under /wmo, including the vendored
-# waterfall utility. environment-capture is a dev-only dependency, never a `Requires-Dist`.
+# One flagship distribution: everything importable lives under /wmo.
 include = [
     "/wmo",
     "/README.md",
@@ -125,90 +70,7 @@ convention = "google"
 
 [tool.ruff.lint.per-file-ignores]
 # Test modules are fixtures and assertions rather than public package APIs. Production modules
-# still require a module docstring, and new public APIs must use the Google convention above.
+# still require a module docstring and Google-style public API documentation.
 "**/*_test.py" = ["D"]
-# Exact public-docstring migration inventory frozen from W1's baseline. The corresponding
-# symbol-level transition test rejects new violations in these legacy files, requires tombstones
-# when a violation is fixed, and rejects a reintroduced tombstone. No directory is exempt.
-"wmo/cli/defer.py" = ["D102"]
-"wmo/common/config/card.py" = ["D103"]
-"wmo/common/config/config.py" = ["D102"]
-"wmo/common/config/settings.py" = ["D103"]
-"wmo/common/config/store.py" = ["D102"]
-"wmo/common/observability/clock.py" = ["D102"]
-"wmo/common/observability/metered.py" = ["D102"]
-"wmo/common/observability/reporting.py" = ["D102"]
-"wmo/common/observability/telemetry.py" = ["D102", "D103"]
-"wmo/common/observability/tracker.py" = ["D102"]
-"wmo/common/providers/anthropic.py" = ["D102"]
-"wmo/common/providers/azure_openai.py" = ["D102"]
-"wmo/common/providers/base.py" = ["D102"]
-"wmo/common/providers/bedrock.py" = ["D102"]
-"wmo/common/providers/openai.py" = ["D102"]
-"wmo/common/providers/pool.py" = ["D102"]
-"wmo/common/providers/retry.py" = ["D102"]
-"wmo/common/providers/waterfall.py" = ["D102"]
-"wmo/common/vendor/waterfall/adapters/anthropic.py" = ["D102"]
-"wmo/common/vendor/waterfall/adapters/aws_mantle.py" = ["D102"]
-"wmo/common/vendor/waterfall/adapters/azure_openai.py" = ["D102"]
-"wmo/common/vendor/waterfall/waterfall.py" = ["D102"]
-"wmo/optimize/base.py" = ["D102"]
-"wmo/optimize/gepa.py" = ["D102"]
-"wmo/optimize/judge.py" = ["D102"]
-"wmo/optimize/judge_quality.py" = ["D102"]
-"wmo/optimize/numeric.py" = ["D102"]
-"wmo/optimize/research/ablation.py" = ["D102"]
-"wmo/optimize/research/concurrency_scaling.py" = ["D102"]
-"wmo/optimize/research/gepa_scaling.py" = ["D102"]
-"wmo/optimize/research/seed_stability.py" = ["D102"]
-"wmo/optimize/research/trace_scaling.py" = ["D102"]
-"wmo/runtime/agents/llm.py" = ["D102"]
-"wmo/runtime/episode.py" = ["D102"]
-"wmo/runtime/evaluation/harbor/agent.py" = ["D102"]
-"wmo/runtime/evaluation/harbor/scorer.py" = ["D102"]
-"wmo/runtime/evaluation/harbor/tasks.py" = ["D102"]
-"wmo/runtime/harness/code_runtime.py" = ["D102"]
-"wmo/runtime/harness/doc.py" = ["D102"]
-"wmo/runtime/harness/e2b_sandbox.py" = ["D102"]
-"wmo/runtime/harness/live_session.py" = ["D102"]
-"wmo/runtime/harness/pi_e2b.py" = ["D102"]
-"wmo/runtime/harness/pi_runtime.py" = ["D102"]
-"wmo/runtime/harness/runner_link.py" = ["D102", "D103"]
-"wmo/runtime/harness/runtime.py" = ["D102"]
-"wmo/runtime/harness/scoring.py" = ["D102"]
-"wmo/runtime/harness/skills.py" = ["D102"]
-"wmo/runtime/harness/store.py" = ["D102"]
-"wmo/runtime/platform/auth.py" = ["D102"]
-"wmo/runtime/platform/client.py" = ["D102"]
-"wmo/simulation/environment.py" = ["D102"]
-"wmo/simulation/evaluation/agreement.py" = ["D102"]
-"wmo/simulation/evaluation/base.py" = ["D102"]
-"wmo/simulation/evaluation/closed_loop.py" = ["D102"]
-"wmo/simulation/evaluation/failover.py" = ["D102"]
-"wmo/simulation/evaluation/gold.py" = ["D102"]
-"wmo/simulation/evaluation/grid.py" = ["D102"]
-"wmo/simulation/evaluation/open_loop.py" = ["D102"]
-"wmo/simulation/ingest/adapter.py" = ["D103"]
-"wmo/simulation/ingest/base.py" = ["D102"]
-"wmo/simulation/ingest/mastra.py" = ["D102"]
-"wmo/simulation/ingest/messages.py" = ["D102"]
-"wmo/simulation/ingest/normalize.py" = ["D103"]
-"wmo/simulation/ingest/posthog.py" = ["D102"]
-"wmo/simulation/model/autoconfig.py" = ["D102"]
-"wmo/simulation/model/demo.py" = ["D102"]
-"wmo/simulation/model/eval_suites.py" = ["D102"]
-"wmo/simulation/model/grounding.py" = ["D102"]
-"wmo/simulation/model/replay.py" = ["D102"]
-"wmo/simulation/model/workspace.py" = ["D102"]
-"wmo/simulation/model/world_model.py" = ["D102"]
-"wmo/simulation/retrieval/embedders.py" = ["D102"]
-"wmo/simulation/scenarios/synthesis/scenario_set.py" = ["D102"]
-"wmo/simulation/scenarios/verification/judge.py" = ["D102"]
-"wmo/simulation/scenarios/verification/verify.py" = ["D102"]
-# The waterfall utility's adapter tests stub provider SDK clients, whose kwargs are genuinely
-# arbitrary — the fakes have to accept whatever the SDK signature accepts. Scoped to that one
-# module tree so the rest of `wmo/` keeps ANN401 in full force.
-"wmo/common/vendor/waterfall/**/*_test.py" = ["ANN401"]
-
 [tool.ty.environment]
 python-version = "3.12"
