@@ -1,163 +1,363 @@
-"""HTTP routing endpoint transcript, retry, and caller-validation tests."""
+"""Official OpenAI SDK routing endpoint tests."""
 
 from __future__ import annotations
 
-import hashlib
-
 import pytest
-from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from openai import OpenAI
+from openai.types.chat import (
+    ChatCompletion,
+    ChatCompletionChunk,
+    ChatCompletionMessageParam,
+    ChatCompletionToolUnionParam,
+)
+from openai.types.responses import Response, ResponseStreamEvent
 
-from wmo.runtime.router import create_router_endpoint
-from wmo.runtime.router.runtime_test import _runtime
+from wmo.runtime.router.application import create_project_router_app
+from wmo.runtime.router.runtime import RouterRuntime
+from wmo.runtime.router.runtime_test import _Client, _runtime
 
 
-def test_endpoint_requires_episode_rejects_stream_and_preserves_tool_transcript() -> None:
-    """HTTP is non-streaming and preserves tools while keeping later turns sticky."""
-    runtime, client = _runtime()
-    app = FastAPI()
-    app.include_router(create_router_endpoint({"router-a": runtime}))
+def _clients(*, candidate_tools: bool = True) -> tuple[OpenAI, TestClient, RouterRuntime, _Client]:
+    runtime, model_client = _runtime(candidate_tools=candidate_tools)
+    app = create_project_router_app("router-a", runtime)
     http = TestClient(app)
-    payload = {
-        "model": "router-a",
-        "messages": [
-            {"role": "user", "content": "do it"},
+    openai = OpenAI(api_key="local-test", base_url="http://testserver/v1", http_client=http)
+    return openai, http, runtime, model_client
+
+
+def test_official_chat_client_preserves_tools_without_cross_caller_affinity() -> None:
+    """Official SDK chat calls need no WMO header and do not join equal transcripts."""
+    openai, _http, _runtime_value, model_client = _clients()
+    messages: list[ChatCompletionMessageParam] = [
+        {"role": "user", "content": "do it"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call-in",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": '{"path":"a"}'},
+                }
+            ],
+        },
+        {"role": "tool", "content": "result", "tool_call_id": "call-in"},
+    ]
+    tools: list[ChatCompletionToolUnionParam] = [
+        {
+            "type": "function",
+            "function": {
+                "name": "read",
+                "description": "read a file",
+                "parameters": {"type": "object"},
+            },
+        }
+    ]
+
+    completion = openai.chat.completions.create(model="router-a", messages=messages, tools=tools)
+
+    assert isinstance(completion, ChatCompletion)
+    assert completion.model == "router-a"
+    assert completion.choices[0].message.tool_calls is not None
+    assert completion.choices[0].message.tool_calls[0].id == "call-out"
+    assert completion.model_extra is None or "routing_decision" not in completion.model_extra
+    captured = model_client.requests[-1]
+    assert [message.role for message in captured.messages] == ["user", "assistant", "tool"]
+    assert captured.messages[1].assistant_action is not None
+    assert captured.messages[1].assistant_action.tool_calls[0].call_id == "call-in"
+    assert captured.messages[2].tool_call_id == "call-in"
+
+    next_turn = openai.chat.completions.create(
+        model="router-a",
+        messages=[
+            *messages,
             {
                 "role": "assistant",
                 "content": None,
                 "tool_calls": [
                     {
-                        "id": "call-in",
+                        "id": "call-out",
                         "type": "function",
-                        "function": {"name": "read", "arguments": '{"path":"a"}'},
+                        "function": {"name": "write", "arguments": '{"x":1}'},
                     }
                 ],
             },
-            {"role": "tool", "content": "result", "tool_call_id": "call-in"},
+            {"role": "tool", "content": "done", "tool_call_id": "call-out"},
+            {"role": "user", "content": "next turn"},
         ],
-        "tools": [
-            {
-                "type": "function",
-                "function": {
+        tools=tools,
+    )
+
+    assert next_turn.model == "router-a"
+    assert model_client.embed_calls == 2
+    assert len(model_client.requests[-1].messages) == 6
+
+    openai.chat.completions.create(model="router-a", messages=messages, tools=tools)
+    assert model_client.embed_calls == 3
+
+
+@pytest.mark.parametrize("path", ("/v1/chat/completions", "/v1/responses"))
+def test_tool_request_rejects_an_incapable_selected_model(path: str) -> None:
+    """OpenAI tool requests fail explicitly before an incapable provider call."""
+    _openai, http, _runtime_value, model_client = _clients(candidate_tools=False)
+    payload = (
+        {
+            "model": "router-a",
+            "input": "read",
+            "tools": [
+                {
+                    "type": "function",
                     "name": "read",
-                    "description": "read a file",
                     "parameters": {"type": "object"},
-                },
+                }
+            ],
+        }
+        if path.endswith("responses")
+        else {
+            "model": "router-a",
+            "messages": [{"role": "user", "content": "read"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+        }
+    )
+
+    response = http.post(path, json=payload)
+
+    assert response.status_code == 501
+    assert response.json()["error"]["code"] == "tool_calling_unsupported"
+    assert model_client.complete_calls == 0
+
+
+def test_official_responses_client_continues_with_previous_response_id() -> None:
+    """Responses continuation keeps routing affinity through the standard response ID."""
+    openai, _http, _runtime_value, model_client = _clients()
+
+    first = openai.responses.create(model="router-a", input="Help me")
+    second = openai.responses.create(
+        model="router-a", input="Continue", previous_response_id=first.id
+    )
+
+    assert isinstance(first, Response)
+    assert isinstance(second, Response)
+    assert second.previous_response_id == first.id
+    assert model_client.embed_calls == 1
+    assert [message.role for message in model_client.requests[-1].messages] == [
+        "user",
+        "assistant",
+        "user",
+    ]
+
+
+def test_openai_text_content_parts_are_preserved() -> None:
+    """Chat and Responses text parts reach the routed model as complete visible text."""
+    openai, _http, _runtime_value, model_client = _clients()
+
+    openai.chat.completions.create(
+        model="router-a",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "first "},
+                    {"type": "text", "text": "second"},
+                ],
             }
         ],
-    }
-    assert http.post("/v1/chat/completions", json=payload).status_code == 400
-    assert (
-        http.post(
-            "/v1/chat/completions",
-            json={**payload, "stream": True},
-            headers={"X-WMO-Episode-ID": "episode-a"},
-        ).status_code
-        == 400
     )
+    openai.responses.create(
+        model="router-a",
+        input=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "third "},
+                    {"type": "input_text", "text": "fourth"},
+                ],
+            }
+        ],
+    )
+
+    assert model_client.requests[-2].messages[0].content == "first second"
+    assert model_client.requests[-1].messages[0].content == "third fourth"
+
+
+def test_request_validation_uses_an_openai_error_envelope() -> None:
+    """Public schema failures do not leak FastAPI's proprietary detail body."""
+    _openai, http, _runtime_value, model_client = _clients()
+
     response = http.post(
         "/v1/chat/completions",
-        json=payload,
-        headers={"X-WMO-Episode-ID": "episode-a"},
+        json={"model": "router-a", "messages": [{"role": "invalid", "content": "x"}]},
     )
 
-    assert response.status_code == 200
-    assert response.headers["X-WMO-Episode-ID-SHA256"] == hashlib.sha256(b"episode-a").hexdigest()
-    assert "episode-a" not in response.text
-    assert response.json()["choices"][0]["message"]["tool_calls"][0]["id"] == "call-out"
-    captured = client.requests[-1]
-    assert [message.role for message in captured.messages] == ["user", "assistant", "tool"]
-    assert captured.messages[1].assistant_action is not None
-    assert captured.messages[1].assistant_action.tool_calls[0].call_id == "call-in"
-    assert captured.messages[2].tool_call_id == "call-in"
-    next_turn = http.post(
-        "/v1/chat/completions",
-        json={
-            **payload,
-            "messages": [*payload["messages"], {"role": "user", "content": "next turn"}],
-        },
-        headers={"X-WMO-Episode-ID": "episode-a"},
-    )
-    assert next_turn.status_code == 200
-    assert next_turn.headers["X-WMO-Routed-Model"] == response.headers["X-WMO-Routed-Model"]
-    assert (
-        next_turn.json()["routing_decision"]["decision_id"]
-        == response.json()["routing_decision"]["decision_id"]
-    )
-    assert client.embed_calls == 1
-    assert len(client.requests[-1].messages) == 4
-    assert "episode-a" not in next_turn.text
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": {
+            "message": "Invalid OpenAI request",
+            "type": "invalid_request_error",
+            "param": None,
+            "code": "invalid_request",
+        }
+    }
+    assert model_client.embed_calls == 0
+    assert model_client.complete_calls == 0
 
 
-def test_endpoint_provider_retry_reuses_exact_cached_request_decision() -> None:
-    """A provider failure can retry the same turn without reselection or decision drift."""
-    runtime, client = _runtime()
-    client.completion_error = RuntimeError("provider unavailable")
-    app = FastAPI()
-    app.include_router(create_router_endpoint({"router-a": runtime}))
-    http = TestClient(app)
-    payload = {"model": "router-a", "messages": [{"role": "user", "content": "retry me"}]}
-    headers = {"X-WMO-Episode-ID": "episode-a"}
+def test_official_clients_parse_buffered_streams() -> None:
+    """Both official SDK streaming iterators parse WMO's OpenAI SSE events."""
+    openai, _http, _runtime_value, _model_client = _clients()
+
+    chat_stream = openai.chat.completions.create(
+        model="router-a", messages=[{"role": "user", "content": "stream"}], stream=True
+    )
+    chat_chunks: list[ChatCompletionChunk] = list(chat_stream)
+    response_stream = openai.responses.create(model="router-a", input="stream", stream=True)
+    response_events: list[ResponseStreamEvent] = list(response_stream)
+
+    assert chat_chunks
+    assert all(isinstance(item, ChatCompletionChunk) for item in chat_chunks)
+    assert chat_chunks[-1].choices[0].finish_reason == "tool_calls"
+    assert response_events
+    assert response_events[0].type == "response.created"
+    assert response_events[-1].type == "response.completed"
+
+
+def test_idempotency_key_reuses_decision_after_provider_failure() -> None:
+    """A standard idempotency key pins the retry decision without a WMO episode header."""
+    openai, http, runtime, model_client = _clients()
+    model_client.completion_error = RuntimeError("provider unavailable")
+    payload = {"model": "router-a", "messages": [{"role": "user", "content": "retry"}]}
+    headers = {"Idempotency-Key": "interaction-a"}
 
     assert http.post("/v1/chat/completions", json=payload, headers=headers).status_code == 502
-    cached = next(iter(runtime._request_decisions.values()))  # noqa: SLF001 - retry identity probe
-    response = http.post("/v1/chat/completions", json=payload, headers=headers)
+    cached = next(iter(runtime._request_decisions.values()))  # noqa: SLF001
+    response = openai.chat.completions.create(
+        model="router-a",
+        messages=[{"role": "user", "content": "retry"}],
+        extra_headers=headers,
+    )
 
-    assert response.status_code == 200
-    assert response.json()["routing_decision"]["decision_id"] == cached.decision_id
-    assert client.embed_calls == 1
-    assert client.complete_calls == 2
+    assert response.id.startswith("chatcmpl-")
+    assert next(iter(runtime._request_decisions.values())) == cached  # noqa: SLF001
+    assert model_client.embed_calls == 1
+    assert model_client.complete_calls == 2
+
+
+@pytest.mark.parametrize("path", ("/v1/chat/completions", "/v1/responses"))
+def test_idempotency_key_rejects_a_different_request(path: str) -> None:
+    """One standard idempotency key cannot merge two divergent OpenAI requests."""
+    _openai, http, _runtime_value, model_client = _clients()
+    headers = {"Idempotency-Key": "one-logical-request"}
+    if path.endswith("responses"):
+        first = {"model": "router-a", "input": "first"}
+        changed = {"model": "router-a", "input": "changed"}
+    else:
+        first = {"model": "router-a", "messages": [{"role": "user", "content": "first"}]}
+        changed = {
+            "model": "router-a",
+            "messages": [{"role": "user", "content": "changed"}],
+        }
+
+    assert http.post(path, json=first, headers=headers).status_code == 200
+    conflict = http.post(path, json=changed, headers=headers)
+
+    assert conflict.status_code == 409
+    assert (
+        conflict.json()["error"]["message"] == "Idempotency-Key conflicts with live request state"
+    )
+    assert model_client.embed_calls == 1
+    assert model_client.complete_calls == 1
+
+
+@pytest.mark.parametrize("path", ("/v1/chat/completions", "/v1/responses"))
+def test_expired_idempotency_key_starts_a_fresh_episode(
+    path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An expired transport key cannot reconnect to retained router state."""
+    now = [100.0]
+    monkeypatch.setattr("wmo.runtime.router.endpoint.time.monotonic", lambda: now[0])
+    _openai, http, runtime, model_client = _clients()
+    headers = {"Idempotency-Key": "reusable-after-retention"}
+    if path.endswith("responses"):
+        first = {"model": "router-a", "input": "first"}
+        changed = {"model": "router-a", "input": "changed"}
+    else:
+        first = {"model": "router-a", "messages": [{"role": "user", "content": "first"}]}
+        changed = {
+            "model": "router-a",
+            "messages": [{"role": "user", "content": "changed"}],
+        }
+
+    assert http.post(path, json=first, headers=headers).status_code == 200
+    now[0] += 24 * 60 * 60 + 1
+    assert http.post(path, json=changed, headers=headers).status_code == 200
+
+    assert model_client.embed_calls == 2
+    assert model_client.complete_calls == 2
+    assert len(runtime._episode_decisions) == 2  # noqa: SLF001
 
 
 @pytest.mark.parametrize(
-    "request_update",
+    "path,payload",
     [
-        {
-            "messages": [
-                {
-                    "role": "assistant",
-                    "tool_calls": [
-                        {
-                            "id": "x",
-                            "function": {"name": "read", "arguments": "[1]"},
-                        }
-                    ],
-                }
-            ]
-        },
-        {
-            "tools": [
-                {"function": {"name": "read", "parameters": {}}},
-                {"function": {"name": "read", "parameters": {}}},
-            ]
-        },
-        {"tool_choice": {"function": {"name": "missing"}}},
-        {"max_completion_tokens": 0},
-        {"messages": [{"role": "system", "content": "no user"}]},
-        {"messages": [{"role": "assistant", "content": "no user"}]},
-        {"messages": [{"role": "user", "content": None}]},
+        (
+            "/v1/chat/completions",
+            {
+                "model": "router-a",
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "x",
+                                "function": {"name": "read", "arguments": "[1]"},
+                            }
+                        ],
+                    }
+                ],
+            },
+        ),
+        (
+            "/v1/chat/completions",
+            {
+                "model": "router-a",
+                "messages": [{"role": "system", "content": "no user"}],
+            },
+        ),
+        (
+            "/v1/responses",
+            {"model": "router-a", "input": "next", "previous_response_id": "missing"},
+        ),
+        (
+            "/v1/chat/completions",
+            {
+                "model": "router-a",
+                "messages": [{"role": "user", "content": "unsupported"}],
+                "logprobs": True,
+            },
+        ),
+        (
+            "/v1/responses",
+            {"model": "router-a", "input": "unsupported", "background": True},
+        ),
     ],
 )
-def test_invalid_http_request_never_reaches_selection_or_provider(
-    request_update: dict[str, object],
+def test_invalid_official_request_never_reaches_provider(
+    path: str, payload: dict[str, object]
 ) -> None:
-    """Caller message, tool, choice, and token validation failures remain actionable 4xx."""
-    runtime, client = _runtime()
-    app = FastAPI()
-    app.include_router(create_router_endpoint({"router-a": runtime}))
-    http = TestClient(app)
-    payload: dict[str, object] = {
-        "model": "router-a",
-        "messages": [{"role": "user", "content": "validate me"}],
-        **request_update,
-    }
+    """Malformed OpenAI requests fail as 4xx before embedding or model dispatch."""
+    _openai, http, _runtime_value, model_client = _clients()
 
-    response = http.post(
-        "/v1/chat/completions",
-        json=payload,
-        headers={"X-WMO-Episode-ID": "episode-a"},
-    )
+    response = http.post(path, json=payload)
 
     assert response.status_code in {400, 422}
-    assert client.embed_calls == 0
-    assert client.complete_calls == 0
+    assert model_client.embed_calls == 0
+    assert model_client.complete_calls == 0

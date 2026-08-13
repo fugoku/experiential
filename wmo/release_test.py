@@ -13,7 +13,7 @@ import pytest
 
 BUILT_DIST_ENV = "WMO_BUILT_DIST_DIR"
 RETIRED_REQUIREMENT = re.compile(
-    r"(?mi)^Requires-Dist:\s*(?:anthropic|boto3|environment-capture|gepa|mlx-lm|openai|"
+    r"(?mi)^Requires-Dist:\s*(?:anthropic|boto3|environment-capture|gepa|mlx-lm|"
     r"opentelemetry-proto|scikit-learn|transformers)(?:\s|[<>=;~!])"
 )
 REQUIRED_CORE_REQUIREMENTS = frozenset(
@@ -23,6 +23,7 @@ REQUIRED_CORE_REQUIREMENTS = frozenset(
         "filelock",
         "httpx",
         "numpy",
+        "openai",
         "posthog",
         "pydantic",
         "rich",
@@ -193,7 +194,6 @@ def test_requirement_scanner_rejects_removed_dependencies() -> None:
         "environment-capture",
         "gepa",
         "mlx-lm",
-        "openai",
         "opentelemetry-proto",
         "scikit-learn",
         "transformers",
@@ -210,6 +210,7 @@ def test_w16_public_evidence_apis_resolve_from_release_owners() -> None:
 
     assert callable(wmo.compose_router)
     assert callable(wmo.load_project_router)
+    assert callable(wmo.load_router)
     assert callable(wmo.create_project_router_app)
     assert callable(compare_text_and_sandbox)
     assert SandboxSimulator.__module__ == "wmo.simulation.engines.sandbox"
