@@ -139,10 +139,14 @@ uv run pytest -q
    has unrelated failures, record them and keep them out of the patch; fix them only when they are
    in scope or prevent meaningful validation.
 
-2. **Tests live inline next to the code.** A module `foo.py` is tested by `foo_test.py` in the same
-   directory (for example, `wmo/workflow/router.py` maps to `wmo/workflow/router_test.py`). There
-   is no top-level `tests/` directory. Pytest is configured (`python_files = ["*_test.py"]`) to
-   discover these.
+2. **Tests live inline, one test file per module.** `wmo/workflow/router.py` is tested by
+   `wmo/workflow/router_test.py`, next to it. Pytest is configured (`python_files =
+   ["*_test.py"]`) to find these, and there is no top-level `tests/` directory.
+
+   - Give every module a `_test.py` beside it.
+   - Leaving that file empty is fine, and better than a vacuous test.
+   - Do not create a `_test.py` whose module does not exist. A test that covers a whole package
+     goes in that package's own `tests/` directory, such as `wmo/simulation/tests/`.
 
 3. **Avoid generic types.** Do not use `Any`, bare `dict`/`object`, or untyped `**kwargs` where a
    concrete type is practical. Prefer explicit pydantic models and fields; for genuinely arbitrary
