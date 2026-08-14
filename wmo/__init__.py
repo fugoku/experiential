@@ -6,24 +6,40 @@ from importlib import import_module
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from wmo.optimize.router.workflow import EvaluationInputs as EvaluationInputs
-    from wmo.optimize.router.workflow import RouterFitConfig as RouterFitConfig
-    from wmo.optimize.router.workflow import (
+    from wmo.optimize.router.activation import load_project_router as load_project_router
+    from wmo.optimize.router.activation import load_router as load_router
+    from wmo.optimize.router.composition import (
+        ApprovedRouterReview as ApprovedRouterReview,
+    )
+    from wmo.optimize.router.composition import FidelityApprovalDecision as FidelityApprovalDecision
+    from wmo.optimize.router.composition import LocalTraceSource as LocalTraceSource
+    from wmo.optimize.router.composition import (
+        RouterCompositionBudget as RouterCompositionBudget,
+    )
+    from wmo.optimize.router.composition import (
+        RouterCompositionResult as RouterCompositionResult,
+    )
+    from wmo.optimize.router.composition import (
+        RouterEvaluationSetup as RouterEvaluationSetup,
+    )
+    from wmo.optimize.router.composition import RouterWorkflowServices as RouterWorkflowServices
+    from wmo.optimize.router.composition import compose_router as compose_router
+    from wmo.optimize.router.fit.workflow import EvaluationInputs as EvaluationInputs
+    from wmo.optimize.router.fit.workflow import RouterFitConfig as RouterFitConfig
+    from wmo.optimize.router.fit.workflow import (
         RouterFitWorkflowResult as RouterFitWorkflowResult,
     )
-    from wmo.optimize.router.workflow import (
+    from wmo.optimize.router.fit.workflow import (
         RouterOptimizationConfig as RouterOptimizationConfig,
     )
-    from wmo.optimize.router.workflow import RouterReportConfig as RouterReportConfig
-    from wmo.optimize.router.workflow import RouterWorkflowResult as RouterWorkflowResult
-    from wmo.optimize.router.workflow import fit_router as fit_router
-    from wmo.optimize.router.workflow import optimize_router as optimize_router
-    from wmo.optimize.router.workflow import report_router as report_router
+    from wmo.optimize.router.fit.workflow import RouterReportConfig as RouterReportConfig
+    from wmo.optimize.router.fit.workflow import RouterWorkflowResult as RouterWorkflowResult
+    from wmo.optimize.router.fit.workflow import fit_router as fit_router
+    from wmo.optimize.router.fit.workflow import optimize_router as optimize_router
+    from wmo.optimize.router.fit.workflow import report_router as report_router
     from wmo.runtime.router.application import (
         create_project_router_app as create_project_router_app,
     )
-    from wmo.runtime.router.application import load_project_router as load_project_router
-    from wmo.runtime.router.application import load_router as load_router
     from wmo.runtime.router.runtime import RouterRuntime as RouterRuntime
     from wmo.simulation.build import BuildReviewReadiness as BuildReviewReadiness
     from wmo.simulation.build import ProjectBuild as ProjectBuild
@@ -47,22 +63,6 @@ if TYPE_CHECKING:
         WorldModelSessionLimits as WorldModelSessionLimits,
     )
     from wmo.simulation.world_model.application import load_world_model as load_world_model
-    from wmo.workflow.router import (
-        ApprovedRouterReview as ApprovedRouterReview,
-    )
-    from wmo.workflow.router import FidelityApprovalDecision as FidelityApprovalDecision
-    from wmo.workflow.router import LocalTraceSource as LocalTraceSource
-    from wmo.workflow.router import (
-        RouterCompositionBudget as RouterCompositionBudget,
-    )
-    from wmo.workflow.router import (
-        RouterCompositionResult as RouterCompositionResult,
-    )
-    from wmo.workflow.router import (
-        RouterEvaluationSetup as RouterEvaluationSetup,
-    )
-    from wmo.workflow.router import RouterWorkflowServices as RouterWorkflowServices
-    from wmo.workflow.router import compose_router as compose_router
 
 _EXPORT_MODULES = {
     "BuildReviewReadiness": "wmo.simulation.build",
@@ -77,27 +77,27 @@ _EXPORT_MODULES = {
     "WorldModelSessionError": "wmo.simulation.world_model.application",
     "WorldModelSessionLimits": "wmo.simulation.world_model.application",
     "load_world_model": "wmo.simulation.world_model.application",
-    "EvaluationInputs": "wmo.optimize.router.workflow",
-    "RouterFitConfig": "wmo.optimize.router.workflow",
-    "RouterFitWorkflowResult": "wmo.optimize.router.workflow",
-    "RouterOptimizationConfig": "wmo.optimize.router.workflow",
-    "RouterReportConfig": "wmo.optimize.router.workflow",
-    "RouterWorkflowResult": "wmo.optimize.router.workflow",
-    "fit_router": "wmo.optimize.router.workflow",
-    "optimize_router": "wmo.optimize.router.workflow",
-    "report_router": "wmo.optimize.router.workflow",
+    "EvaluationInputs": "wmo.optimize.router.fit.workflow",
+    "RouterFitConfig": "wmo.optimize.router.fit.workflow",
+    "RouterFitWorkflowResult": "wmo.optimize.router.fit.workflow",
+    "RouterOptimizationConfig": "wmo.optimize.router.fit.workflow",
+    "RouterReportConfig": "wmo.optimize.router.fit.workflow",
+    "RouterWorkflowResult": "wmo.optimize.router.fit.workflow",
+    "fit_router": "wmo.optimize.router.fit.workflow",
+    "optimize_router": "wmo.optimize.router.fit.workflow",
+    "report_router": "wmo.optimize.router.fit.workflow",
     "RouterRuntime": "wmo.runtime.router.runtime",
     "create_project_router_app": "wmo.runtime.router.application",
-    "load_project_router": "wmo.runtime.router.application",
-    "load_router": "wmo.runtime.router.application",
-    "ApprovedRouterReview": "wmo.workflow.router",
-    "LocalTraceSource": "wmo.workflow.router",
-    "FidelityApprovalDecision": "wmo.workflow.router",
-    "RouterCompositionBudget": "wmo.workflow.router",
-    "RouterCompositionResult": "wmo.workflow.router",
-    "RouterEvaluationSetup": "wmo.workflow.router",
-    "RouterWorkflowServices": "wmo.workflow.router",
-    "compose_router": "wmo.workflow.router",
+    "load_project_router": "wmo.optimize.router.activation",
+    "load_router": "wmo.optimize.router.activation",
+    "ApprovedRouterReview": "wmo.optimize.router.composition",
+    "LocalTraceSource": "wmo.optimize.router.composition",
+    "FidelityApprovalDecision": "wmo.optimize.router.composition",
+    "RouterCompositionBudget": "wmo.optimize.router.composition",
+    "RouterCompositionResult": "wmo.optimize.router.composition",
+    "RouterEvaluationSetup": "wmo.optimize.router.composition",
+    "RouterWorkflowServices": "wmo.optimize.router.composition",
+    "compose_router": "wmo.optimize.router.composition",
 }
 
 __all__ = list(_EXPORT_MODULES)
