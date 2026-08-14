@@ -8,6 +8,7 @@ from datetime import datetime
 from wmo.common.core.artifacts import ArtifactInput
 from wmo.common.evaluations import ObservedProductionCell
 from wmo.common.models import (
+    CandidateTokenPrice,
     PricingSnapshot,
     load_model_catalog,
     persist_pricing_snapshot,
@@ -40,6 +41,7 @@ class AutomaticRouterArtifacts:
     """Immutable evidence, pricing, embeddings, and execution reservations."""
 
     observed_cells: tuple[ObservedProductionCell, ...]
+    attribution_input: ArtifactInput
     pricing: PricingSnapshot
     router_embeddings: ReservedFrozenEmbeddingSet
     router_embedding_input: ArtifactInput
@@ -56,6 +58,7 @@ def materialize_automatic_router_artifacts(
     preflight: AutomaticRouterPreflight,
     runtime_catalog: RuntimeModelCatalog,
     *,
+    attribution_input: ArtifactInput,
     router_embedding_maximum_attempts: int,
     completion_maximum_attempts: int,
     maximum_provider_cost_usd: float,
@@ -68,6 +71,7 @@ def materialize_automatic_router_artifacts(
         project: Existing project whose completed build is being optimized.
         preflight: Aggregate read-only prerequisite and reservation result.
         runtime_catalog: Credential-capable resolver over the just-persisted catalog.
+        attribution_input: Immutable real-overlap attribution persisted after consent.
         router_embedding_maximum_attempts: Active embedding retry ceiling.
         completion_maximum_attempts: Active completion retry ceiling.
         maximum_provider_cost_usd: Exact operator-approved shared provider ceiling.
@@ -93,10 +97,16 @@ def materialize_automatic_router_artifacts(
     ):
         raise ValueError("resolved embedder differs from the completed-build preflight")
 
-    observed_cells = _persist_observed_cells(project, preflight, created_at, code_revision)
+    observed_cells = _persist_observed_cells(
+        project,
+        preflight,
+        attribution_input,
+        created_at,
+        code_revision,
+    )
     pricing = persist_pricing_snapshot(
         project.artifacts,
-        preflight.candidate_prices,
+        _canonical_candidate_prices(preflight),
         created_at=created_at,
         code_revision=code_revision,
     )
@@ -148,6 +158,7 @@ def materialize_automatic_router_artifacts(
         preflight.setup_input,
         preflight.judge_audit_input,
         preflight.approved_calibration_input,
+        attribution_input,
         pricing_input,
         embedding_input,
         completion_input,
@@ -183,6 +194,7 @@ def materialize_automatic_router_artifacts(
     )
     return AutomaticRouterArtifacts(
         observed_cells=observed_cells,
+        attribution_input=attribution_input,
         pricing=pricing,
         router_embeddings=embeddings,
         router_embedding_input=embedding_input,
@@ -195,9 +207,31 @@ def materialize_automatic_router_artifacts(
     )
 
 
+def _canonical_candidate_prices(
+    preflight: AutomaticRouterPreflight,
+) -> tuple[CandidateTokenPrice, ...]:
+    """Align selected prices with the canonical candidate snapshot order.
+
+    Args:
+        preflight: Verified candidate snapshots and complete catalog-derived prices.
+
+    Returns:
+        Exact price rows ordered by canonical candidate alias.
+
+    Raises:
+        ValueError: Prices repeat, omit, or add a selected candidate alias.
+    """
+    prices = {item.candidate_alias: item for item in preflight.candidate_prices}
+    aliases = tuple(item.alias for item in preflight.candidates)
+    if len(prices) != len(preflight.candidate_prices) or set(prices) != set(aliases):
+        raise ValueError("candidate pricing differs from the canonical selected candidates")
+    return tuple(prices[alias] for alias in aliases)
+
+
 def _persist_observed_cells(
     project: ProjectStore,
     preflight: AutomaticRouterPreflight,
+    attribution_input: ArtifactInput,
     created_at: datetime,
     code_revision: str,
 ) -> tuple[ObservedProductionCell, ...]:
@@ -206,6 +240,7 @@ def _persist_observed_cells(
     Args:
         project: Project-local artifact store.
         preflight: Verified real task and trace overlaps.
+        attribution_input: Exact immutable attribution authorizing selected candidate snapshots.
         created_at: Artifact materialization time.
         code_revision: Exact producer revision.
 
@@ -221,6 +256,8 @@ def _persist_observed_cells(
             item.trace,
             created_at,
             code_revision,
+            attributed_candidate=item.attribution.candidate_model,
+            attribution_input=attribution_input,
         )
         cells.append(
             ObservedProductionCell(

@@ -1,5 +1,13 @@
 """Frozen, leakage-safe SFT datasets and managed offline Tinker SFT behavior."""
 
+from wmo.optimize.model.sft.automatic import (
+    AutomaticSFTPreparation,
+    AutomaticSFTPreparationError,
+    InitialSFTModelOptimizationSettings,
+    accept_runtime_sft_model_optimization,
+    prepare_runtime_sft_model_optimization,
+    require_completed_runtime_interactions,
+)
 from wmo.optimize.model.sft.builder import (
     SFTBuildError,
     SFTBuildSpec,
@@ -75,6 +83,9 @@ from wmo.optimize.model.sft.training import (
 
 __all__ = [
     "AssistantActionEvent",
+    "AutomaticSFTPreparation",
+    "AutomaticSFTPreparationError",
+    "InitialSFTModelOptimizationSettings",
     "CanonicalSFTTurn",
     "HumanApproval",
     "InfrastructureFailureEvent",
@@ -115,6 +126,7 @@ __all__ = [
     "TinkerTrainerSession",
     "ToolEvent",
     "TrainerBackend",
+    "accept_runtime_sft_model_optimization",
     "build_sft_dataset",
     "create_sft_model_optimization_config",
     "context_target_fingerprint",
@@ -123,6 +135,8 @@ __all__ = [
     "load_sft_model_optimization_config",
     "load_verified_sft_dataset",
     "parse_rendered_turn",
+    "prepare_runtime_sft_model_optimization",
+    "require_completed_runtime_interactions",
     "preflight_sft_model_optimization",
     "render_context_target",
     "resolve_runtime_source",
