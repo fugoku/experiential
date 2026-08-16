@@ -65,7 +65,9 @@ def test_created_and_released_records_are_fsynced(
     assert len(calls) == 2
 
 
-def test_release_marks_the_record_and_reports_a_fully_released_file(tmp_path: Path) -> None:
+def test_release_marks_held_ids_and_fully_released_state(tmp_path: Path) -> None:
+    """Release records drop held IDs and mark a file fully released without deleting it."""
+
     state_directory = tmp_path / "state"
     ledger = _ledger(state_directory)
     ledger.record_created(sandbox_id="ix1", template_id="tpl", trial_name="t1")
@@ -82,6 +84,7 @@ def test_release_marks_the_record_and_reports_a_fully_released_file(tmp_path: Pa
     [empty_file] = read_ledger_files(state_directory)
     assert empty_file.held == ()
     assert empty_file.fully_released is True
+    assert ledger.path.exists()
 
 
 def test_a_hard_kill_leaves_an_unreleased_record_and_a_torn_line_is_skipped(
