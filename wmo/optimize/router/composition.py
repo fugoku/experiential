@@ -280,7 +280,7 @@ def compose_router(
         task_input,
         setup,
         budget.maximum_simulation_cost_usd,
-        created_at,
+        plan.created_at,
         code_revision,
         fit_cells,
         phase="fit",
@@ -318,14 +318,14 @@ def compose_router(
         pricing_snapshot_id=setup.pricing_snapshot_id,
         guard=setup.guard,
         judgment_status=setup.judgment_status,
-        created_at=created_at,
+        created_at=plan.created_at,
         code_revision=code_revision,
     )
     fit, policy_lock = _fit_and_lock_once(
         project,
         plan_input,
         fit_config,
-        created_at,
+        plan.created_at,
         code_revision,
     )
     _phase(phase_hook, "policy_locked")
@@ -338,7 +338,7 @@ def compose_router(
         task_input,
         setup,
         remaining_cost_usd,
-        created_at,
+        plan.created_at,
         code_revision,
         held_cells,
         phase="heldout",
@@ -368,7 +368,7 @@ def compose_router(
                 cell_evidence=held_evidence,
             ),
             embedding_set_id=setup.embedding_set_id,
-            created_at=created_at,
+            created_at=plan.created_at,
             code_revision=code_revision,
         ),
     )
