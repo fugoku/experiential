@@ -22,7 +22,10 @@ from wmo.optimize.router.automatic.preflight import (
     preflight_automatic_router,
 )
 from wmo.optimize.router.automatic.replay import find_completed_automatic_router_replay
-from wmo.optimize.router.automatic.service import optimize_project_router
+from wmo.optimize.router.automatic.service import (
+    optimize_project_router,
+    persist_router_candidate_setup,
+)
 from wmo.runtime.models import RuntimeModelCatalog
 
 _console = Console()
@@ -34,7 +37,9 @@ _CANDIDATE_OPTION = typer.Option(
 _CANDIDATE_MODEL_OPTION = typer.Option(
     None,
     "--candidate-model",
-    help="Repeat a complete ProviderModelSelection JSON object for a new candidate alias.",
+    help=(
+        "Advanced: repeat a complete ProviderModelSelection JSON object for a new candidate alias."
+    ),
 )
 
 
@@ -75,7 +80,7 @@ def router(
         project: Local project ID below ``<root>/projects``.
         root: Local ``.wmo`` root containing the project and shared model catalog.
         candidate: Repeatable explicit completion candidate aliases.
-        candidate_model: Repeatable complete JSON definitions for new candidate aliases.
+        candidate_model: Advanced repeatable JSON definitions for new candidate aliases.
         incumbent: Explicit quality incumbent among the selected candidates.
         maximum_provider_cost_usd: Shared ceiling for all optimization provider calls.
         maximum_judgments: Maximum rollout judgments admitted by composition.
@@ -119,6 +124,7 @@ def router(
             incumbent=incumbent,
             non_interactive=effective_noninteractive,
             console=_console,
+            interactive_command=f"wmo optimize router {project} --root {root}",
         )
         preflight = preflight_automatic_router(
             store,
@@ -146,6 +152,10 @@ def router(
             ),
             non_interactive=effective_noninteractive,
         )
+        with usage_error(OSError, ValueError):
+            configured_catalog = persist_router_candidate_setup(store, candidate_plan)
+            if configured_catalog != candidate_plan.prospective_catalog:
+                raise ValueError("persisted router candidate catalog differs from confirmation")
         _console.print("replay: verified completed optimization")
         _console.print(f"policy: {replay.policy_id}")
         _console.print(f"report: {replay.report_id}")
