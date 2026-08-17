@@ -1019,8 +1019,6 @@ def _installed_release_driver() -> None:
             "0.000001",
             "--maximum-judgments",
             "100",
-            "--preferred-fidelity-overlaps",
-            "2",
             "--maximum-model-calls",
             "1",
             "--simulation-maximum-output-tokens",
@@ -1028,7 +1026,6 @@ def _installed_release_driver() -> None:
             "--maximum-concurrency",
             "1",
             "--yes",
-            "--approve-fidelity",
         ]
         optimization_output = run_tty(
             optimize_arguments,
@@ -1058,7 +1055,7 @@ def _installed_release_driver() -> None:
         optimized_review = support_store.paths.review_json.read_bytes()
         optimized_provider_requests = state.snapshot()
         replay_result = run_cli(
-            *optimize_arguments[:-2],
+            *optimize_arguments[:-1],
             "--non-interactive",
         )
         assert "replay: verified completed optimization" in replay_result.stdout
