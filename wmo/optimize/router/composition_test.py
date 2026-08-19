@@ -64,6 +64,7 @@ from wmo.optimize.router.composition import (
     RouterCompositionBudget,
     RouterCompositionError,
     RouterEvaluationSetup,
+    RouterReviewProvenance,
     RouterWorkflowServices,
     compose_router,
 )
@@ -357,7 +358,7 @@ class _SetupSupplier:
         self,
         project: ProjectStore,
         build: ProjectBuild,
-        review: ApprovedRouterReview,
+        review: RouterReviewProvenance,
         budget: RouterCompositionBudget,
     ) -> RouterEvaluationSetup:
         """Persist reviewed evaluation inputs bound to the selected completed build.
@@ -490,7 +491,7 @@ class _ReservedSetupSupplier(_SetupSupplier):
         self,
         project: ProjectStore,
         build: ProjectBuild,
-        review: ApprovedRouterReview,
+        review: RouterReviewProvenance,
         budget: RouterCompositionBudget,
     ) -> RouterEvaluationSetup:
         """Persist the reviewed two-candidate setup and its frozen completion reservations.
@@ -551,7 +552,7 @@ class _MismatchedSetupSupplier(_SetupSupplier):
         self,
         project: ProjectStore,
         build: ProjectBuild,
-        review: ApprovedRouterReview,
+        review: RouterReviewProvenance,
         budget: RouterCompositionBudget,
     ) -> RouterEvaluationSetup:
         """Replace the valid setup fit pointer with an unrelated immutable pointer.
@@ -1042,6 +1043,8 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
     )
 
     assert second.optimization == first.optimization
+    assert first.simulation_spec.created_at == first.plan.created_at
+    assert second.simulation_spec == first.simulation_spec
     assert completed_build.fit_rag in first.simulation_spec.inputs
     assert completed_build.fit_rag in first.held_out_simulation_spec.inputs
     assert first.held_out_simulation_spec.maximum_cost_usd == pytest.approx(
@@ -1108,13 +1111,13 @@ def test_public_composition_runs_and_resumes_complete_frozen_router(
     def exact_cap_spend(
         phase_project: ProjectStore,
         artifact_set: SimulationArtifactSet,
-        phase_setup: RouterEvaluationSetup,
+        completion_contract_input: ArtifactInput | None,
     ) -> float:
         """Return spend that exactly exhausts the admitted phase budget."""
-        del phase_project, artifact_set, phase_setup
+        del phase_project, artifact_set, completion_contract_input
         return 1.0
 
-    monkeypatch.setattr(workflow_module, "_verified_simulation_spend", exact_cap_spend)
+    monkeypatch.setattr(workflow_module, "verified_simulation_spend", exact_cap_spend)
     with pytest.raises(RouterCompositionError, match="reached the shared ceiling"):
         compose_router(
             project,

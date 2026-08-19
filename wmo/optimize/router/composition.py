@@ -9,7 +9,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Literal, Protocol
+from typing import Annotated, Literal, Protocol
 
 from pydantic import Field, field_validator
 
@@ -32,7 +32,7 @@ from wmo.common.evaluations import (
 from wmo.common.evaluations.evidence import (
     read_rollout,
 )
-from wmo.common.judging import Judge
+from wmo.common.judging import Judge, verify_persisted_calibration
 from wmo.common.models import (
     ModelCatalog,
     ProviderConnection,
@@ -47,7 +47,6 @@ from wmo.common.project import (
     artifact_input,
 )
 from wmo.common.rollouts import (
-    RolloutArtifact,
     SimulationArtifactSet,
 )
 from wmo.common.routing import KnnGuard, KnnRouterPolicy
@@ -60,7 +59,7 @@ from wmo.optimize.router.evaluation.build import (
 )
 from wmo.optimize.router.evaluation.setup import verify_router_evaluation_setup
 from wmo.optimize.router.evaluation.simulation_spec import build_router_simulation_spec
-from wmo.optimize.router.evaluation.spend import observed_rollout_spend
+from wmo.optimize.router.evaluation.spend import verified_simulation_spend
 from wmo.optimize.router.fit.spec import RouterFitResult
 from wmo.optimize.router.fit.workflow import (
     EvaluationInputs,
@@ -75,14 +74,10 @@ from wmo.optimize.router.judgment_budget import complete_cell_evidence
 from wmo.runtime.models import RuntimeModelCatalog
 from wmo.runtime.router import RouterRuntime
 from wmo.simulation.build import ProjectBuild
-from wmo.simulation.engines.text.bindings import rollout_id_for_binding
-from wmo.simulation.engines.text.errors import SimulationConfigurationError
-from wmo.simulation.engines.text.grounding import load_completion_contract
 from wmo.simulation.engines.text.resume import (
     MAXIMUM_CELL_ATTEMPTS,
     reexecutable_dispatch_failure,
 )
-from wmo.simulation.engines.text.rollout_support import rollout_spend
 from wmo.simulation.ingest.otlp import TraceNormalizationResult
 from wmo.simulation.orchestration import Simulator
 from wmo.simulation.specs import SimulationSpec, WorldModelSettings, simulation_spec_digest
@@ -133,8 +128,38 @@ class RouterCandidateSetupPlan:
 class ApprovedRouterReview(ContractModel):
     """Explicit approved rubric and eligible calibration artifact identities."""
 
+    judgment_status: Literal["human_calibrated"] = "human_calibrated"
     rubric_id: ArtifactId
     calibration_id: ArtifactId
+    calibration_input: ArtifactInput | None = None
+    audit_input: ArtifactInput | None = None
+
+    @property
+    def artifact_inputs(self) -> tuple[ArtifactInput, ...]:
+        """Return exact approved provenance inputs available to composition."""
+        return tuple(
+            item for item in (self.audit_input, self.calibration_input) if item is not None
+        )
+
+
+class ProvisionalRouterReview(ContractModel):
+    """Explicit zero-label calibration provenance eligible only for provisional routing."""
+
+    judgment_status: Literal["provisional"] = "provisional"
+    rubric_id: ArtifactId
+    calibration_id: ArtifactId
+    calibration_input: ArtifactInput
+
+    @property
+    def artifact_inputs(self) -> tuple[ArtifactInput, ...]:
+        """Return the exact provisional calibration input bound into evaluation evidence."""
+        return (self.calibration_input,)
+
+
+RouterReviewProvenance = Annotated[
+    ApprovedRouterReview | ProvisionalRouterReview,
+    Field(discriminator="judgment_status"),
+]
 
 
 class RouterEvaluationSetup(ContractModel):
@@ -166,7 +191,7 @@ class ReviewSupplier(Protocol):
         project: ProjectStore,
         build: ProjectBuild,
         budget: RouterCompositionBudget,
-    ) -> ApprovedRouterReview:
+    ) -> RouterReviewProvenance:
         """Return manifest-persisted review artifacts."""
 
 
@@ -177,7 +202,7 @@ class EvaluationSetupSupplier(Protocol):
         self,
         project: ProjectStore,
         build: ProjectBuild,
-        review: ApprovedRouterReview,
+        review: RouterReviewProvenance,
         budget: RouterCompositionBudget,
     ) -> RouterEvaluationSetup:
         """Return explicit immutable planning inputs and finite simulation controls."""
@@ -218,7 +243,7 @@ class RouterCompositionResult:
     """Complete local artifact chain and loaded frozen online runtime."""
 
     build: ProjectBuild
-    review: ApprovedRouterReview
+    review: RouterReviewProvenance
     plan: EvaluationPlan
     simulation_spec: SimulationSpec
     held_out_simulation_spec: SimulationSpec
@@ -277,6 +302,10 @@ def compose_router(
     review = services.review_supplier(project, built, budget)
     _verify_review(project, review)
     setup = services.setup_supplier(project, built, review, budget)
+    if review.calibration_input is not None and setup.judgment_status != review.judgment_status:
+        raise RouterCompositionError(
+            "router evaluation judgment status differs from its calibration provenance"
+        )
     verify_router_evaluation_setup(
         completed=completed_build,
         fit_rag_input=setup.fit_rag_input,
@@ -293,12 +322,16 @@ def compose_router(
         candidate_snapshots=setup.candidates,
         pricing_snapshot_id=setup.pricing_snapshot_id,
         observed_cells=setup.observed_cells,
-        additional_inputs=services.evaluation_plan_inputs,
+        additional_inputs=sorted_unique_inputs(
+            *services.evaluation_plan_inputs,
+            *review.artifact_inputs,
+        ),
         created_at=created_at,
         code_revision=code_revision,
     )
     plan_input = artifact_input(project.artifacts.read(plan.plan_id).manifest)
     task_input = built.review.task_set
+    artifact_time = plan.created_at
     _phase(phase_hook, "fit_started")
     fit_cells = tuple(cell for cell in plan.cells if cell.purpose == "fit")
     spec = build_router_simulation_spec(
@@ -307,7 +340,7 @@ def compose_router(
         task_input,
         setup,
         budget.maximum_simulation_cost_usd,
-        plan.created_at,
+        artifact_time,
         code_revision,
         fit_cells,
         phase="fit",
@@ -321,7 +354,7 @@ def compose_router(
         progress=progress,
         progress_detail="fit",
     )
-    fit_spend = _verified_simulation_spend(project, fit_set, setup)
+    fit_spend = verified_simulation_spend(project, fit_set, setup.simulation_completion_input)
     if fit_spend > budget.maximum_simulation_cost_usd:
         _spend_ceiling_crossed(
             budget.stop_on_overspend,
@@ -368,7 +401,7 @@ def compose_router(
         pricing_snapshot_id=setup.pricing_snapshot_id,
         guard=setup.guard,
         judgment_status=setup.judgment_status,
-        created_at=plan.created_at,
+        created_at=artifact_time,
         code_revision=code_revision,
     )
     report(progress, "fitting")
@@ -376,7 +409,7 @@ def compose_router(
         project,
         plan_input,
         fit_config,
-        plan.created_at,
+        artifact_time,
         code_revision,
     )
     _phase(phase_hook, "policy_locked")
@@ -391,7 +424,7 @@ def compose_router(
         task_input,
         setup,
         remaining_cost_usd if budget.stop_on_overspend else budget.maximum_simulation_cost_usd,
-        plan.created_at,
+        artifact_time,
         code_revision,
         held_cells,
         phase="heldout",
@@ -405,7 +438,7 @@ def compose_router(
         progress=progress,
         progress_detail="held-out",
     )
-    held_out_spend = _verified_simulation_spend(project, held_set, setup)
+    held_out_spend = verified_simulation_spend(project, held_set, setup.simulation_completion_input)
     if math.fsum((fit_spend, held_out_spend)) > budget.maximum_simulation_cost_usd:
         _spend_ceiling_crossed(
             budget.stop_on_overspend,
@@ -441,7 +474,7 @@ def compose_router(
                 cell_evidence=held_evidence,
             ),
             embedding_set_id=setup.embedding_set_id,
-            created_at=plan.created_at,
+            created_at=artifact_time,
             code_revision=code_revision,
         ),
     )
@@ -601,86 +634,6 @@ def _reexecutable_cell_count(
     )
 
 
-def _verified_simulation_spend(
-    project: ProjectStore,
-    expected: SimulationArtifactSet,
-    setup: RouterEvaluationSetup,
-) -> float:
-    """Recompute one phase's spend from verified immutable rollouts.
-
-    Args:
-        project: Project store containing the completed simulation artifacts.
-        expected: Exact artifact set returned for the simulation phase.
-
-    Returns:
-        Finite total of candidate, world-model, and retrieval dispatch spend.
-
-    Raises:
-        RouterCompositionError: The set, index, rollout, or economics cannot be verified.
-    """
-    stored = project.artifacts.read(expected.artifact_set_id)
-    if stored.manifest.artifact_type != "simulation-artifact-set":
-        raise RouterCompositionError("simulation spend source has the wrong artifact type")
-    artifact_set = SimulationArtifactSet.model_validate_json(
-        project.artifacts.read_bytes(expected.artifact_set_id, "artifact-set.json")
-    )
-    if artifact_set != expected:
-        raise RouterCompositionError("simulation spend source differs from its completed set")
-    index_payload = project.artifacts.read_bytes(
-        expected.artifact_set_id, artifact_set.artifacts_path
-    )
-    if hashlib.sha256(index_payload).hexdigest() != artifact_set.artifacts_sha256:
-        raise RouterCompositionError("simulation spend index digest has drifted")
-    values: list[float] = []
-    for rollout_id in artifact_set.artifact_ids:
-        rollout = read_rollout(project.artifacts, rollout_id)[0]
-        values.append(observed_rollout_spend(rollout))
-        values.extend(_superseded_attempt_spend(project, rollout, setup))
-    return math.fsum(values)
-
-
-def _superseded_attempt_spend(
-    project: ProjectStore,
-    rollout: RolloutArtifact,
-    setup: RouterEvaluationSetup,
-) -> tuple[float, ...]:
-    """Return conservative charges for every superseded retry attempt behind one rollout.
-
-    Args:
-        project: Project store containing the immutable prior-attempt artifacts.
-        rollout: Final rollout selected for its cell, possibly after retries.
-        setup: Reviewed evaluation setup naming the completion reservation contract.
-
-    Returns:
-        One worst-case charge per superseded attempt, so retried dispatches with unknown
-        spend still count against the phase ceiling.
-
-    Raises:
-        RouterCompositionError: A superseded attempt cannot be reconciled conservatively.
-    """
-    if rollout.retry_attempt == 0:
-        return ()
-    binding = rollout.simulation_binding
-    if binding is None:
-        raise RouterCompositionError("retried simulation rollout lacks its cell binding")
-    try:
-        load_completion_contract(project.artifacts, setup.simulation_completion_input)
-    except SimulationConfigurationError as exc:
-        raise RouterCompositionError(str(exc)) from exc
-    charges = []
-    for attempt in range(rollout.retry_attempt):
-        prior, _input = read_rollout(
-            project.artifacts, rollout_id_for_binding(binding, attempt=attempt)
-        )
-        spend = rollout_spend(prior)
-        if spend is None:
-            raise RouterCompositionError(
-                "superseded simulation attempt spend cannot be reconciled conservatively"
-            )
-        charges.append(spend)
-    return tuple(charges)
-
-
 def _fit_and_lock_once(
     project: ProjectStore,
     plan_input: ArtifactInput,
@@ -779,12 +732,25 @@ def _preflight(
         raise RouterCompositionError("all workflow services must be injected explicitly")
 
 
-def _verify_review(project: ProjectStore, review: ApprovedRouterReview) -> None:
-    """Require exact persisted rubric and calibration artifact kinds before simulation."""
+def _verify_review(project: ProjectStore, review: RouterReviewProvenance) -> None:
+    """Require persisted artifacts and exact typed calibration eligibility before simulation."""
     expected = ((review.rubric_id, "rubric"), (review.calibration_id, "judge-calibration"))
     for artifact_id, artifact_type in expected:
         if project.artifacts.read(artifact_id).manifest.artifact_type != artifact_type:
             raise RouterCompositionError(f"{artifact_id} is not a completed {artifact_type}")
+    if review.calibration_input is None:
+        if review.judgment_status == "provisional":
+            raise RouterCompositionError("provisional review requires an exact calibration input")
+        return
+    calibration, calibration_input = verify_persisted_calibration(project, review.calibration_id)
+    if (
+        calibration_input != review.calibration_input
+        or calibration.status != review.judgment_status
+        or calibration.rubric_id != review.rubric_id
+    ):
+        raise RouterCompositionError(
+            "router review differs from its persisted calibration status or rubric"
+        )
 
 
 def _phase(hook: Callable[[str], None] | None, phase: str) -> None:
