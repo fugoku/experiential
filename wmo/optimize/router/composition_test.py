@@ -380,7 +380,11 @@ class _SetupSupplier:
             )
         if "pricing-a" not in project.artifacts.list_ids():
             _persist_pricing(project.artifacts)
-            _persist_embeddings(project.artifacts, tasks)
+        embedding_set_id = _persist_embeddings(
+            project.artifacts,
+            tasks,
+            completed.task_set,
+        )
         production = EvaluationProtocol(
             protocol_id="protocol-production",
             evidence_source="production",
@@ -406,7 +410,7 @@ class _SetupSupplier:
             observed_cells=tuple(observed),
             production_protocol=production,
             simulation_protocol=world,
-            embedding_set_id="embeddings-a",
+            embedding_set_id=embedding_set_id,
             fit_rag_input=completed.fit_rag,
             pricing_snapshot_id="pricing-a",
             incumbent_alias="candidate-a",
@@ -612,6 +616,8 @@ class _Judge:
                     dimension_id="dimension-a",
                     raw_score=4,
                     calibrated_score=4.0,
+                    min_score=0,
+                    max_score=5,
                     rationale="Deterministic workflow score.",
                 ),
             ),
