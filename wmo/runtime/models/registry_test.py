@@ -243,6 +243,46 @@ def test_resolution_rejects_unsupported_connection_and_incomplete_compatible_url
         compatible.resolve("fixture-model")
 
 
+@pytest.mark.parametrize(
+    ("provider", "base_url"),
+    [
+        ("openai", None),
+        ("openai-compatible", "https://models.example.test/v1"),
+        ("azure", "https://resource.example.test"),
+    ],
+)
+def test_resolution_threads_catalog_served_model_pin_to_every_http_provider(
+    provider: str,
+    base_url: str | None,
+) -> None:
+    """A cataloged served-model pin reaches the resolved identity for each HTTP provider.
+
+    Args:
+        provider: Catalog connection provider under test.
+        base_url: Explicit endpoint for providers that require one.
+    """
+    pinned = RuntimeModelCatalog(
+        _catalog(
+            provider=provider,
+            base_url=base_url,
+            api_version="v1" if provider == "azure" else None,
+            served_model_id="fixture-model-served",
+        ),
+        environment={"FIXTURE_API_KEY": "fixture-key"},
+        transport_factory=ScriptedJsonTransport,
+    )
+    unpinned = RuntimeModelCatalog(
+        _catalog(
+            provider=provider, base_url=base_url, api_version="v1" if provider == "azure" else None
+        ),
+        environment={"FIXTURE_API_KEY": "fixture-key"},
+        transport_factory=ScriptedJsonTransport,
+    )
+
+    assert pinned.resolve("fixture-model").served_model_id == "fixture-model-served"
+    assert unpinned.resolve("fixture-model").served_model_id is None
+
+
 def test_resolution_carries_the_cataloged_served_model_identity() -> None:
     """An openai-compatible alias exposes its declared served identity for response checks.
 
