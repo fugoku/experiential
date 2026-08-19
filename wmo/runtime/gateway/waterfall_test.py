@@ -33,6 +33,7 @@ from wmo.runtime.gateway.contracts import (
     GatewayMessage,
     GatewayRequest,
     GatewayTarget,
+    GatewayUsage,
     ProjectSelection,
     ProjectTarget,
 )
@@ -165,6 +166,52 @@ def test_circuit_identity_is_catalog_and_connection_scoped() -> None:
     health.succeeded(second)
     now[0] += 11
     assert health.claim(first)
+
+
+def test_provider_auth_failover_opens_skips_and_recovers_the_primary() -> None:
+    """Provider authentication failover opens one circuit and later probes recovery."""
+    now = [100.0]
+    first = _deployment("route-a", connection_sha256="b" * 64)
+    second = _deployment("route-b", connection_sha256="c" * 64)
+    first_provider = _ScriptedProvider(
+        [
+            ProviderTransportError("provider rejected credentials", status_code=401),
+            _completed_stream("primary recovered"),
+        ]
+    )
+    second_provider = _ScriptedProvider(
+        [_completed_stream("fallback one"), _completed_stream("fallback two")]
+    )
+    health = DeploymentHealthRegistry(
+        failure_threshold=1,
+        open_seconds=10,
+        throttle_seconds=5,
+        clock=lambda: now[0],
+    )
+    executor = _executor(
+        (first, second),
+        {
+            first.source_alias: first_provider,
+            second.source_alias: second_provider,
+        },
+        _WaterfallLedger(),
+        maximum_same_deployment_attempts=1,
+        health=health,
+    )
+
+    async def consume() -> str:
+        """Run one logical request and return its sole text delta."""
+        stream = await executor.start(route=_route((first, second)), request=_request())
+        events = [event async for event in stream]
+        return "".join(event.text_delta or "" for event in events)
+
+    assert asyncio.run(consume()) == "fallback one"
+    assert asyncio.run(consume()) == "fallback two"
+    assert len(first_provider.idempotency_keys) == 1
+    now[0] += 11
+    assert asyncio.run(consume()) == "primary recovered"
+    assert len(first_provider.idempotency_keys) == 2
+    assert len(second_provider.idempotency_keys) == 2
 
 
 def test_throttle_window_recovers_without_opening_the_failure_circuit() -> None:
@@ -344,25 +391,33 @@ def test_first_semantic_event_freezes_route_even_when_provider_later_fails() -> 
 
 
 def test_refusal_failover_requires_opt_in_and_withholds_the_failed_route() -> None:
-    """A typed precommit refusal advances only for an explicitly allowed alias revision."""
+    """A provider refusal stream advances only for an explicitly allowed alias revision."""
 
-    async def scenario(*, opted_in: bool) -> tuple[list[GatewayEvent], int]:
+    async def scenario(*, opted_in: bool) -> tuple[list[GatewayEvent], int, _WaterfallLedger]:
         """Run one refusal with or without the injected revision policy."""
         first = _deployment("route-a", connection_sha256="b" * 64)
         second = _deployment("route-b", connection_sha256="c" * 64)
-        refusal = GatewayFailure(
-            failure_class=GatewayFailureClass.REFUSAL,
-            safe_message="provider refused the request",
-            safe_details={"signal": "safety"},
-        )
         first_provider = _ScriptedProvider(
             [
                 _WaterfallStream(
                     (
                         GatewayEvent(
-                            kind=GatewayEventKind.FAILED,
+                            kind=GatewayEventKind.REFUSAL_DELTA,
                             sequence_number=0,
-                            failure=refusal,
+                            text_delta="provider refusal body",
+                        ),
+                        GatewayEvent(
+                            kind=GatewayEventKind.USAGE,
+                            sequence_number=1,
+                            usage=GatewayUsage(input_tokens=5, output_tokens=2),
+                        ),
+                        GatewayEvent(
+                            kind=GatewayEventKind.FAILED,
+                            sequence_number=2,
+                            failure=GatewayFailure(
+                                failure_class=GatewayFailureClass.REFUSAL,
+                                safe_message="provider refused the request",
+                            ),
                         ),
                     )
                 )
@@ -385,12 +440,16 @@ def test_refusal_failover_requires_opt_in_and_withholds_the_failed_route() -> No
             request=_request(),
         )
         events = [event async for event in stream]
-        return events, len(second_provider.idempotency_keys)
+        return events, len(second_provider.idempotency_keys), ledger
 
-    default_events, default_fallbacks = asyncio.run(scenario(opted_in=False))
-    opted_events, opted_fallbacks = asyncio.run(scenario(opted_in=True))
+    default_events, default_fallbacks, default_ledger = asyncio.run(scenario(opted_in=False))
+    opted_events, opted_fallbacks, opted_ledger = asyncio.run(scenario(opted_in=True))
 
-    assert [event.kind for event in default_events] == [GatewayEventKind.FAILED]
+    assert [event.kind for event in default_events] == [
+        GatewayEventKind.REFUSAL_DELTA,
+        GatewayEventKind.USAGE,
+        GatewayEventKind.COMPLETED,
+    ]
     assert default_fallbacks == 0
     assert [event.kind for event in opted_events] == [
         GatewayEventKind.TEXT_DELTA,
@@ -398,6 +457,226 @@ def test_refusal_failover_requires_opt_in_and_withholds_the_failed_route() -> No
     ]
     assert all(event.kind is not GatewayEventKind.REFUSAL_DELTA for event in opted_events)
     assert opted_fallbacks == 1
+    default_failure = default_ledger.finished[0][1]
+    assert default_failure is not None
+    assert default_failure.failure_class is GatewayFailureClass.REFUSAL
+    assert default_ledger.finished_events[0] is not None
+    assert default_ledger.finished_events[0].kind is GatewayEventKind.FAILED
+    opted_failure = opted_ledger.finished[0][1]
+    assert opted_failure is not None
+    assert opted_failure.failure_class is GatewayFailureClass.REFUSAL
+    assert opted_ledger.finished[0][2] is False
+    assert opted_ledger.finished_events[0] is not None
+    assert opted_ledger.finished_events[0].usage == GatewayUsage(input_tokens=5, output_tokens=2)
+
+
+def test_buffered_refusal_followed_by_retryable_failure_advances_without_exposure() -> None:
+    """An opted-in uncommitted refusal does not block another safe failure class."""
+
+    async def scenario() -> None:
+        """Fail the refusing primary before commitment and complete on the secondary."""
+        first = _deployment("route-a", connection_sha256="b" * 64)
+        second = _deployment("route-b", connection_sha256="c" * 64)
+        failure = GatewayFailure(
+            failure_class=GatewayFailureClass.TRANSPORT,
+            safe_message="provider transport failed",
+            failover_eligible=True,
+        )
+        first_provider = _ScriptedProvider(
+            [
+                _WaterfallStream(
+                    (
+                        GatewayEvent(
+                            kind=GatewayEventKind.REFUSAL_DELTA,
+                            sequence_number=0,
+                            text_delta="private refusal detail",
+                        ),
+                        GatewayEvent(
+                            kind=GatewayEventKind.FAILED,
+                            sequence_number=1,
+                            failure=failure,
+                        ),
+                    )
+                )
+            ]
+        )
+        second_provider = _ScriptedProvider([_completed_stream("safe fallback")])
+        ledger = _WaterfallLedger()
+        executor = _executor(
+            (first, second),
+            {
+                first.source_alias: first_provider,
+                second.source_alias: second_provider,
+            },
+            ledger,
+            maximum_same_deployment_attempts=1,
+        )
+
+        stream = await executor.start(
+            route=_route((first, second), refusal_failover=True),
+            request=_request(),
+        )
+        events = [event async for event in stream]
+
+        assert [event.kind for event in events] == [
+            GatewayEventKind.TEXT_DELTA,
+            GatewayEventKind.COMPLETED,
+        ]
+        assert events[0].text_delta == "safe fallback"
+        assert all(event.text_delta != "private refusal detail" for event in events)
+        assert len(second_provider.idempotency_keys) == 1
+        assert ledger.finished[0][1] == failure
+        assert ledger.finished[0][2] is False
+        assert ledger.finished[1][1] is None
+        assert ledger.finished[1][2] is True
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "refusals",
+    [
+        ("r" * 65_536,),
+        ("a" * 32_768, "b" * 32_768),
+        tuple("" for _index in range(256)),
+    ],
+)
+def test_refusal_buffer_accepts_exact_byte_and_event_bounds(
+    refusals: tuple[str, ...],
+) -> None:
+    """Exact refusal bounds remain precommit and can advance without exposure."""
+
+    async def scenario() -> tuple[list[GatewayEvent], int]:
+        """Complete one exactly bounded refusal-only route and its fallback."""
+        first = _deployment("route-a", connection_sha256="b" * 64)
+        second = _deployment("route-b", connection_sha256="c" * 64)
+        first_events = tuple(
+            GatewayEvent(
+                kind=GatewayEventKind.REFUSAL_DELTA,
+                sequence_number=index,
+                text_delta=text,
+            )
+            for index, text in enumerate(refusals)
+        ) + (
+            GatewayEvent(
+                kind=GatewayEventKind.USAGE,
+                sequence_number=len(refusals),
+                usage=GatewayUsage(input_tokens=5, output_tokens=2),
+            ),
+            GatewayEvent(
+                kind=GatewayEventKind.COMPLETED,
+                sequence_number=len(refusals) + 1,
+            ),
+        )
+        second_provider = _ScriptedProvider([_completed_stream("bounded fallback")])
+        executor = _executor(
+            (first, second),
+            {
+                first.source_alias: _ScriptedProvider([_WaterfallStream(first_events)]),
+                second.source_alias: second_provider,
+            },
+            _WaterfallLedger(),
+            maximum_same_deployment_attempts=1,
+        )
+        stream = await executor.start(
+            route=_route((first, second), refusal_failover=True),
+            request=_request(),
+        )
+        return [event async for event in stream], len(second_provider.idempotency_keys)
+
+    events, fallback_count = asyncio.run(scenario())
+
+    assert [event.kind for event in events] == [
+        GatewayEventKind.TEXT_DELTA,
+        GatewayEventKind.COMPLETED,
+    ]
+    assert events[0].text_delta == "bounded fallback"
+    assert fallback_count == 1
+
+
+@pytest.mark.parametrize(
+    "first_events",
+    [
+        (
+            GatewayEvent(
+                kind=GatewayEventKind.REFUSAL_DELTA,
+                sequence_number=0,
+                text_delta="r" * 70_000,
+            ),
+            GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=1),
+        ),
+        (
+            GatewayEvent(
+                kind=GatewayEventKind.REFUSAL_DELTA,
+                sequence_number=0,
+                text_delta="a" * 32_768,
+            ),
+            GatewayEvent(
+                kind=GatewayEventKind.REFUSAL_DELTA,
+                sequence_number=1,
+                text_delta="b" * 32_769,
+            ),
+            GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=2),
+        ),
+        (
+            GatewayEvent(
+                kind=GatewayEventKind.REFUSAL_DELTA,
+                sequence_number=0,
+                text_delta="refused",
+            ),
+            GatewayEvent(
+                kind=GatewayEventKind.TEXT_DELTA,
+                sequence_number=1,
+                text_delta="mixed output",
+            ),
+            GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=2),
+        ),
+        tuple(
+            GatewayEvent(
+                kind=GatewayEventKind.REFUSAL_DELTA,
+                sequence_number=index,
+                text_delta="",
+            )
+            for index in range(257)
+        )
+        + (GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=257),),
+    ],
+)
+def test_refusal_buffer_overflow_or_mixed_output_commits_without_failover(
+    first_events: tuple[GatewayEvent, ...],
+) -> None:
+    """A bounded refusal buffer flushes safely before semantic output can switch routes."""
+
+    async def scenario() -> tuple[list[GatewayEvent], int]:
+        """Consume one overflow or mixed-semantic provider stream."""
+        first = _deployment("route-a", connection_sha256="b" * 64)
+        second = _deployment("route-b", connection_sha256="c" * 64)
+        first_provider = _ScriptedProvider([_WaterfallStream(first_events)])
+        second_provider = _ScriptedProvider([_completed_stream("must not run")])
+        executor = _executor(
+            (first, second),
+            {
+                first.source_alias: first_provider,
+                second.source_alias: second_provider,
+            },
+            _WaterfallLedger(),
+            maximum_same_deployment_attempts=1,
+        )
+        stream = await executor.start(
+            route=_route((first, second), refusal_failover=True),
+            request=_request(),
+        )
+        return [event async for event in stream], len(second_provider.idempotency_keys)
+
+    events, fallback_count = asyncio.run(scenario())
+
+    assert [event.kind for event in events] == [event.kind for event in first_events]
+    assert [
+        event.text_delta for event in events if event.kind is GatewayEventKind.REFUSAL_DELTA
+    ] == [
+        event.text_delta for event in first_events if event.kind is GatewayEventKind.REFUSAL_DELTA
+    ]
+    assert fallback_count == 0
 
 
 def test_deadline_between_attempts_finalizes_parent_and_releases_claims(
@@ -629,6 +908,7 @@ class _WaterfallLedger:
         """Initialize empty ordered accounting records."""
         self.started: list[tuple[str, int, int]] = []
         self.finished: list[tuple[str, GatewayFailure | None, bool]] = []
+        self.finished_events: list[GatewayEvent | None] = []
         self.parent_finishes: list[GatewayFailure] = []
 
     def accept_request(self, *, authorization: AuthorizationSnapshot) -> None:
@@ -667,7 +947,7 @@ class _WaterfallLedger:
         finalize_request: bool = True,
     ) -> None:
         """Record physical settlement and whether it owns parent terminalization."""
-        del terminal_event
+        self.finished_events.append(terminal_event)
         self.finished.append((attempt_id, failure, finalize_request))
 
     def finish_request(

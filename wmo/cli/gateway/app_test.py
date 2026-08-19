@@ -17,6 +17,7 @@ from click import unstyle
 from typer.testing import CliRunner
 
 from wmo.cli.app import app
+from wmo.cli.gateway import app as gateway_cli_app
 from wmo.cli.gateway import key_output as gateway_key_output
 from wmo.common.core.artifacts import sha256_json
 from wmo.common.models import (
@@ -32,6 +33,40 @@ from wmo.runtime.gateway.sqlite import key_delivery
 from wmo.runtime.gateway.sqlite.alias_activation import AliasActivationOutcomeUnknownError
 from wmo.runtime.gateway.sqlite.provider_authority import ProviderConnectionBinding
 from wmo.runtime.gateway.sqlite.store import OperationOutcomeUnknownError, SQLiteGatewayStore
+
+EXPECTED_GATEWAY_COMMANDS = {"init", "status", "usage"}
+EXPECTED_GATEWAY_GROUPS = {
+    "alias": {"create", "disable", "list", "update"},
+    "grant": {"add", "list", "remove"},
+    "identity": {"create", "disable", "list", "update"},
+    "key": {"issue", "list", "revoke"},
+    "pool": {"certify"},
+    "provider": {"add", "disable", "list", "remove", "update"},
+}
+
+
+def test_gateway_help_tree_is_exact_and_every_node_renders() -> None:
+    """Lock every public gateway command and prove its installed help path."""
+    direct = {command.name for command in gateway_cli_app.gateway_app.registered_commands}
+    groups: dict[str | None, set[str | None]] = {}
+    for group in gateway_cli_app.gateway_app.registered_groups:
+        assert group.typer_instance is not None
+        groups[group.name] = {command.name for command in group.typer_instance.registered_commands}
+    assert direct == EXPECTED_GATEWAY_COMMANDS
+    assert groups == EXPECTED_GATEWAY_GROUPS
+
+    runner = CliRunner()
+    paths = [["config", "gateway"]]
+    paths.extend(["config", "gateway", name] for name in EXPECTED_GATEWAY_GROUPS)
+    paths.extend(["config", "gateway", name] for name in EXPECTED_GATEWAY_COMMANDS)
+    paths.extend(
+        ["config", "gateway", group, command]
+        for group, commands in EXPECTED_GATEWAY_GROUPS.items()
+        for command in commands
+    )
+    for path in paths:
+        result = runner.invoke(app, [*path, "--help"])
+        assert result.exit_code == 0, result.output
 
 
 def test_noninteractive_management_story_emits_stable_secret_safe_json(
@@ -136,7 +171,7 @@ def test_noninteractive_management_story_emits_stable_secret_safe_json(
     assert usage.exit_code == 0, usage.output
     assert raw_key not in key_list.stdout
     assert raw_key not in usage.stdout
-    assert json.loads(usage.stdout)["schema_version"] == 1
+    assert json.loads(usage.stdout)["schema_version"] == 2
 
     readiness = runner.invoke(
         app,

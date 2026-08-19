@@ -1,6 +1,8 @@
-"""Tests for the honest later-provider certification artifact."""
+"""Tests for the honest launch-provider certification artifact."""
 
 from __future__ import annotations
+
+from datetime import UTC, datetime
 
 from wmo.common.core.artifacts import assert_secret_free
 from wmo.runtime.gateway.provider_certification import (
@@ -12,10 +14,25 @@ from wmo.runtime.gateway.provider_certification import (
 
 
 def test_provider_matrix_is_complete_deterministic_and_secret_free() -> None:
-    """Every later-provider cell is labeled and the artifact round-trips exactly."""
+    """Every launch-provider cell is labeled and the artifact round-trips exactly."""
     matrix = PROVIDER_CERTIFICATION_MATRIX
 
-    assert len(matrix.cells) == 4 * len(ProviderCapability)
+    assert len(matrix.cells) == 7 * len(ProviderCapability)
+    assert {cell.provider for cell in matrix.cells} == {
+        "anthropic",
+        "azure",
+        "bedrock",
+        "gemini",
+        "openai",
+        "openai-compatible",
+        "openrouter",
+    }
+    assert {cell.client_sdk for cell in matrix.cells} == {"openai==3.0.0"}
+    assert {cell.evaluated_at for cell in matrix.cells} == {datetime(2026, 8, 19, tzinfo=UTC)}
+    assert {cell.gateway_api_surfaces for cell in matrix.cells} == {
+        ("chat.completions", "responses")
+    }
+    assert all(cell.provider_api_surface for cell in matrix.cells)
     assert matrix.identity_sha256() == PROVIDER_CERTIFICATION_MATRIX.identity_sha256()
     assert ProviderCertificationMatrix.model_validate_json(matrix.model_dump_json()) == matrix
     assert_secret_free(matrix.model_dump(mode="json"))
@@ -30,9 +47,12 @@ def test_provider_matrix_does_not_claim_unperformed_live_credentials() -> None:
     )
 
     assert {cell.provider for cell in live_cells} == {
+        "anthropic",
         "azure",
         "bedrock",
         "gemini",
+        "openai",
+        "openai-compatible",
         "openrouter",
     }
     assert all(
@@ -53,3 +73,15 @@ def test_gemini_raw_argument_limit_is_explicit_while_bedrock_is_certified() -> N
         cells[("bedrock", ProviderCapability.TOOL_ARGUMENT_STREAM)].result
         is ProviderCertificationResult.PROVIDER_FIXTURE_PASS
     )
+
+
+def test_anthropic_text_stream_cell_names_exact_native_fixture() -> None:
+    """Anthropic text certification is bound to native text lifecycle evidence."""
+    cells = {(cell.provider, cell.capability): cell for cell in PROVIDER_CERTIFICATION_MATRIX.cells}
+    cell = cells[("anthropic", ProviderCapability.TEXT_STREAM)]
+
+    assert cell.result is ProviderCertificationResult.PROVIDER_FIXTURE_PASS
+    assert (
+        "wmo/runtime/models/providers/streaming_test.py::"
+        "test_anthropic_text_stream_emits_text_usage_and_completion"
+    ) in cell.evidence
