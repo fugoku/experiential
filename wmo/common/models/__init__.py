@@ -26,6 +26,7 @@ from wmo.common.models.known_models import KnownModel, known_model_metadata
 from wmo.common.models.model import (
     DEFAULT_REASONING_EFFORT,
     AssistantAction,
+    BillingSource,
     Embedding,
     ModelAlias,
     ModelCapabilities,
@@ -78,6 +79,7 @@ from wmo.common.models.structured import structured_json_text
 
 __all__ = [
     "AssistantAction",
+    "BillingSource",
     "CandidateTokenPrice",
     "CompletionCostReservation",
     "ConnectionConfig",
