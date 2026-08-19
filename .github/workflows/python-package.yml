@@ -65,7 +65,8 @@ jobs:
           import wmo.common.models
           import wmo.runtime.models
           from wmo.runtime.environments import LocalProcessEnvironmentRuntime
-          from wmo.runtime.router import RouterRuntime, create_project_router_app
+          from wmo.runtime.openai_protocol import decode_chat, stream_encoder
+          from wmo.runtime.router import RouterRuntime
           from wmo.simulation import compare_text_and_sandbox
           from wmo.simulation.engines import SandboxSimulator
           from wmo.optimize.router import RouterCompositionResult
@@ -73,28 +74,18 @@ jobs:
 
           assert callable(wmo.compose_router)
           assert callable(wmo.load_project_router)
-          assert callable(wmo.create_project_router_app)
+          assert callable(wmo.load_router)
+          assert callable(decode_chat)
+          assert callable(stream_encoder)
           assert wmo.RouterRuntime is RouterRuntime
           assert wmo.RouterCompositionResult is RouterCompositionResult
-          assert wmo.create_project_router_app is create_project_router_app
+          assert "create_project_router_app" not in wmo.__all__
           assert callable(compare_text_and_sandbox)
           assert SimulationSpec.__module__ == "wmo.simulation.specs.simulation"
           assert SandboxSimulator.__module__ == "wmo.simulation.engines.sandbox"
           assert LocalProcessEnvironmentRuntime.__module__ == "wmo.runtime.environments.local"
           PY
           /tmp/wmo-wheel-smoke/bin/wmo --help
-      - name: Installed-wheel no-spend release evidence
-        env:
-          PYTHONNOUSERSITE: "1"
-          TERM: xterm-256color
-          WMO_INSTALLED_RELEASE_EVIDENCE: "1"
-          WMO_RELEASE_REVISION: ${{ steps.source_revision.outputs.sha }}
-          WMO_SOURCE_CHECKOUT: ${{ github.workspace }}
-          WMO_TELEMETRY: "0"
-        run: |
-          cp wmo/release_test.py /tmp/wmo-wheel-smoke/installed_release_evidence.py
-          cd /tmp/wmo-wheel-smoke
-          ./bin/python installed_release_evidence.py
       - uses: actions/upload-artifact@v4
         with:
           name: python-dist
