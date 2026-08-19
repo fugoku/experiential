@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 from wmo.common.core.artifacts import canonical_json_bytes, validate_artifact_id
@@ -13,6 +14,8 @@ from wmo.common.models import (
     ConnectionConfig,
     GatewayDeploymentCapabilities,
     GatewayDeploymentMetadata,
+    GatewayEquivalenceCertification,
+    GatewayPoolRecord,
     GatewayTokenPrices,
     ModelCapabilities,
     ModelCatalog,
@@ -27,6 +30,22 @@ from wmo.common.models import (
 
 class GatewayCatalogAuthoringError(ValueError):
     """A gateway catalog mutation is incomplete or conflicts with active metadata."""
+
+
+class GatewayCatalogCompensationError(GatewayCatalogAuthoringError):
+    """A failed activation's catalog rollback could not be proven complete."""
+
+
+@dataclass(frozen=True)
+class CertifiedPoolUpdate:
+    """One lock-scoped certified-pool catalog update and its durable preimage."""
+
+    original: ModelCatalog
+    updated: ModelCatalog
+    normalized: NormalizedGatewayCatalog
+    snapshot: Path
+    observed_matches_expected: bool
+    changed: bool
 
 
 def list_connections(root: Path) -> tuple[tuple[str, ConnectionConfig], ...]:
@@ -116,6 +135,7 @@ def upsert_singleton_deployment(
     gateway_capabilities: GatewayDeploymentCapabilities,
     prices: GatewayTokenPrices,
     pricing_source: str | None,
+    billing_source: BillingSource = BillingSource.CUSTOMER_MANAGED,
     replace: bool,
     serving_connections: dict[str, ConnectionConfig] | None = None,
 ) -> tuple[NormalizedGatewayCatalog, Path, bool]:
@@ -132,6 +152,7 @@ def upsert_singleton_deployment(
         gateway_capabilities: Gateway protocol capability declaration.
         prices: Integer attribution rates, with unknown represented by ``None``.
         pricing_source: Optional provenance label for the rates.
+        billing_source: Credential ownership frozen for every dispatched attempt.
         replace: Whether an existing deployment alias may change.
         serving_connections: SQLite-authoritative connection metadata for serving snapshots.
 
@@ -164,7 +185,7 @@ def upsert_singleton_deployment(
             connection=connection_name,
             model=provider_model,
             revision=revision,
-            billing_source=BillingSource.CUSTOMER_MANAGED,
+            billing_source=billing_source,
             capabilities=capabilities,
             gateway=GatewayDeploymentMetadata(
                 exact_model_id=exact_model_id,
@@ -186,6 +207,181 @@ def upsert_singleton_deployment(
     normalized = normalize_gateway_catalog(current)
     snapshot = _write_catalog_snapshot(root, current, normalized)
     return normalized, snapshot, changed
+
+
+def upsert_certified_pool(
+    root: Path,
+    *,
+    pool_id: str,
+    exact_model_id: str,
+    deployment_aliases: tuple[str, ...],
+    certification: GatewayEquivalenceCertification,
+    expected_catalog_sha256: str,
+    replace: bool,
+) -> tuple[NormalizedGatewayCatalog, Path, bool]:
+    """Author one certified ordered pool against an optimistic catalog digest.
+
+    Args:
+        root: WMO root containing ``models.toml`` and gateway snapshots.
+        pool_id: Stable direct-pool and public-alias identifier.
+        exact_model_id: Exact logical model identity shared by every deployment.
+        deployment_aliases: Ordered existing deployment aliases.
+        certification: Operator evidence binding the declared equivalence.
+        expected_catalog_sha256: Normalized digest observed before this mutation.
+        replace: Whether an existing pool declaration may change.
+
+    Returns:
+        Updated normalized catalog, immutable snapshot path, and change status.
+
+    Raises:
+        GatewayCatalogAuthoringError: The catalog moved or the pool already differs.
+    """
+    path = root / "models.toml"
+    with file_write_lock(path, what="the gateway exact-model pool catalog"):
+        update = plan_certified_pool_update(
+            root,
+            pool_id=pool_id,
+            exact_model_id=exact_model_id,
+            deployment_aliases=deployment_aliases,
+            certification=certification,
+            expected_catalog_sha256=expected_catalog_sha256,
+            replace=replace,
+        )
+        apply_certified_pool_update(root, update)
+    return update.normalized, update.snapshot, update.changed
+
+
+def plan_certified_pool_update(
+    root: Path,
+    *,
+    pool_id: str,
+    exact_model_id: str,
+    deployment_aliases: tuple[str, ...],
+    certification: GatewayEquivalenceCertification,
+    expected_catalog_sha256: str,
+    replace: bool,
+    allow_existing_desired_state: bool = False,
+) -> CertifiedPoolUpdate:
+    """Plan a certified pool mutation while the caller holds the catalog lock.
+
+    Args:
+        root: WMO root containing ``models.toml`` and gateway snapshots.
+        pool_id: Stable direct-pool and public-alias identifier.
+        exact_model_id: Exact logical model identity shared by every deployment.
+        deployment_aliases: Ordered existing deployment aliases.
+        certification: Operator evidence binding the declared equivalence.
+        expected_catalog_sha256: Normalized digest observed before this mutation.
+        replace: Whether an existing pool declaration may change.
+        allow_existing_desired_state: Whether an exact existing pool may be considered for an
+            idempotent authority retry despite the caller's stale pre-mutation digest.
+
+    Returns:
+        Immutable update plan containing the catalog preimage and desired snapshot.
+
+    Raises:
+        GatewayCatalogAuthoringError: The catalog moved or the pool already differs.
+    """
+    validate_artifact_id(pool_id)
+    validate_artifact_id(exact_model_id)
+    current = load_model_catalog(root / "models.toml")
+    observed_sha256 = normalize_gateway_catalog(current).identity_sha256()
+    record = GatewayPoolRecord(
+        exact_model_id=exact_model_id,
+        deployment_aliases=deployment_aliases,
+        equivalence=certification,
+    )
+    existing = current.gateway_pools.get(pool_id)
+    if observed_sha256 != expected_catalog_sha256 and not (
+        allow_existing_desired_state and existing == record
+    ):
+        raise GatewayCatalogAuthoringError(
+            "gateway catalog changed; refresh its digest before certifying the pool"
+        )
+    if existing is not None and existing != record and not replace:
+        raise GatewayCatalogAuthoringError(
+            f"gateway pool {pool_id!r} exists; pass --replace to update it"
+        )
+    changed = existing != record
+    updated = current
+    if changed:
+        pools = {**current.gateway_pools, pool_id: record}
+        updated = current.model_copy(update={"gateway_pools": pools})
+    normalized = normalize_gateway_catalog(updated)
+    snapshot = root / "gateway" / "catalog-snapshots" / f"{normalized.identity_sha256()}.json"
+    return CertifiedPoolUpdate(
+        original=current,
+        updated=updated,
+        normalized=normalized,
+        snapshot=snapshot,
+        observed_matches_expected=observed_sha256 == expected_catalog_sha256,
+        changed=changed,
+    )
+
+
+def apply_certified_pool_update(root: Path, update: CertifiedPoolUpdate) -> None:
+    """Persist a planned pool update while its catalog lock remains held.
+
+    Args:
+        root: WMO root containing the locked catalog.
+        update: Previously validated mutation plan.
+    """
+    if update.changed:
+        write_model_catalog(root / "models.toml", update.updated)
+    _write_catalog_snapshot(root, update.updated, update.normalized)
+
+
+def rollback_certified_pool_update(root: Path, update: CertifiedPoolUpdate) -> None:
+    """Restore a failed activation's exact catalog preimage atomically.
+
+    Args:
+        root: WMO root containing the locked catalog.
+        update: Applied mutation plan whose authority activation failed.
+
+    Raises:
+        GatewayCatalogCompensationError: The exact catalog preimage could not be proven restored.
+    """
+    if not update.changed:
+        return
+    path = root / "models.toml"
+    try:
+        current = load_model_catalog(path)
+    except BaseException as exc:
+        raise GatewayCatalogCompensationError(
+            "gateway catalog rollback outcome is unknown; inspect catalog authority before retrying"
+        ) from exc
+    if current == update.original:
+        return
+    if current != update.updated:
+        raise GatewayCatalogCompensationError(
+            "gateway catalog changed during alias activation; inspect authority before retrying"
+        )
+    try:
+        write_model_catalog(path, update.original)
+    except BaseException as exc:
+        try:
+            restored = load_model_catalog(path)
+        except BaseException as reconciliation_error:
+            raise GatewayCatalogCompensationError(
+                "gateway catalog rollback outcome is unknown; inspect catalog authority "
+                "before retrying"
+            ) from reconciliation_error
+        if restored == update.original:
+            return
+        raise GatewayCatalogCompensationError(
+            "gateway catalog rollback did not restore its exact preimage; inspect authority "
+            "before retrying"
+        ) from exc
+    try:
+        restored = load_model_catalog(path)
+    except BaseException as exc:
+        raise GatewayCatalogCompensationError(
+            "gateway catalog rollback could not be verified; inspect authority before retrying"
+        ) from exc
+    if restored != update.original:
+        raise GatewayCatalogCompensationError(
+            "gateway catalog rollback did not restore its exact preimage; inspect authority "
+            "before retrying"
+        )
 
 
 def snapshot_current_catalog(

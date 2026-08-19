@@ -21,12 +21,17 @@ from wmo.runtime.gateway.contracts import (
     ProjectTarget,
 )
 from wmo.runtime.gateway.sqlite import key_delivery
+from wmo.runtime.gateway.sqlite.alias_activation import (
+    AliasActivationOutcomeUnknownError,
+    reconcile_alias_activation,
+)
 from wmo.runtime.gateway.sqlite.provider_authority import (
     ProviderAuthorityError,
     ProviderConnectionBinding,
 )
 from wmo.runtime.gateway.sqlite.store import (
     AliasNotGrantedError,
+    GatewayStoreError,
     InvalidVirtualKeyError,
     KeyIssuanceCommitError,
     OperationConflictError,
@@ -77,7 +82,11 @@ def _request(content: str = "content-canary") -> GatewayRequest:
     )
 
 
-def _configured_store(tmp_path: Path) -> tuple[SQLiteGatewayStore, FakeClock, str]:
+def _configured_store(
+    tmp_path: Path,
+    *,
+    refusal_failover: bool = False,
+) -> tuple[SQLiteGatewayStore, FakeClock, str]:
     """Create explicit organization, identity, snapshot, alias, grant, and key state."""
     clock = FakeClock()
     store = SQLiteGatewayStore(tmp_path / "gateway.db", clock=clock)
@@ -98,6 +107,7 @@ def _configured_store(tmp_path: Path) -> tuple[SQLiteGatewayStore, FakeClock, st
         target=DirectTarget(pool_id="pool-coding"),
         snapshot_ref="snapshot-one",
         catalog_sha256=_DIGEST,
+        refusal_failover=refusal_failover,
     )
     store.grant_alias(
         organization_id="org-one", identity_id="identity-one", alias_id="alias-coding"
@@ -106,6 +116,27 @@ def _configured_store(tmp_path: Path) -> tuple[SQLiteGatewayStore, FakeClock, st
         organization_id="org-one", identity_id="identity-one", key_id="key-one"
     )
     return store, clock, issued.raw_key
+
+
+@pytest.mark.parametrize("refusal_failover", [False, True])
+def test_authorization_freezes_revision_scoped_refusal_policy(
+    tmp_path: Path,
+    refusal_failover: bool,
+) -> None:
+    """Authorization carries the immutable active revision refusal policy."""
+    store, clock, raw_key = _configured_store(
+        tmp_path,
+        refusal_failover=refusal_failover,
+    )
+
+    snapshot = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=_request(),
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+
+    assert snapshot.refusal_failover is refusal_failover
 
 
 def test_key_derived_authority_is_deny_by_default_and_revocation_is_immediate(
@@ -661,6 +692,306 @@ def test_project_activation_binding_is_unique_per_tenant_and_revisions_are_immut
         )
     finally:
         connection.close()
+
+
+def test_alias_activation_reconciles_lost_commit_acknowledgement_after_supersession(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Immutable revision A proves its commit even when concurrent revision B supersedes it."""
+    store = SQLiteGatewayStore(tmp_path / "gateway.db")
+    store.create_organization(organization_id="org-one", slug="one", display_name="One")
+    store.register_catalog_snapshot(
+        organization_id="org-one",
+        snapshot_ref="snapshot-one",
+        catalog_sha256=_DIGEST,
+    )
+    original_connect = store._connect
+    superseding_store = SQLiteGatewayStore(tmp_path / "gateway.db")
+
+    class CommitAfterEffectConnection:
+        """Raise only after SQLite has applied COMMIT."""
+
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            """Wrap one configured SQLite connection."""
+            self.connection = connection
+
+        def execute(self, statement: str, parameters: tuple[object, ...] = ()) -> sqlite3.Cursor:
+            """Delegate SQL and lose the COMMIT acknowledgement."""
+            result = self.connection.execute(statement, parameters)
+            if statement == "COMMIT":
+                superseding_store.activate_alias_revision(
+                    organization_id="org-one",
+                    alias_id="alias-one",
+                    alias_name="coding",
+                    revision_id="revision-two",
+                    target=DirectTarget(pool_id="pool-one"),
+                    snapshot_ref="snapshot-one",
+                    catalog_sha256=_DIGEST,
+                )
+                raise KeyboardInterrupt("injected post-COMMIT interrupt")
+            return result
+
+    @contextmanager
+    def commit_after_effect() -> Iterator[CommitAfterEffectConnection]:
+        """Yield one connection with an ambiguous reported COMMIT."""
+        with original_connect() as connection:
+            yield CommitAfterEffectConnection(connection)
+
+    monkeypatch.setattr(store, "_connect", commit_after_effect)
+    store.activate_alias_revision(
+        organization_id="org-one",
+        alias_id="alias-one",
+        alias_name="coding",
+        revision_id="revision-one",
+        target=DirectTarget(pool_id="pool-one"),
+        snapshot_ref="snapshot-one",
+        catalog_sha256=_DIGEST,
+    )
+
+    with sqlite3.connect(tmp_path / "gateway.db") as connection:
+        row = connection.execute(
+            "SELECT active_revision_id FROM gateway_aliases WHERE alias_id = 'alias-one'"
+        ).fetchone()
+    assert row == ("revision-two",)
+    assert (
+        reconcile_alias_activation(
+            connect=original_connect,
+            organization_id="org-one",
+            alias_id="alias-one",
+            alias_name="coding",
+            revision_id="missing-revision",
+            target=DirectTarget(pool_id="pool-one"),
+            snapshot_ref="snapshot-one",
+            catalog_sha256=_DIGEST,
+            refusal_failover=False,
+        )
+        is False
+    )
+    assert (
+        reconcile_alias_activation(
+            connect=original_connect,
+            organization_id="org-one",
+            alias_id="alias-one",
+            alias_name="coding",
+            revision_id="revision-one",
+            target=DirectTarget(pool_id="wrong-pool"),
+            snapshot_ref="snapshot-one",
+            catalog_sha256=_DIGEST,
+            refusal_failover=False,
+        )
+        is False
+    )
+
+
+def test_alias_activation_reconciles_teardown_interruption_after_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A teardown interruption after acknowledged COMMIT preserves exact authority.
+
+    Args:
+        tmp_path: Pytest-owned SQLite database directory.
+        monkeypatch: Scoped connection-context failure injection.
+    """
+    store = SQLiteGatewayStore(tmp_path / "gateway.db")
+    store.create_organization(organization_id="org-one", slug="one", display_name="One")
+    store.register_catalog_snapshot(
+        organization_id="org-one",
+        snapshot_ref="snapshot-one",
+        catalog_sha256=_DIGEST,
+    )
+    original_connect = store._connect
+    connect_calls = 0
+
+    @contextmanager
+    def teardown_after_commit() -> Iterator[sqlite3.Connection]:
+        """Interrupt only the first connection context after its body returns."""
+        nonlocal connect_calls
+        connect_calls += 1
+        with original_connect() as connection:
+            try:
+                yield connection
+            finally:
+                if connect_calls == 1:
+                    raise KeyboardInterrupt("injected post-COMMIT teardown interruption")
+
+    monkeypatch.setattr(store, "_connect", teardown_after_commit)
+    store.activate_alias_revision(
+        organization_id="org-one",
+        alias_id="alias-one",
+        alias_name="coding",
+        revision_id="revision-one",
+        target=DirectTarget(pool_id="pool-one"),
+        snapshot_ref="snapshot-one",
+        catalog_sha256=_DIGEST,
+    )
+
+    assert connect_calls == 2
+    with sqlite3.connect(tmp_path / "gateway.db") as connection:
+        row = connection.execute(
+            "SELECT active_revision_id FROM gateway_aliases WHERE alias_id = 'alias-one'"
+        ).fetchone()
+    assert row == ("revision-one",)
+
+
+def test_alias_activation_types_unreadable_postcommit_teardown_as_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unreadable recovery after a post-COMMIT teardown preserves catalog authority.
+
+    Args:
+        tmp_path: Pytest-owned SQLite database directory.
+        monkeypatch: Scoped teardown and fresh-read failure injection.
+    """
+    store = SQLiteGatewayStore(tmp_path / "gateway.db")
+    store.create_organization(organization_id="org-one", slug="one", display_name="One")
+    store.register_catalog_snapshot(
+        organization_id="org-one",
+        snapshot_ref="snapshot-one",
+        catalog_sha256=_DIGEST,
+    )
+    original_connect = store._connect
+    connect_calls = 0
+
+    @contextmanager
+    def teardown_then_unreadable() -> Iterator[sqlite3.Connection]:
+        """Interrupt teardown once and reject its fresh reconciliation connection."""
+        nonlocal connect_calls
+        connect_calls += 1
+        if connect_calls > 1:
+            raise RuntimeError("injected reconciliation read failure")
+        with original_connect() as connection:
+            try:
+                yield connection
+            finally:
+                raise SystemExit("injected post-COMMIT teardown interruption")
+
+    monkeypatch.setattr(store, "_connect", teardown_then_unreadable)
+    with pytest.raises(AliasActivationOutcomeUnknownError, match="operation_outcome_unknown"):
+        store.activate_alias_revision(
+            organization_id="org-one",
+            alias_id="alias-one",
+            alias_name="coding",
+            revision_id="revision-one",
+            target=DirectTarget(pool_id="pool-one"),
+            snapshot_ref="snapshot-one",
+            catalog_sha256=_DIGEST,
+        )
+
+    assert connect_calls == 2
+    with sqlite3.connect(tmp_path / "gateway.db") as connection:
+        row = connection.execute(
+            "SELECT active_revision_id FROM gateway_aliases WHERE alias_id = 'alias-one'"
+        ).fetchone()
+    assert row == ("revision-one",)
+
+
+def test_alias_activation_keeps_precommit_teardown_failure_definite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A teardown failure before COMMIT remains ordinary and leaves no revision.
+
+    Args:
+        tmp_path: Pytest-owned SQLite database directory.
+        monkeypatch: Scoped precommit teardown failure injection.
+    """
+    store = SQLiteGatewayStore(tmp_path / "gateway.db")
+    store.create_organization(organization_id="org-one", slug="one", display_name="One")
+    original_connect = store._connect
+
+    @contextmanager
+    def precommit_teardown_failure() -> Iterator[sqlite3.Connection]:
+        """Replace one rolled-back body error with an ordinary teardown failure."""
+        with original_connect() as connection:
+            try:
+                yield connection
+            finally:
+                raise RuntimeError("injected precommit teardown failure")
+
+    monkeypatch.setattr(store, "_connect", precommit_teardown_failure)
+    with pytest.raises(RuntimeError, match="injected precommit teardown failure"):
+        store.activate_alias_revision(
+            organization_id="org-one",
+            alias_id="alias-one",
+            alias_name="coding",
+            revision_id="revision-one",
+            target=DirectTarget(pool_id="pool-one"),
+            snapshot_ref="missing-snapshot",
+            catalog_sha256=_DIGEST,
+        )
+
+    with sqlite3.connect(tmp_path / "gateway.db") as connection:
+        count = connection.execute("SELECT COUNT(*) FROM alias_revisions").fetchone()[0]
+    assert count == 0
+
+
+def test_alias_activation_types_only_unreadable_commit_outcome_as_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Body failures stay definite while an unreadable COMMIT outcome is explicitly unknown."""
+    store = SQLiteGatewayStore(tmp_path / "gateway.db")
+    store.create_organization(organization_id="org-one", slug="one", display_name="One")
+    store.register_catalog_snapshot(
+        organization_id="org-one",
+        snapshot_ref="snapshot-one",
+        catalog_sha256=_DIGEST,
+    )
+    original_connect = store._connect
+    connect_calls = 0
+
+    class CommitAfterEffectConnection:
+        """Raise only after SQLite has applied COMMIT."""
+
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            """Wrap one configured SQLite connection."""
+            self.connection = connection
+
+        def execute(self, statement: str, parameters: tuple[object, ...] = ()) -> sqlite3.Cursor:
+            """Delegate SQL and lose the COMMIT acknowledgement."""
+            result = self.connection.execute(statement, parameters)
+            if statement == "COMMIT":
+                raise KeyboardInterrupt("injected post-COMMIT interrupt")
+            return result
+
+    @contextmanager
+    def commit_then_unreadable() -> Iterator[CommitAfterEffectConnection]:
+        """Commit once, then make the fresh reconciliation connection unavailable."""
+        nonlocal connect_calls
+        connect_calls += 1
+        if connect_calls > 1:
+            raise RuntimeError("injected non-sqlite reconciliation failure")
+        with original_connect() as connection:
+            yield CommitAfterEffectConnection(connection)
+
+    monkeypatch.setattr(store, "_connect", commit_then_unreadable)
+    with pytest.raises(AliasActivationOutcomeUnknownError, match="operation_outcome_unknown"):
+        store.activate_alias_revision(
+            organization_id="org-one",
+            alias_id="alias-one",
+            alias_name="coding",
+            revision_id="revision-one",
+            target=DirectTarget(pool_id="pool-one"),
+            snapshot_ref="snapshot-one",
+            catalog_sha256=_DIGEST,
+        )
+    assert connect_calls == 2
+
+    connect_calls = 0
+    with pytest.raises(GatewayStoreError, match="catalog snapshot reference is not registered"):
+        store.activate_alias_revision(
+            organization_id="org-one",
+            alias_id="alias-two",
+            alias_name="analysis",
+            revision_id="revision-two",
+            target=DirectTarget(pool_id="pool-two"),
+            snapshot_ref="missing-snapshot",
+            catalog_sha256=_DIGEST,
+        )
+    assert connect_calls == 1
 
 
 def test_cross_tenant_grant_is_rejected_by_composite_foreign_keys(tmp_path: Path) -> None:
