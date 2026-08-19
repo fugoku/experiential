@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
-from typing import Protocol, cast
+from typing import cast
 
 from fastapi import FastAPI
 from filelock import FileLock, Timeout
@@ -37,6 +37,12 @@ from wmo.runtime.gateway.execution import GatewayExecutor
 from wmo.runtime.gateway.interfaces import ProjectTargetResolver
 from wmo.runtime.gateway.ledger import SQLiteAttemptLedger
 from wmo.runtime.gateway.management import GatewayAliasView, GatewayManagement
+from wmo.runtime.gateway.project_activation import (
+    ProjectActivation,
+    ProjectActivationError,
+    ProjectActivationRepository,
+    require_project_activation_authority,
+)
 from wmo.runtime.gateway.routing import (
     CatalogRouteResolver,
     GatewayRoutingError,
@@ -47,27 +53,13 @@ from wmo.runtime.gateway.sqlite.store import SQLiteGatewayStore, SystemGatewayCl
 from wmo.runtime.gateway.usage import read_usage_report
 from wmo.runtime.models import ModelConnectionError, RuntimeModelCatalog
 from wmo.runtime.models.credentials import ModelCredentialError
+from wmo.runtime.openai_protocol.state import ResponseContinuationStore, ResponseReplayStore
 from wmo.runtime.router.errors import RouterApplicationError
-from wmo.runtime.router.runtime import RouterRuntime
+from wmo.runtime.router.runtime import DecisionSink, RouterRuntime
 
 
 class GatewayLifecycleError(ValueError):
     """Local gateway configuration cannot form one ready execution snapshot."""
-
-
-class ProjectLoader(Protocol):
-    """Load one exact frozen project policy without executing provider work."""
-
-    def __call__(
-        self,
-        project: str,
-        root: Path,
-        *,
-        policy_id: str,
-        runtime_catalog: RuntimeModelCatalog,
-    ) -> RouterRuntime:
-        """Return one verified selection-only project runtime."""
-        ...
 
 
 @dataclass(frozen=True)
@@ -188,7 +180,10 @@ def load_local_gateway(
     *,
     graceful_timeout_seconds: float,
     environment: Mapping[str, str] | None = None,
-    project_loader: ProjectLoader | None = None,
+    project_repository: ProjectActivationRepository | None = None,
+    decision_sink: DecisionSink | None = None,
+    replay: ResponseReplayStore | None = None,
+    continuations: ResponseContinuationStore | None = None,
     only_aliases: frozenset[str] | None = None,
 ) -> LocalGatewayRuntime:
     """Load all granted active aliases and compose the loopback application.
@@ -197,7 +192,10 @@ def load_local_gateway(
         root: Initialized WMO root.
         graceful_timeout_seconds: Shutdown drain bound.
         environment: Optional provider credential mapping used by tests.
-        project_loader: CLI-injected verified project activation loader.
+        project_repository: Repository for verified immutable project activations.
+        decision_sink: Optional aggregate-safe recorder for served project selections.
+        replay: Optional shared Chat and Responses replay state.
+        continuations: Optional shared Responses continuation state.
         only_aliases: Optional exact public aliases to expose from the shared application.
 
     Returns:
@@ -245,18 +243,27 @@ def load_local_gateway(
             continue
         if alias.target_kind != "project":
             raise GatewayLifecycleError(f"alias {alias.alias_name!r} has an unknown target kind")
-        if project_loader is None:
+        if project_repository is None:
             raise GatewayLifecycleError(
-                f"project alias {alias.alias_name!r} requires a project activation loader"
+                f"project alias {alias.alias_name!r} requires a project activation repository"
             )
         project_ref = _required(alias.project_ref, "project reference", alias)
         activation_ref = _required(alias.activation_ref, "activation reference", alias)
         try:
-            runtime = project_loader(
+            activation = project_repository.load(
                 project_ref,
-                root,
-                policy_id=activation_ref,
+                activation_ref,
                 runtime_catalog=runtime_catalog,
+            )
+            _require_activation_authority(
+                activation,
+                project_ref=project_ref,
+                activation_ref=activation_ref,
+            )
+            runtime = RouterRuntime.from_activation(
+                activation,
+                runtime_catalog,
+                decision_sink=decision_sink,
             )
             proof = _project_readiness(
                 manager,
@@ -316,6 +323,8 @@ def load_local_gateway(
         clock=SystemGatewayClock(),
         readiness=readiness_probe,
         usage=lambda: read_usage_report(ledger, organization_id=manager.organization_id),
+        replay=replay,
+        continuations=continuations,
     )
     return LocalGatewayRuntime(
         runtime=runtime,
@@ -523,3 +532,20 @@ def _required(value: str | None, name: str, alias: GatewayAliasView) -> str:
     if value is None:
         raise GatewayLifecycleError(f"alias {alias.alias_name!r} is missing {name}")
     return value
+
+
+def _require_activation_authority(
+    activation: ProjectActivation,
+    *,
+    project_ref: str,
+    activation_ref: str,
+) -> None:
+    """Require repository output to match the exact authorized project target."""
+    try:
+        require_project_activation_authority(
+            activation,
+            project_ref=project_ref,
+            activation_ref=activation_ref,
+        )
+    except ProjectActivationError as exc:
+        raise GatewayLifecycleError(str(exc)) from exc
