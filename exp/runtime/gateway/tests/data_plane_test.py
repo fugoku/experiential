@@ -15,7 +15,13 @@ import httpx
 import pytest
 from fastapi.responses import StreamingResponse
 
-from exp.common.models import BillingSource, ModelCapabilities, ModelClient, ModelSnapshot
+from exp.common.models import (
+    BillingSource,
+    ModelCapabilities,
+    ModelClient,
+    ModelSnapshot,
+    ToolCall,
+)
 from exp.common.models.catalog import GatewayDeploymentCapabilities, GatewayDeploymentMetadata
 from exp.common.models.gateway_catalog import (
     ExactModelDeployment,
@@ -586,6 +592,226 @@ def test_direct_request_routes_streams_and_accounts_before_public_completion() -
         assert ledger.routes == [("direct", None)]
         assert ledger.finished[0][0] is not None
         assert ledger.finished[0][0].kind is GatewayEventKind.COMPLETED
+
+    asyncio.run(scenario())
+
+
+def test_terminal_usage_carries_deduplicated_invoked_tool_names() -> None:
+    """Settled terminal usage lists the invoked tool names in first-use order, deduplicated."""
+
+    async def scenario() -> None:
+        """Drive a request whose stream invokes two tools, one of them twice by name."""
+
+        def _tool_events(
+            index: int, call_id: str, name: str, base: int
+        ) -> tuple[GatewayEvent, ...]:
+            """Build one well-formed start, arguments, and completion tool triple."""
+            return (
+                GatewayEvent(
+                    kind=GatewayEventKind.TOOL_CALL_STARTED,
+                    sequence_number=base,
+                    tool_call_index=index,
+                    tool_call_id=call_id,
+                    tool_name=name,
+                ),
+                GatewayEvent(
+                    kind=GatewayEventKind.TOOL_ARGUMENTS_DELTA,
+                    sequence_number=base + 1,
+                    tool_call_index=index,
+                    raw_arguments_delta="{}",
+                ),
+                GatewayEvent(
+                    kind=GatewayEventKind.TOOL_CALL_COMPLETED,
+                    sequence_number=base + 2,
+                    tool_call=ToolCall(
+                        call_id=call_id, name=name, arguments={}, raw_arguments="{}"
+                    ),
+                ),
+            )
+
+        provider = _Provider(
+            lambda: _EventStream(
+                (
+                    *_tool_events(0, "call-a", "search", 0),
+                    *_tool_events(1, "call-b", "lookup", 3),
+                    *_tool_events(2, "call-c", "search", 6),
+                    GatewayEvent(
+                        kind=GatewayEventKind.USAGE,
+                        sequence_number=9,
+                        usage=GatewayUsage(input_tokens=3, output_tokens=1),
+                    ),
+                    GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=10),
+                )
+            )
+        )
+        service, _control, ledger, _proof = _service(provider)
+
+        await service.preflight()
+        response = await service.complete(
+            raw_key="caller-secret",
+            decoded=decode_chat(
+                {
+                    "model": "public-model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                }
+            ),
+        )
+
+        assert response.status_code == 200
+        terminal = ledger.finished[0][0]
+        assert terminal is not None
+        assert terminal.usage is not None
+        assert terminal.usage.tool_names == ("search", "lookup")
+
+    asyncio.run(scenario())
+
+
+def test_terminal_usage_tool_names_default_empty_without_tool_calls() -> None:
+    """A stream that invokes no tool settles terminal usage with an empty tool-name tuple."""
+
+    async def scenario() -> None:
+        """Drive one text-only request and confirm no tool names are recorded."""
+        provider = _Provider(
+            lambda: _EventStream(
+                (
+                    GatewayEvent(
+                        kind=GatewayEventKind.TEXT_DELTA,
+                        sequence_number=0,
+                        text_delta="hello",
+                    ),
+                    GatewayEvent(
+                        kind=GatewayEventKind.COMPLETED,
+                        sequence_number=1,
+                        usage=GatewayUsage(input_tokens=3, output_tokens=1),
+                    ),
+                )
+            )
+        )
+        service, _control, ledger, _proof = _service(provider)
+
+        await service.preflight()
+        await service.complete(
+            raw_key="caller-secret",
+            decoded=decode_chat(
+                {
+                    "model": "public-model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                }
+            ),
+        )
+
+        terminal = ledger.finished[0][0]
+        assert terminal is not None
+        assert terminal.usage is not None
+        assert terminal.usage.tool_names == ()
+
+    asyncio.run(scenario())
+
+
+def test_terminal_tool_names_survive_when_provider_omits_usage() -> None:
+    """A usage-less completed attempt retains invoked names without fabricating token counts."""
+
+    async def scenario() -> None:
+        """Drive one tool completion directly into a terminal event without usage."""
+        provider = _Provider(
+            lambda: _EventStream(
+                (
+                    GatewayEvent(
+                        kind=GatewayEventKind.TOOL_CALL_COMPLETED,
+                        sequence_number=0,
+                        tool_call=ToolCall(
+                            call_id="call-a", name="search", arguments={}, raw_arguments="{}"
+                        ),
+                    ),
+                    GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=1),
+                )
+            )
+        )
+        service, _control, ledger, _proof = _service(provider)
+
+        await service.preflight()
+        response = await service.complete(
+            raw_key="caller-secret",
+            decoded=decode_chat(
+                {
+                    "model": "public-model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                }
+            ),
+        )
+
+        body = json.loads(cast(bytes, response.body))
+        terminal = ledger.finished[0][0]
+        assert response.status_code == 200
+        assert body["usage"] is None
+        assert terminal is not None
+        assert terminal.usage == GatewayUsage(tool_names=("search",))
+        assert terminal.usage is not None
+        assert terminal.usage.input_tokens is None
+        assert terminal.usage.output_tokens is None
+
+    asyncio.run(scenario())
+
+
+def test_abort_preserves_tool_names_when_provider_omits_usage() -> None:
+    """An aborted attempt retains invoked names even when no usage event arrived."""
+
+    async def scenario() -> None:
+        """Abort after a completed tool call and inspect the durable terminal event."""
+        catalog, _deployment = _catalog()
+        ledger = _Ledger()
+        provider = _Provider(
+            lambda: _EventStream(
+                (
+                    GatewayEvent(
+                        kind=GatewayEventKind.TOOL_CALL_COMPLETED,
+                        sequence_number=0,
+                        tool_call=ToolCall(
+                            call_id="call-a", name="search", arguments={}, raw_arguments="{}"
+                        ),
+                    ),
+                )
+            )
+        )
+        request = GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=(GatewayMessage(role="user", content="abort"),),
+        )
+        authorization = _ControlStore(catalog.identity_sha256()).authorize_request(
+            raw_key="caller-secret",
+            alias="public-model",
+            request=request,
+            deadline_monotonic=time.monotonic() + 30,
+        )
+        route = await CatalogRouteResolver(
+            {("revision-one", catalog.identity_sha256()): catalog}
+        ).resolve(
+            authorization=authorization,
+            request=request,
+            episode_namespace=("org", "identity", "revision-one", "episode"),
+        )
+        executor = GatewayExecutor(
+            {
+                ("revision-one", catalog.identity_sha256()): cast(
+                    RuntimeModelCatalog, _RuntimeCatalog(provider)
+                )
+            },
+            ledger,
+        )
+        stream = await executor.start(route=route, request=request)
+        event = await stream.__anext__()
+        assert event.kind is GatewayEventKind.TOOL_CALL_COMPLETED
+
+        await stream.abort(
+            GatewayFailure(
+                failure_class=GatewayFailureClass.CANCELLED,
+                safe_message="provider request was cancelled",
+            )
+        )
+
+        terminal = ledger.finished[0][0]
+        assert terminal is not None
+        assert terminal.usage == GatewayUsage(tool_names=("search",))
 
     asyncio.run(scenario())
 
