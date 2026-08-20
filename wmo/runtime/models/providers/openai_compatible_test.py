@@ -61,11 +61,13 @@ def _snapshot(provider: str = "openai-compatible", model_id: str = "fake-model")
 def _request(
     *,
     tool_choice: ToolChoice | Literal["auto", "none", "required"] | None = None,
+    top_p: float | None = None,
 ) -> ModelRequest:
     """Build a visible transcript containing an earlier tool call and result.
 
     Args:
         tool_choice: Optional tool-choice constraint forwarded to the request.
+        top_p: Optional nucleus-sampling mass forwarded to the request.
 
     Returns:
         A typed request with system, user, assistant tool-call, and tool-result turns.
@@ -97,6 +99,7 @@ def _request(
         ),
         tool_choice=tool_choice,
         temperature=0.2,
+        top_p=top_p,
         maximum_output_tokens=128,
     )
 
@@ -104,11 +107,13 @@ def _request(
 def test_openai_compatible_request_keeps_history_tools_and_non_streaming_cap() -> None:
     """Shared conversion keeps every tool turn and emits no streaming request."""
     payload = openai_compatible_request(
-        "fake-model", _request(tool_choice=ToolChoice(name="create_ticket"))
+        "fake-model", _request(tool_choice=ToolChoice(name="create_ticket"), top_p=1.0)
     )
 
     assert payload["stream"] is False
     assert payload["max_tokens"] == 128
+    assert payload["temperature"] == 0.2
+    assert payload["top_p"] == 1.0
     assert payload["tool_choice"] == {
         "type": "function",
         "function": {"name": "create_ticket"},
@@ -132,6 +137,17 @@ def test_openai_compatible_request_keeps_history_tools_and_non_streaming_cap() -
             "function": {"name": "create_ticket", "arguments": '{"priority": "normal"}'},
         }
     ]
+
+
+def test_openai_compatible_request_omits_absent_top_p() -> None:
+    """Buffered Chat payloads do not invent a nucleus-sampling value."""
+    payload = openai_compatible_request(
+        "fake-model",
+        ModelRequest(messages=(ModelMessage(role="user", content="hello"),)),
+    )
+
+    assert "top_p" not in payload
+    assert "temperature" not in payload
 
 
 def test_openai_compatible_client_converts_tool_usage_and_resolved_identity() -> None:
