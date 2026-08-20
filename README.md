@@ -16,6 +16,42 @@ Experiential optimizes agent workflows from traces through a three-step process:
 
 ## Getting Started
 
+Start a local OpenAI-compatible gateway. On first run, the setup wizard asks for a provider,
+model, and public alias, then prints a one-time virtual key:
+
+```bash
+pip install experiential
+exp run
+```
+
+Choose a public alias such as `support-agent`, capture the issued key, and send a request:
+
+```bash
+export EXP_GATEWAY_KEY=...
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Authorization: Bearer $EXP_GATEWAY_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"support-agent","messages":[{"role":"user","content":"Help me"}]}'
+```
+
+## Using the API
+
+Create a local gateway programmatically:
+
+```python
+import uvicorn
+
+from exp.runtime.gateway.lifecycle import load_local_gateway
+
+gateway = load_local_gateway()
+uvicorn.run(gateway.app, lifespan="on")
+```
+
+For hosted workers with their own storage and provider services, use the lower-level
+`exp.create_gateway_runtime(...)` composition API.
+
+## Optimize from Traffic
+
 First, collect OpenTelemetry traces from your current agent. If you just want to try it out, grab
 the public [terminal-tasks OTLP dataset](https://huggingface.co/datasets/experiential-labs/wmo-terminal-tasks-traces):
 
@@ -24,22 +60,12 @@ curl -L -o traces.otel.jsonl \
   https://huggingface.co/datasets/experiential-labs/wmo-terminal-tasks-traces/resolve/540883e451dc13d34fb50fdd36b143cb0f1fb0db/traces.otel.jsonl
 ```
 
-Then install the package and build a project. The build command walks you through providers,
+Then build a project. The build command walks you through providers,
 models, and budget, and asks for your trace file:
 
 ```bash
-pip install experiential
-
 # Build simulation from your agent traces and optimize a router against it
 exp build support-agent
-
-# Run your router as an OpenAI compatible endpoint
-exp run support-agent
-
-# Send a request to your endpoint
-curl http://127.0.0.1:8000/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"support-agent","messages":[{"role":"user","content":"Help me"}]}'
 ```
 
 After collecting traces from your router, fine-tune an open source model you own using
@@ -47,27 +73,6 @@ After collecting traces from your router, fine-tune an open source model you own
 
 ```bash
 exp optimize model support-agent
-```
-
-## Using the API
-
-Call an optimized router programmatically:
-
-```python
-from pathlib import Path
-
-from exp import load_project_router
-from exp.common.models import ModelMessage, ModelRequest
-
-router = load_project_router("support-agent", Path(".exp"))
-
-result = router.complete(
-    ModelRequest(
-        messages=(
-            ModelMessage(role="user", content="Help me reset my password"),
-        ),
-    )
-)
 ```
 
 ## Telemetry
