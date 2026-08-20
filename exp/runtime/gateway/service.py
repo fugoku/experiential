@@ -26,6 +26,11 @@ from exp.runtime.gateway.contracts import (
     GatewayFailureClass,
     GatewayRequest,
 )
+from exp.runtime.gateway.discovery import (
+    public_model_list,
+    public_model_object,
+    require_granted_authority,
+)
 from exp.runtime.gateway.execution import (
     GatewayExecutionError,
     GatewayExecutionStream,
@@ -74,6 +79,7 @@ from exp.runtime.openai_protocol.state import (
 from exp.runtime.openai_protocol.streaming import stable_public_id
 
 _STREAM_REPLAY_CAPTURE_BYTES = 64 * 1024 * 1024
+_DRAINING_RETRY_AFTER_SECONDS = 10
 
 
 class GatewayDrainingError(RuntimeError):
@@ -236,6 +242,17 @@ class GatewayService:
     def models(self, *, raw_key: str) -> tuple[str, ...]:
         """Return only aliases granted to one authenticated key-derived identity."""
         return self._control.granted_aliases(raw_key=raw_key)
+
+    def model_authorities(self, *, raw_key: str) -> tuple[tuple[str, str, str], ...]:
+        """Return granted alias, revision, and catalog digest triples for one key."""
+        return self._control.granted_alias_authorities(raw_key=raw_key)
+
+    def model_authority(self, *, raw_key: str, model_id: str) -> tuple[str, str, str]:
+        """Return one granted alias authority or raise the shared no-oracle 404."""
+        return require_granted_authority(
+            self._control.granted_alias_authorities(raw_key=raw_key),
+            model_id,
+        )
 
     def authenticate(self, *, raw_key: str) -> None:
         """Authenticate a key before the HTTP boundary performs full protocol decoding."""
@@ -497,7 +514,10 @@ class GatewayService:
                         raise OpenAIProtocolError(
                             status_code=500,
                             code="idempotency_replay_unavailable",
-                            message="The completed stream exceeds the bounded replay cache.",
+                            message=(
+                                "The completed stream exceeds the bounded replay cache. "
+                                "Resend without an Idempotency-Key or request less output."
+                            ),
                             error_type="api_error",
                         )
             for data in terminal_frames:
@@ -635,16 +655,21 @@ def create_gateway_app(service: GatewayService) -> FastAPI:
         """List only aliases granted to the presented virtual key."""
         try:
             raw_key = _bearer_key(authorization)
-            aliases = service.models(raw_key=raw_key)
-            return JSONResponse(
-                {
-                    "object": "list",
-                    "data": [
-                        {"id": alias, "object": "model", "created": 0, "owned_by": "exp"}
-                        for alias in aliases
-                    ],
-                }
-            )
+            authorities = service.model_authorities(raw_key=raw_key)
+            return JSONResponse(public_model_list(authorities))
+        except Exception as exc:  # noqa: BLE001 - HTTP boundary sanitizes every failure.
+            return _exception_response(exc)
+
+    @app.get("/v1/models/{model_id}")
+    async def model_detail(
+        model_id: str,
+        authorization: str | None = Header(default=None),
+    ) -> Response:
+        """Describe one granted alias, answering 404 for every other model ID."""
+        try:
+            raw_key = _bearer_key(authorization)
+            authority = service.model_authority(raw_key=raw_key, model_id=model_id)
+            return JSONResponse(public_model_object(authority))
         except Exception as exc:  # noqa: BLE001 - HTTP boundary sanitizes every failure.
             return _exception_response(exc)
 
@@ -704,13 +729,13 @@ async def _dispatch(
             raise OpenAIProtocolError(
                 status_code=400,
                 code="invalid_json",
-                message="Request body must contain valid JSON.",
+                message="Request body must contain valid JSON. Re-encode the payload and resend.",
             ) from exc
         if not isinstance(payload, dict):
             raise OpenAIProtocolError(
                 status_code=400,
                 code="invalid_request",
-                message="Request body must be a JSON object.",
+                message="Request body must be a JSON object. Re-encode the payload and resend.",
             )
         decoded = decoder(
             cast(JsonObject, payload),
@@ -731,7 +756,10 @@ def _bearer_key(value: str | None) -> str:
         raise OpenAIProtocolError(
             status_code=401,
             code="invalid_key",
-            message="A valid gateway Bearer key is required.",
+            message=(
+                "A valid gateway Bearer key is required. Send the virtual key as "
+                "'Authorization: Bearer <key>'."
+            ),
             error_type="authentication_error",
         )
     return value[7:].strip()
@@ -746,14 +774,20 @@ def _exception_response(exception: BaseException) -> Response:
         error = OpenAIProtocolError(
             status_code=401,
             code="invalid_key",
-            message="The gateway key is invalid, expired, or revoked.",
+            message=(
+                "The gateway key is invalid, expired, or revoked. Ask the gateway operator "
+                "to issue a new virtual key."
+            ),
             error_type="authentication_error",
         )
     elif isinstance(exception, AliasNotGrantedError):
         error = OpenAIProtocolError(
             status_code=403,
             code="model_not_granted",
-            message="The requested model alias is not granted to this identity.",
+            message=(
+                "The requested model alias is not granted to this identity. "
+                "GET /v1/models lists the model aliases available to this key."
+            ),
             error_type="permission_error",
             param="model",
         )
@@ -761,14 +795,20 @@ def _exception_response(exception: BaseException) -> Response:
         error = OpenAIProtocolError(
             status_code=409,
             code="idempotency_conflict",
-            message="The caller operation was reused with different request content.",
+            message=(
+                "The caller operation was reused with different request content. "
+                "Send a new Idempotency-Key for each distinct request."
+            ),
             param="Idempotency-Key",
         )
     elif isinstance(exception, IdempotencyReplayUnavailableError):
         error = OpenAIProtocolError(
             status_code=409,
             code="idempotency_replay_unavailable",
-            message="The completed keyed result is unavailable after restart.",
+            message=(
+                "The completed keyed result is unavailable after restart. "
+                "Resend the request with a new Idempotency-Key."
+            ),
             error_type="api_error",
             param="Idempotency-Key",
         )
@@ -778,7 +818,10 @@ def _exception_response(exception: BaseException) -> Response:
         error = public_failure_error(
             GatewayFailure(
                 failure_class=GatewayFailureClass.TIMEOUT,
-                safe_message="Gateway request deadline exceeded.",
+                safe_message=(
+                    "Gateway request deadline exceeded. Retry with a shorter prompt "
+                    "or a smaller max_tokens value."
+                ),
             )
         )
     elif isinstance(exception, (GatewayRoutingError, GatewayStoreError)):
@@ -790,9 +833,13 @@ def _exception_response(exception: BaseException) -> Response:
                 else "invalid_request"
             ),
             message=(
-                "The authorized model route is unavailable."
+                "The authorized model route is unavailable. Retry after a short delay; "
+                "if this persists, ask the gateway operator to check the alias deployments."
                 if isinstance(exception, GatewayRoutingError)
-                else "The gateway request is invalid."
+                else (
+                    "The gateway request is invalid. Verify the model alias and request "
+                    "fields, then resend."
+                )
             ),
             error_type=(
                 "api_error"
@@ -804,31 +851,44 @@ def _exception_response(exception: BaseException) -> Response:
         error = OpenAIProtocolError(
             status_code=502,
             code="provider_output_too_large",
-            message="Provider output exceeded the gateway response limit.",
+            message=(
+                "Provider output exceeded the gateway response limit. "
+                "Request less output, for example with a lower max_tokens value."
+            ),
             error_type="api_error",
         )
     elif isinstance(exception, asyncio.CancelledError):
         error = OpenAIProtocolError(
             status_code=499,
             code="request_cancelled",
-            message="The gateway request was cancelled.",
+            message=(
+                "The gateway request was cancelled. Resend the request if cancellation "
+                "was not intended."
+            ),
             error_type="api_error",
         )
     elif isinstance(exception, GatewayDrainingError):
         error = OpenAIProtocolError(
             status_code=503,
             code="gateway_draining",
-            message="The gateway is draining and is not accepting new requests.",
+            message=(
+                "The gateway is draining and is not accepting new requests. "
+                "Retry after the delay in the Retry-After header."
+            ),
             error_type="api_error",
+            retry_after_seconds=_DRAINING_RETRY_AFTER_SECONDS,
         )
     else:
         error = OpenAIProtocolError(
             status_code=500,
             code="internal_error",
-            message="The gateway request failed.",
+            message=(
+                "The gateway request failed. Retry the request; if this persists, "
+                "ask the gateway operator to inspect the server logs."
+            ),
             error_type="api_error",
         )
-    return JSONResponse(error.json_body(), status_code=error.status_code)
+    return JSONResponse(error.json_body(), status_code=error.status_code, headers=error.headers())
 
 
 def _protocol_namespace(authorization: AuthorizationSnapshot) -> ProtocolNamespace:
