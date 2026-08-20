@@ -1,10 +1,10 @@
 # Experiential
 
-Experiential optimizes agent workflows from traces through a three-step process:
+Experiential is an open source gateway and router for agent workflows:
 
-1. Build a simulation using text world models grounded on your traces.
-2. Fit a router that determines which model every request should be sent to.
-3. Train custom open source models just for your agent.
+1. Use hosted, BYOK, and local models through one OpenAI-compatible API.
+2. Control which users and agents can use which models, for which use cases, and how much they can spend.
+3. Turn production traffic into a custom router or model optimized for quality, speed, and cost.
 
 ![Your traces flow through simulation into routing and training optimization](https://raw.githubusercontent.com/experientiallabs/experiential/main/assets/experiential-workflow.png)
 
