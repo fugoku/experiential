@@ -170,6 +170,7 @@ def test_bedrock_stream_normalizes_text_tools_usage_and_terminal_state() -> None
             GatewayEventKind.COMPLETED,
         ]
         assert events[2].raw_arguments_delta == '{"city":'
+        assert events[4].tool_call_index == 1
         assert events[4].tool_call is not None
         assert events[4].tool_call.raw_arguments == '{"city":"Zürich"}'
         assert events[5].usage is not None
@@ -177,6 +178,74 @@ def test_bedrock_stream_normalizes_text_tools_usage_and_terminal_state() -> None
         assert events[5].usage.cached_input_tokens == 2
         assert runtime.stream_calls[0]["modelId"] == "exact-model"
         assert upstream.closed
+
+    asyncio.run(scenario())
+
+
+def test_bedrock_empty_tool_input_delta_is_skipped() -> None:
+    """A leading empty toolUse input fragment produces no delta event and no failure."""
+
+    async def scenario() -> None:
+        """Consume one tool-call stream whose first input fragment is empty."""
+        upstream = _EventStream(
+            (
+                {"messageStart": {"role": "assistant"}},
+                {
+                    "contentBlockStart": {
+                        "contentBlockIndex": 0,
+                        "start": {
+                            "toolUse": {
+                                "toolUseId": "tool-empty",
+                                "name": "write",
+                            }
+                        },
+                    }
+                },
+                {
+                    "contentBlockDelta": {
+                        "contentBlockIndex": 0,
+                        "delta": {"toolUse": {"input": ""}},
+                    }
+                },
+                {
+                    "contentBlockDelta": {
+                        "contentBlockIndex": 0,
+                        "delta": {"toolUse": {"input": '{"path":"fib.py"}'}},
+                    }
+                },
+                {"contentBlockStop": {"contentBlockIndex": 0}},
+                {"messageStop": {"stopReason": "tool_use"}},
+                {
+                    "metadata": {
+                        "usage": {
+                            "inputTokens": 4,
+                            "outputTokens": 2,
+                            "cacheReadInputTokens": 0,
+                            "cacheWriteInputTokens": 0,
+                        }
+                    }
+                },
+            )
+        )
+        stream = await _client(_Runtime([upstream])).stream(
+            _request(),
+            deadline=RequestDeadline.after(10),
+            idempotency_key="empty-fragment-operation",
+            retry_policy=RetryPolicy(1, 0, 0),
+        )
+        events = [event async for event in stream]
+
+        assert [event.kind for event in events] == [
+            GatewayEventKind.TOOL_CALL_STARTED,
+            GatewayEventKind.TOOL_ARGUMENTS_DELTA,
+            GatewayEventKind.TOOL_CALL_COMPLETED,
+            GatewayEventKind.USAGE,
+            GatewayEventKind.COMPLETED,
+        ]
+        assert events[1].raw_arguments_delta == '{"path":"fib.py"}'
+        assert events[2].tool_call_index == 0
+        assert events[2].tool_call is not None
+        assert events[2].tool_call.raw_arguments == '{"path":"fib.py"}'
 
     asyncio.run(scenario())
 
