@@ -10,6 +10,7 @@ screen.
 
 from __future__ import annotations
 
+import re
 from collections.abc import MutableMapping, Sequence
 from dataclasses import dataclass, field
 from getpass import getpass
@@ -26,6 +27,7 @@ from exp.cli.shared.picker import (
     choose_one,
 )
 from exp.common.models import (
+    ConnectionConfig,
     ModelCapabilities,
     PricingSource,
     ProviderConnection,
@@ -68,6 +70,7 @@ _RECOVERY_RETRY = "retry"
 _RECOVERY_SKIP = "skip"
 _RECOVERY_BACK = "back"
 _PROVIDER_VISIBLE_ROWS = 3
+_ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 class SetupCancelled(Exception):
@@ -304,6 +307,100 @@ def _select_provider_rows(
     )
 
 
+def collect_provider_connection(
+    provider: str,
+    *,
+    console: Console,
+) -> ConnectionConfig | None:
+    """Collect the provider-specific connection metadata shared by setup entry points.
+
+    Args:
+        provider: Supported provider selected on the shared provider screen.
+        console: Terminal used for provider-specific fields.
+
+    Returns:
+        Secret-free connection metadata, or ``None`` when an optional endpoint field is skipped.
+
+    Raises:
+        ValueError: The provider is unsupported or the collected metadata is invalid.
+    """
+    if provider not in SETUP_PROVIDER_LABELS:
+        raise ValueError(f"unsupported provider {provider!r}")
+    base_url = None
+    api_version = None
+    region = None
+    if provider in ("openai-compatible", "azure"):
+        base_url = ask_text(f"{SETUP_PROVIDER_LABELS[provider]} base URL", console=console)
+        if not base_url:
+            return None
+    if provider == "azure":
+        api_version = ask_text("Azure OpenAI API version", console=console, default="v1")
+        if not api_version:
+            return None
+    if provider == "bedrock":
+        region = (
+            ask_text(
+                "AWS region (empty uses the AWS credential or session configuration)",
+                console=console,
+            )
+            or None
+        )
+    api_key_env = CANONICAL_CREDENTIAL_ENV.get(provider)
+    if provider == "openai-compatible":
+        while True:
+            candidate = (
+                ask_text(
+                    "Credential environment variable name",
+                    console=console,
+                    default=CANONICAL_CREDENTIAL_ENV[provider],
+                ).strip()
+                or CANONICAL_CREDENTIAL_ENV[provider]
+            )
+            if _ENVIRONMENT_NAME.fullmatch(candidate):
+                api_key_env = candidate
+                break
+            console.print(
+                "Credential environment variable names must match [A-Za-z_][A-Za-z0-9_]*.",
+                style="yellow",
+                markup=False,
+            )
+    return ConnectionConfig(
+        provider=provider,
+        base_url=base_url,
+        api_key_env=api_key_env,
+        api_version=api_version,
+        region=region,
+    )
+
+
+def collect_provider_connections(
+    providers: Sequence[str],
+    *,
+    console: Console,
+) -> tuple[tuple[str, ConnectionConfig], ...]:
+    """Collect connection metadata for every provider selected in the shared screen.
+
+    Args:
+        providers: Supported providers returned by ``select_providers``.
+        console: Terminal used for provider-specific fields.
+
+    Returns:
+        Provider names paired with the metadata accepted for each provider. A provider whose
+        optional endpoint field is left empty is skipped using the same rule as normal setup.
+
+    Raises:
+        ValueError: A provider is unsupported or its collected metadata is invalid.
+    """
+    connections: list[tuple[str, ConnectionConfig]] = []
+    for provider in providers:
+        connection = collect_provider_connection(provider, console=console)
+        if connection is None:
+            console.print(f"[yellow]Skipping {SETUP_PROVIDER_LABELS[provider]}.[/yellow]")
+            continue
+        connections.append((provider, connection))
+    return tuple(connections)
+
+
 def prepare_providers(
     session: SetupSession,
     *,
@@ -415,43 +512,26 @@ def _resolve_endpoint(
         SetupCancelled: The user cancelled setup at a prompt.
     """
     label = SETUP_PROVIDER_LABELS[provider]
-    base_url = None
-    api_version = None
-    region = None
-    if provider in ("openai-compatible", "azure"):
-        base_url = ask_text(f"{label} base URL", console=console)
-        if not base_url:
-            return None
-    if provider == "azure":
-        api_version = ask_text("Azure OpenAI API version", console=console, default="v1")
-        if not api_version:
-            return None
-    if provider == "bedrock":
-        region = (
-            ask_text(
-                "AWS region (empty uses the AWS credential or session configuration)",
-                console=console,
-            )
-            or None
-        )
-    api_key_env = CANONICAL_CREDENTIAL_ENV.get(provider)
+    config = collect_provider_connection(provider, console=console)
+    if config is None:
+        return None
     connection = _reused_connection(
         existing_connections,
         provider=provider,
-        api_key_env=api_key_env,
-        base_url=base_url,
-        api_version=api_version,
-        region=region,
+        api_key_env=config.api_key_env,
+        base_url=config.base_url,
+        api_version=config.api_version,
+        region=config.region,
     )
     configured = connection is not None
     if connection is None:
         connection = ProviderConnection(
             name=derive_connection_name(provider, taken_names),
             provider=provider,
-            api_key_env=api_key_env,
-            base_url=base_url,
-            api_version=api_version,
-            region=region,
+            api_key_env=config.api_key_env,
+            base_url=config.base_url,
+            api_version=config.api_version,
+            region=config.region,
         )
     if provider == "bedrock":
         return PreparedEndpoint(connection=connection, api_key="", configured=configured)
