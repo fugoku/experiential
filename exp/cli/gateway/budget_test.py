@@ -9,10 +9,41 @@ import click
 from typer.testing import CliRunner
 
 from exp.cli.app import app
+from exp.common.core.artifacts import canonical_json_bytes
+from exp.common.models import ModelCapabilities
+from exp.common.models.gateway_catalog import (
+    ExactModelDeployment,
+    ExactModelPool,
+    NormalizedGatewayCatalog,
+)
 from exp.runtime.gateway.contracts import DirectTarget
 from exp.runtime.gateway.management import GatewayManagement
 
-_DIGEST = "a" * 64
+
+def _snapshot_catalog() -> NormalizedGatewayCatalog:
+    """Build the pinned singleton-pool catalog snapshot for the fixture alias."""
+    return NormalizedGatewayCatalog(
+        deployments=(
+            ExactModelDeployment(
+                deployment_id="azure-primary",
+                source_alias="azure-primary",
+                exact_model_id="exact-one",
+                connection="connection-one",
+                provider="openai-compatible",
+                provider_model="provider-model",
+                connection_sha256="b" * 64,
+                capabilities_sha256="c" * 64,
+                capabilities=ModelCapabilities(maximum_output_tokens=16),
+            ),
+        ),
+        pools=(
+            ExactModelPool(
+                pool_id="pool-one",
+                exact_model_id="exact-one",
+                deployment_ids=("azure-primary",),
+            ),
+        ),
+    )
 
 
 def _configured(root: Path) -> GatewayManagement:
@@ -21,10 +52,15 @@ def _configured(root: Path) -> GatewayManagement:
     manager.initialize()
     store = manager.require_initialized()
     manager.create_identity(identity_id="identity-one", display_name="Identity")
+    catalog = _snapshot_catalog()
+    (manager.state_dir / "snapshot-one").write_bytes(
+        canonical_json_bytes(catalog.model_dump(mode="json"))
+    )
+    digest = catalog.identity_sha256()
     store.register_catalog_snapshot(
         organization_id=manager.organization_id,
         snapshot_ref="snapshot-one",
-        catalog_sha256=_DIGEST,
+        catalog_sha256=digest,
     )
     store.activate_alias_revision(
         organization_id=manager.organization_id,
@@ -33,7 +69,7 @@ def _configured(root: Path) -> GatewayManagement:
         revision_id="revision-one",
         target=DirectTarget(pool_id="pool-one"),
         snapshot_ref="snapshot-one",
-        catalog_sha256=_DIGEST,
+        catalog_sha256=digest,
     )
     return manager
 
