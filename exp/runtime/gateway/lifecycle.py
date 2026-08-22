@@ -37,6 +37,7 @@ from exp.runtime.gateway.contracts import (
     ProjectTarget,
 )
 from exp.runtime.gateway.execution import GatewayExecutor
+from exp.runtime.gateway.group_commit import GroupCommitAttemptLedger
 from exp.runtime.gateway.interfaces import ProjectTargetResolver
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.management import GatewayAliasView, GatewayManagement
@@ -77,6 +78,7 @@ class LocalGatewayRuntime:
     runtime: GatewayRuntime
     reconciled_expired_requests: int
     reconciled_unknown_attempts: int
+    write_ledger: GroupCommitAttemptLedger | None = None
 
     @property
     def app(self) -> FastAPI:
@@ -106,8 +108,11 @@ class LocalGatewayRuntime:
         return await self.runtime.drain(timeout_seconds=timeout_seconds)
 
     async def shutdown(self) -> bool:
-        """Shut down the shared runtime within its local bound."""
-        return await self.runtime.shutdown()
+        """Shut down the shared runtime, then stop the drained ledger writer."""
+        stopped = await self.runtime.shutdown()
+        if self.write_ledger is not None:
+            self.write_ledger.close()
+        return stopped
 
 
 @dataclass(frozen=True)
@@ -395,7 +400,8 @@ def load_local_gateway(
         project_resolver=_project_resolver(state.activations, state.exact_models),
         listing_pools=state.listing_pools,
     )
-    executor = GatewayExecutor(state.runtime_catalogs, ledger)
+    write_ledger = GroupCommitAttemptLedger(ledger)
+    executor = GatewayExecutor(state.runtime_catalogs, write_ledger)
     reloader = _AliasAuthorityReloader(
         loader=loader,
         state=state,
@@ -413,7 +419,7 @@ def load_local_gateway(
             title="EXP local gateway",
         ),
         authority=_ReadyControlStore(store=store, reloader=reloader),
-        ledger=ledger,
+        ledger=write_ledger,
         routes=routes,
         executor=executor,
         clock=SystemGatewayClock(),
@@ -421,9 +427,11 @@ def load_local_gateway(
         usage=lambda: read_usage_report(ledger, organization_id=manager.organization_id),
         replay=replay,
         continuations=continuations,
+        terminal_flusher=write_ledger.flush,
     )
     return LocalGatewayRuntime(
         runtime=runtime,
+        write_ledger=write_ledger,
         reconciled_expired_requests=expired,
         reconciled_unknown_attempts=unknown,
     )
