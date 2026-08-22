@@ -50,6 +50,22 @@ _GRACEFUL_TIMEOUT_OPTION = typer.Option(
     min=0.1,
     help="Seconds to drain admitted gateway work during shutdown.",
 )
+_ENGINE_OPTION = typer.Option(
+    "auto",
+    "--engine",
+    help=(
+        "Data-plane engine: 'auto' (rust when built, otherwise python), 'rust' "
+        "(native data plane with an embedded python engine for Responses, "
+        "replay, and project aliases), or 'python' (uvicorn only)."
+    ),
+)
+_MAX_ACTIVE_REQUESTS_DEFAULT = 1024
+_MAX_ACTIVE_REQUESTS_OPTION = typer.Option(
+    _MAX_ACTIVE_REQUESTS_DEFAULT,
+    "--max-active-requests",
+    min=1,
+    help="Rust engine only: maximum concurrently admitted requests.",
+)
 
 
 def run(
@@ -65,6 +81,8 @@ def run(
     json_output: bool = _JSON_OPTION,
     check: bool = _CHECK_OPTION,
     graceful_timeout: float = _GRACEFUL_TIMEOUT_OPTION,
+    engine: str = _ENGINE_OPTION,
+    max_active_requests: int = _MAX_ACTIVE_REQUESTS_OPTION,
 ) -> None:
     """Start the local gateway, optionally materializing one project-backed alias.
 
@@ -78,13 +96,46 @@ def run(
         json_output: Whether startup output is one versioned JSON receipt.
         check: Whether to validate gateway readiness without binding.
         graceful_timeout: Gateway shutdown drain bound in seconds.
+        engine: Data-plane engine: ``auto``, ``rust``, or ``python``.
+        max_active_requests: Rust engine concurrent-admission bound.
 
     Raises:
         typer.BadParameter: The selected form or activation is invalid.
     """
+    if engine not in {"auto", "rust", "python"}:
+        raise typer.BadParameter("--engine must be 'auto', 'rust', or 'python'")
     if policy is not None or ghost:
         if project is None:
             raise typer.BadParameter("--policy and --ghost require the 'exp run PROJECT' form")
+    if engine == "rust" and project is not None:
+        raise typer.BadParameter(
+            "--engine rust serves direct aliases only; project-backed serving "
+            "requires the python engine"
+        )
+    if project is None and engine != "python":
+        blocker = _rust_engine_blocker(root)
+        if blocker is None:
+            _run_rust_gateway(
+                root=root,
+                port=port,
+                json_output=json_output,
+                check=check,
+                max_active_requests=max_active_requests,
+                graceful_timeout=graceful_timeout,
+            )
+            return
+        if engine == "rust":
+            if blocker == _NOT_INITIALIZED_BLOCKER:
+                _gateway_not_initialized(json_output=json_output)
+            raise typer.BadParameter(blocker)
+        if not json_output:
+            _console.print(f"[yellow]rust engine unavailable ({blocker}); using python[/yellow]")
+    if max_active_requests != _MAX_ACTIVE_REQUESTS_DEFAULT:
+        typer.echo(
+            "--max-active-requests applies only to the rust engine; the python "
+            "engine keeps its own executor bound",
+            err=True,
+        )
     _run_gateway(
         project=project,
         root=root,
@@ -192,6 +243,186 @@ def _run_gateway(
         if setup is not None:
             _emit_setup_recovery(setup=setup)
         raise
+
+
+_NOT_INITIALIZED_BLOCKER = "the gateway is not initialized yet"
+
+
+def _rust_engine_blocker(root: Path) -> str | None:
+    """Return why the rust data plane cannot serve this root, or ``None``.
+
+    Args:
+        root: Local artifact and model-catalog root.
+
+    Returns:
+        A display-safe reason to use the python engine, or ``None`` when the
+        rust engine can serve every granted active alias.
+    """
+    import importlib.util
+
+    from exp.runtime.gateway.management import GatewayManagement
+
+    if importlib.util.find_spec("exp_gateway_native") is None:
+        return (
+            "the exp_gateway_native extension is not built; run 'just native' "
+            "(uv run maturin develop --uv --release "
+            "--manifest-path exp/runtime/gateway/native/Cargo.toml)"
+        )
+    manager = GatewayManagement(root)
+    if not manager.initialized:
+        return _NOT_INITIALIZED_BLOCKER
+    return None
+
+
+def _run_rust_gateway(
+    *,
+    root: Path,
+    port: int,
+    json_output: bool,
+    check: bool,
+    max_active_requests: int,
+    graceful_timeout: float,
+) -> None:
+    """Serve the rust data plane with an embedded python fallback engine.
+
+    The rust engine owns the public socket and the anonymous Chat Completions
+    fast path; a python engine over the same authority, ledger, and routes
+    runs on an internal loopback port and serves Responses, replay-keyed
+    chat, project-backed aliases, and the usage page.
+
+    Args:
+        root: Local artifact and model-catalog root.
+        port: Local loopback TCP port.
+        json_output: Whether startup output is one versioned JSON receipt.
+        check: Whether to validate gateway readiness without binding.
+        max_active_requests: Concurrent-admission bound for the data plane.
+        graceful_timeout: Gateway shutdown drain bound in seconds.
+
+    Raises:
+        typer.BadParameter: The extension module is missing or the gateway
+            configuration cannot form one ready route.
+    """
+    if not json_output:
+        _emit_exp_wordmark()
+
+    import importlib
+    import socket
+    import threading
+    import time
+
+    import uvicorn
+
+    from exp.optimize.router.activation import verify_automatic_router_policy
+    from exp.runtime.gateway.lifecycle import (
+        compose_local_gateway,
+        gateway_instance_lock,
+        load_gateway_components,
+    )
+    from exp.runtime.gateway.management import GatewayManagement
+    from exp.runtime.gateway.native_bridge import NativeControlPlane
+    from exp.runtime.gateway.project_activation import LocalArtifactProjectActivationRepository
+
+    try:
+        exp_gateway_native = importlib.import_module("exp_gateway_native")
+    except ModuleNotFoundError as exc:
+        raise typer.BadParameter(
+            "the Rust gateway engine is not built; run 'just native' "
+            "(uv run maturin develop --uv --release "
+            "--manifest-path exp/runtime/gateway/native/Cargo.toml) and retry"
+        ) from exc
+
+    manager = GatewayManagement(root)
+    if not manager.initialized:
+        _gateway_not_initialized(json_output=json_output)
+    with usage_error(ValueError):
+        with gateway_instance_lock(root, port=port):
+            project_repository = LocalArtifactProjectActivationRepository(
+                root,
+                verifier=verify_automatic_router_policy,
+            )
+            components = load_gateway_components(root, project_repository=project_repository)
+            control_plane = NativeControlPlane(components)
+            runtime = compose_local_gateway(
+                components,
+                graceful_timeout_seconds=graceful_timeout,
+            )
+            asyncio.run(runtime.service.preflight())
+            receipt = {
+                "schema_version": 1,
+                "operation": "gateway.check" if check else "gateway.run",
+                "status": "ready",
+                "engine": "rust",
+                "base_url": f"http://{_LOOPBACK_HOST}:{port}/v1",
+                "usage_url": f"http://{_LOOPBACK_HOST}:{port}/usage",
+                "reconciled_expired_requests": control_plane.reconciled_expired_requests,
+                "reconciled_unknown_attempts": control_plane.reconciled_unknown_attempts,
+                "launch_mode": "gateway",
+            }
+            if json_output:
+                typer.echo(json.dumps(receipt, separators=(",", ":")))
+            elif not check:
+                _console.print(
+                    f"[green]Gateway ready (rust engine)[/green] http://{_LOOPBACK_HOST}:{port}/v1",
+                    markup=True,
+                )
+            if check:
+                return
+
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                try:
+                    probe.bind((_LOOPBACK_HOST, port))
+                except OSError as exc:
+                    raise typer.BadParameter(
+                        f"port {port} is unavailable on {_LOOPBACK_HOST}: {exc}"
+                    ) from exc
+
+            # The fallback socket stays bound from allocation to serving so
+            # the ephemeral port cannot be lost to another process.
+            fallback_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            fallback_socket.bind((_LOOPBACK_HOST, 0))
+            fallback_port = fallback_socket.getsockname()[1]
+            fallback = uvicorn.Server(
+                uvicorn.Config(
+                    runtime.app,
+                    host=_LOOPBACK_HOST,
+                    port=fallback_port,
+                    log_level="warning",
+                )
+            )
+            fallback_thread = threading.Thread(
+                target=lambda: fallback.run(sockets=[fallback_socket]),
+                name="exp-fallback-engine",
+                daemon=True,
+            )
+            fallback_thread.start()
+            deadline = time.monotonic() + 30
+            while not fallback.started:
+                if not fallback_thread.is_alive() or time.monotonic() > deadline:
+                    raise typer.BadParameter(
+                        "the embedded python fallback engine failed to start; "
+                        "inspect the gateway configuration with 'exp run --engine python'"
+                    )
+                time.sleep(0.05)
+            try:
+                config = json.dumps(
+                    {
+                        "host": _LOOPBACK_HOST,
+                        "port": port,
+                        "max_active_requests": max_active_requests,
+                        "request_timeout_seconds": control_plane.request_timeout_seconds,
+                        "fallback_port": fallback_port,
+                        "graceful_timeout_seconds": graceful_timeout,
+                    }
+                )
+                try:
+                    exp_gateway_native.serve(control_plane, config)
+                except RuntimeError as exc:
+                    raise typer.BadParameter(f"the gateway engine failed: {exc}") from exc
+            finally:
+                fallback.should_exit = True
+                fallback_thread.join(timeout=graceful_timeout + 5)
+                fallback_socket.close()
 
 
 def _emit_exp_wordmark() -> None:
