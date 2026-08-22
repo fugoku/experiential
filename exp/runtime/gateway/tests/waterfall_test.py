@@ -1384,6 +1384,7 @@ class _WaterfallLedger:
         self.started: list[tuple[str, int, int]] = []
         self.finished: list[tuple[str, GatewayFailure | None, bool]] = []
         self.finished_events: list[GatewayEvent | None] = []
+        self.first_token_ats: list[datetime | None] = []
         self.parent_finishes: list[GatewayFailure] = []
         self.rejected_deployments = rejected_deployments or set()
         self.rejected_scope = rejected_scope
@@ -1429,10 +1430,12 @@ class _WaterfallLedger:
         terminal_event: GatewayEvent | None,
         failure: GatewayFailure | None,
         finalize_request: bool = True,
+        first_token_at: datetime | None = None,
     ) -> None:
         """Record physical settlement and whether it owns parent terminalization."""
         self.finished_events.append(terminal_event)
         self.finished.append((attempt_id, failure, finalize_request))
+        self.first_token_ats.append(first_token_at)
 
     async def finish_request(
         self,
@@ -1545,3 +1548,115 @@ def _authorization(catalog_sha256: str) -> AuthorizationSnapshot:
         canonical_request_sha256=_DIGEST,
         deadline_monotonic=1.0,
     )
+
+
+class _FixedClock:
+    """Wall and monotonic clock returning one fixed instant for TTFT stamping."""
+
+    def __init__(self, wall: datetime) -> None:
+        """Retain the fixed wall time reported to first-token stamping."""
+        self._wall = wall
+
+    def now(self) -> datetime:
+        """Return the fixed timezone-aware wall time."""
+        return self._wall
+
+    def monotonic(self) -> float:
+        """Return a fixed monotonic reading unused by the request deadline."""
+        return 0.0
+
+
+def test_first_token_time_is_stamped_on_the_winning_attempt() -> None:
+    """The winning attempt's first streamed token time reaches durable settlement."""
+    first = _deployment("route-a", connection_sha256="b" * 64)
+    provider = _ScriptedProvider([_completed_stream("hello world")])
+    ledger = _WaterfallLedger()
+    catalog = cast(
+        RuntimeModelCatalog,
+        _WaterfallRuntimeCatalog((first,), {first.source_alias: provider}),
+    )
+    stamped = datetime(2026, 8, 22, 12, 0, tzinfo=UTC)
+    executor = GatewayExecutor(
+        {("revision-one", _DIGEST): catalog},
+        ledger,
+        clock=_FixedClock(stamped),
+    )
+
+    async def consume() -> list[GatewayEvent]:
+        """Run one logical request and collect its outward events."""
+        stream = await executor.start(route=_route((first,)), request=_request())
+        return [event async for event in stream]
+
+    events = asyncio.run(consume())
+
+    assert any(event.text_delta == "hello world" for event in events)
+    assert ledger.first_token_ats == [stamped]
+
+
+def test_first_token_time_is_absent_when_no_token_is_streamed() -> None:
+    """An attempt that fails before its first token records no first-token time."""
+    first = _deployment("route-a", connection_sha256="b" * 64)
+    provider = _ScriptedProvider([ProviderTransportError("connection failed")])
+    ledger = _WaterfallLedger()
+    catalog = cast(
+        RuntimeModelCatalog,
+        _WaterfallRuntimeCatalog((first,), {first.source_alias: provider}),
+    )
+    executor = GatewayExecutor(
+        {("revision-one", _DIGEST): catalog},
+        ledger,
+        maximum_same_deployment_attempts=1,
+    )
+
+    async def consume() -> None:
+        """Run one logical request that fails before any streamed token."""
+        with pytest.raises(GatewayExecutionError):
+            await executor.start(route=_route((first,)), request=_request())
+
+    asyncio.run(consume())
+
+    assert ledger.first_token_ats == [None]
+
+
+def test_buffered_refusal_stamps_first_token_at_receipt_not_commit() -> None:
+    """A buffered refusal that fails over records first-token at receipt, never null."""
+    first = _deployment("route-a", connection_sha256="b" * 64)
+    second = _deployment("route-b", connection_sha256="c" * 64)
+    first_events = (
+        GatewayEvent(kind=GatewayEventKind.REFUSAL_DELTA, sequence_number=0, text_delta="no"),
+        GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=1),
+    )
+    ledger = _WaterfallLedger()
+    catalog = cast(
+        RuntimeModelCatalog,
+        _WaterfallRuntimeCatalog(
+            (first, second),
+            {
+                first.source_alias: _ScriptedProvider([_WaterfallStream(first_events)]),
+                second.source_alias: _ScriptedProvider([_completed_stream("fallback")]),
+            },
+        ),
+    )
+    stamped = datetime(2026, 8, 22, 12, 0, tzinfo=UTC)
+    executor = GatewayExecutor(
+        {("revision-one", _DIGEST): catalog},
+        ledger,
+        maximum_same_deployment_attempts=1,
+        clock=_FixedClock(stamped),
+    )
+
+    async def consume() -> list[GatewayEvent]:
+        """Run one refusal-failover request and collect its outward events."""
+        stream = await executor.start(
+            route=_route((first, second), refusal_failover=True),
+            request=_request(),
+        )
+        return [event async for event in stream]
+
+    events = asyncio.run(consume())
+
+    assert any(event.text_delta == "fallback" for event in events)
+    # The refused first attempt stamps first-token when the withheld refusal delta is
+    # received (not when the buffer later commits or fails over), so it is never null.
+    assert ledger.first_token_ats[0] == stamped
+    assert ledger.first_token_ats[-1] == stamped

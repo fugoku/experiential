@@ -67,6 +67,7 @@ from exp.runtime.gateway.native_responses import (
 )
 from exp.runtime.gateway.native_settlement import (
     deployment_operation_key,
+    first_token_at_from_settlement,
     optional_text,
     terminal_from_settlement,
 )
@@ -289,8 +290,9 @@ class NativeControlPlane:
 
         Args:
             argument: JSON object with ``raw_key``, ``body`` (raw request
-                body text), and optional ``surface`` (``"chat"`` or
-                ``"responses"``, defaulting to chat).
+                body text), optional ``surface`` (``"chat"`` or
+                ``"responses"``, defaulting to chat), and optional
+                ``app_referer``/``app_title`` caller app identity.
 
         Returns:
             JSON wire configuration for the single resolved deployment,
@@ -314,11 +316,16 @@ class NativeControlPlane:
         request = decoded.request
         deadline = time.monotonic() + self._request_timeout_seconds
         try:
+            # ``app_referer``/``app_title`` are forwarded when the native engine includes the
+            # caller HTTP-Referer/X-Title in its admit payload; absent them app attribution
+            # stays null on the default path until the Rust engine populates them.
             authorization = self._components.store.authorize_request(
                 raw_key=data["raw_key"],
                 alias=decoded.alias,
                 request=request,
                 deadline_monotonic=deadline,
+                app_referer=optional_text(data.get("app_referer")),
+                app_title=optional_text(data.get("app_title")),
             )
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             raise _authority_error(exc) from exc
@@ -494,6 +501,8 @@ class NativeControlPlane:
                 alias=decoded.alias,
                 request=request,
                 deadline_monotonic=deadline,
+                app_referer=optional_text(data.get("app_referer")),
+                app_title=optional_text(data.get("app_title")),
             )
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             raise _authority_error(exc) from exc
@@ -588,12 +597,14 @@ class NativeControlPlane:
         if entry is None:
             return "{}"
         terminal, failure = terminal_from_settlement(data)
+        first_token_at = first_token_at_from_settlement(data)
         try:
             self._write_ledger.finish_attempt(
                 attempt_id=entry.attempt_id,
                 terminal_event=terminal,
                 failure=failure,
                 finalize_request=True,
+                first_token_at=first_token_at,
             )
         except Exception as exc:  # noqa: BLE001 - the data plane retries.
             # The exact settlement is retained so a retry (from the data
