@@ -9,7 +9,12 @@ from pathlib import Path
 from pydantic import Field
 
 from exp.common.core.artifacts import ContractModel, stable_id
-from exp.common.models import ConnectionConfig, ModelCatalog, load_model_catalog
+from exp.common.models import (
+    GATEWAY_EXCLUDED_PROVIDERS,
+    ConnectionConfig,
+    ModelCatalog,
+    load_model_catalog,
+)
 from exp.runtime.gateway.auth import IssuedVirtualKey
 from exp.runtime.gateway.contracts import DirectTarget, ProjectTarget
 from exp.runtime.gateway.sqlite import key_delivery
@@ -20,6 +25,27 @@ from exp.runtime.gateway.sqlite.provider_authority import (
     ProviderConnectionMutation,
 )
 from exp.runtime.gateway.sqlite.store import GatewayStoreError, SQLiteGatewayStore
+from exp.runtime.models import SUPPORTED_PROVIDERS
+
+
+def require_gateway_servable_provider(*, connection_id: str, provider: str) -> None:
+    """Fail closed on a provider the gateway cannot serve.
+
+    Args:
+        connection_id: Operator-facing connection name used in the error.
+        provider: Authored provider identifier to validate.
+
+    Raises:
+        GatewayStoreError: The provider is outside the runtime registry set or
+            its records never become gateway deployments.
+    """
+    servable = SUPPORTED_PROVIDERS - GATEWAY_EXCLUDED_PROVIDERS
+    if provider not in servable:
+        supported = ", ".join(sorted(servable))
+        raise GatewayStoreError(
+            f"provider connection {connection_id!r} uses unsupported provider "
+            f"{provider!r}; choose one of: {supported}"
+        )
 
 
 class GatewayIdentityView(ContractModel):
@@ -147,7 +173,18 @@ class GatewayManagement:
         config: ConnectionConfig,
         replace: bool = False,
     ) -> tuple[bool, ProviderConnectionAuthority]:
-        """Create or revise one SQLite-authoritative serving connection."""
+        """Create or revise one SQLite-authoritative serving connection.
+
+        Raises:
+            GatewayStoreError: The connection names a provider the gateway
+                cannot serve, either because the runtime registry cannot
+                construct a client for it or because its records never become
+                gateway deployments.
+        """
+        require_gateway_servable_provider(
+            connection_id=connection_id,
+            provider=config.provider,
+        )
         revision_id = stable_id(
             "provider-connection-revision",
             {
