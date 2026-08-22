@@ -31,13 +31,20 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.interfaces import GatewayClock
 from exp.runtime.gateway.sqlite import key_delivery
-from exp.runtime.gateway.sqlite.alias_activation import alias_activation_transaction
+from exp.runtime.gateway.sqlite.alias_activation import (
+    activate_alias_revision_in_transaction,
+    alias_activation_transaction,
+)
 from exp.runtime.gateway.sqlite.migrations import initialize_database, persistent_connection
 from exp.runtime.gateway.sqlite.provider_authority import (
     ProviderConnectionBinding,
-    bind_alias_provider_connections,
+    ProviderConnectionMutation,
 )
 from exp.runtime.gateway.sqlite.provider_store import ProviderConnectionStoreMixin
+from exp.runtime.gateway.sqlite.setup_authority import (
+    configure_direct_alias_with_identity,
+    upsert_provider_connections_and_activate_direct_alias,
+)
 
 _LAST_USED_REFRESH_SECONDS = 60.0
 
@@ -480,115 +487,84 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
             catalog_sha256=catalog_sha256,
             refusal_failover=refusal_failover,
         ) as connection:
-            snapshot = connection.execute(
-                """
-                SELECT 1 FROM catalog_snapshot_refs
-                WHERE organization_id = ? AND snapshot_ref = ? AND catalog_sha256 = ?
-                """,
-                (organization_id, snapshot_ref, catalog_sha256),
-            ).fetchone()
-            if snapshot is None:
-                raise GatewayStoreError("catalog snapshot reference is not registered")
-            alias_row = connection.execute(
-                """
-                SELECT alias_name FROM gateway_aliases
-                WHERE organization_id = ? AND alias_id = ?
-                """,
-                (organization_id, alias_id),
-            ).fetchone()
-            if alias_row is None:
-                connection.execute(
-                    """
-                    INSERT INTO gateway_aliases (
-                        alias_id, organization_id, alias_name, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (alias_id, organization_id, alias_name, now, now),
-                )
-                revision_number = 1
-            else:
-                if str(alias_row["alias_name"]) != alias_name:
-                    raise GatewayStoreError("alias ID cannot be renamed")
-                revision_number = int(
-                    connection.execute(
-                        """
-                        SELECT COALESCE(MAX(revision_number), 0) + 1
-                        FROM alias_revisions WHERE organization_id = ? AND alias_id = ?
-                        """,
-                        (organization_id, alias_id),
-                    ).fetchone()[0]
-                )
-            pool_id: str | None = None
-            project_ref: str | None = None
-            activation_ref: str | None = None
-            if isinstance(target, DirectTarget):
-                pool_id = target.pool_id
-            else:
-                project_ref = target.project_ref
-                activation_ref = target.activation_ref
-            connection.execute(
-                """
-                INSERT INTO alias_revisions (
-                    revision_id, organization_id, alias_id, revision_number, target_kind,
-                    pool_id, project_ref, activation_ref, catalog_sha256, snapshot_ref,
-                    refusal_failover, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    revision_id,
-                    organization_id,
-                    alias_id,
-                    revision_number,
-                    target.kind,
-                    pool_id,
-                    project_ref,
-                    activation_ref,
-                    catalog_sha256,
-                    snapshot_ref,
-                    int(refusal_failover),
-                    now,
-                ),
-            )
-            bind_alias_provider_connections(
+            activate_alias_revision_in_transaction(
                 connection,
                 organization_id=organization_id,
                 alias_id=alias_id,
-                alias_revision_id=revision_id,
-                bindings=provider_connections,
+                alias_name=alias_name,
+                revision_id=revision_id,
+                target=target,
+                snapshot_ref=snapshot_ref,
+                catalog_sha256=catalog_sha256,
+                provider_connections=provider_connections,
+                refusal_failover=refusal_failover,
                 now=now,
+                store_error=GatewayStoreError,
             )
-            connection.execute(
-                """
-                DELETE FROM project_activation_bindings
-                WHERE organization_id = ? AND alias_id = ?
-                """,
-                (organization_id, alias_id),
-            )
-            if isinstance(target, ProjectTarget):
-                connection.execute(
-                    """
-                    INSERT INTO project_activation_bindings (
-                        organization_id, project_ref, activation_ref,
-                        alias_id, revision_id, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        organization_id,
-                        target.project_ref,
-                        target.activation_ref,
-                        alias_id,
-                        revision_id,
-                        now,
-                    ),
-                )
-            connection.execute(
-                """
-                UPDATE gateway_aliases
-                SET active_revision_id = ?, active = 1, updated_at = ?
-                WHERE organization_id = ? AND alias_id = ?
-                """,
-                (revision_id, now, organization_id, alias_id),
-            )
+
+    def upsert_provider_connections_and_activate_direct_alias(
+        self,
+        *,
+        organization_id: str,
+        alias_id: str,
+        alias_name: str,
+        revision_id: str,
+        pool_id: str,
+        snapshot_ref: str,
+        catalog_sha256: Sha256,
+        provider_connections: tuple[ProviderConnectionMutation, ...],
+        replace: bool,
+        refusal_failover: bool = False,
+    ) -> None:
+        """Atomically revise providers, register a snapshot, and activate one direct alias."""
+        upsert_provider_connections_and_activate_direct_alias(
+            self,
+            organization_id=organization_id,
+            alias_id=alias_id,
+            alias_name=alias_name,
+            revision_id=revision_id,
+            pool_id=pool_id,
+            snapshot_ref=snapshot_ref,
+            catalog_sha256=catalog_sha256,
+            provider_connections=provider_connections,
+            replace=replace,
+            refusal_failover=refusal_failover,
+            activate_alias_revision=activate_alias_revision_in_transaction,
+        )
+
+    def configure_direct_alias_with_identity(
+        self,
+        *,
+        organization_id: str,
+        alias_id: str,
+        alias_name: str,
+        revision_id: str,
+        pool_id: str,
+        snapshot_ref: str,
+        catalog_sha256: Sha256,
+        provider_connections: tuple[ProviderConnectionMutation, ...],
+        replace: bool,
+        identity_id: str,
+        identity_display_name: str,
+        key_id: str,
+    ) -> tuple[bool, IssuedVirtualKey]:
+        """Atomically configure serving authority and setup caller credentials."""
+        return configure_direct_alias_with_identity(
+            self,
+            organization_id=organization_id,
+            alias_id=alias_id,
+            alias_name=alias_name,
+            revision_id=revision_id,
+            pool_id=pool_id,
+            snapshot_ref=snapshot_ref,
+            catalog_sha256=catalog_sha256,
+            provider_connections=provider_connections,
+            replace=replace,
+            identity_id=identity_id,
+            identity_display_name=identity_display_name,
+            key_id=key_id,
+            activate_alias_revision=activate_alias_revision_in_transaction,
+        )
 
     def disable_alias(self, *, organization_id: str, alias_id: str) -> bool:
         """Disable one alias and release its active project binding.

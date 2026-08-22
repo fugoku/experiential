@@ -7,6 +7,7 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.prompt import Confirm
 from rich.text import Text
 
 from exp.cli.gateway.serve import (
@@ -19,6 +20,7 @@ from exp.cli.gateway.serve import (
 from exp.cli.shared.picker import PickerAction, PickerOption, choose_one
 from exp.cli.shared.theme import EXP_THEME
 from exp.runtime.gateway.management import GatewayManagement
+from exp.runtime.gateway.sqlite.alias_activation import AliasActivationOutcomeUnknownError
 
 _MENU_OPTIONS = (
     PickerOption(
@@ -225,19 +227,59 @@ def _start_from_menu(
 
 
 def _setup_from_menu(console: Console, *, root: Path, port: int) -> None:
-    """Run first-run setup without starting the server, then return to the menu."""
+    """Run setup or explicit reconfiguration without starting the server."""
     from exp.cli.gateway.setup import interactive_gateway_setup
 
+    reconfigure = GatewayManagement(root).initialized
+    if reconfigure:
+        console.print(
+            "[yellow]Gateway already configured.[/yellow]\n"
+            "Reconfiguration replaces the selected provider and public alias revisions. "
+            "Existing identities, keys, grants, usage, and history remain.",
+            markup=True,
+        )
+        try:
+            confirmed = Confirm.ask(
+                "Continue with gateway reconfiguration?",
+                default=False,
+                console=console,
+            )
+        except (EOFError, KeyboardInterrupt):
+            console.print("[yellow]Gateway reconfiguration cancelled.[/yellow]")
+            return
+        if not confirmed:
+            console.print("[yellow]Gateway reconfiguration cancelled.[/yellow]")
+            return
+
     try:
-        setup = interactive_gateway_setup(root, console=console)
+        if reconfigure:
+            setup = interactive_gateway_setup(
+                root,
+                console=console,
+                allow_reconfigure=True,
+            )
+        else:
+            setup = interactive_gateway_setup(root, console=console)
     except typer.Abort:
         console.print("[yellow]Gateway setup cancelled.[/yellow]")
+        return
+    except AliasActivationOutcomeUnknownError as exc:
+        console.print(
+            "[yellow]Gateway setup outcome is unknown; inspect gateway status before "
+            "retrying.[/yellow]"
+        )
+        if exc.issued is not None:
+            console.print(
+                f"Preserve this one-time gateway key: {exc.issued.raw_key}",
+                markup=False,
+            )
         return
     except ValueError as exc:
         console.print(f"[yellow]{exc}[/yellow]")
         return
     emit_setup_credentials(port=port, setup=setup, console=console)
-    console.print("[green]✓ Gateway configured[/green] Choose Default Gateway to start it.")
+    outcome = "reconfigured" if reconfigure else "configured"
+    console.print(f"[green]✓ Gateway {outcome}[/green] Choose Default Gateway to start it.")
 
 
 def _show_status(console: Console, *, root: Path) -> None:

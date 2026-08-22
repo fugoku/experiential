@@ -17,6 +17,7 @@ from exp.runtime.gateway.sqlite.migrations import connect_database
 from exp.runtime.gateway.sqlite.provider_authority import (
     ProviderConnectionAuthority,
     ProviderConnectionBinding,
+    ProviderConnectionMutation,
 )
 from exp.runtime.gateway.sqlite.store import GatewayStoreError, SQLiteGatewayStore
 
@@ -160,6 +161,124 @@ class GatewayManagement:
             revision_id=revision_id,
             config=config,
             replace=replace,
+        )
+
+    def configure_direct_alias(
+        self,
+        *,
+        alias_id: str,
+        alias_name: str,
+        revision_id: str,
+        pool_id: str,
+        snapshot_ref: str,
+        catalog_sha256: str,
+        provider_connections: dict[str, ConnectionConfig],
+        replace: bool,
+    ) -> None:
+        """Atomically revise serving connections and activate one direct alias revision.
+
+        Args:
+            alias_id: Stable public alias identifier.
+            alias_name: Public model string.
+            revision_id: Immutable alias revision identifier.
+            pool_id: Direct target pool identifier.
+            snapshot_ref: Content-addressed catalog snapshot reference.
+            catalog_sha256: Exact normalized catalog digest.
+            provider_connections: Desired secret-free SQLite-authoritative connection metadata.
+            replace: Whether differing active connection metadata may be revised.
+
+        Raises:
+            GatewayStoreError: The requested authority violates an existing invariant.
+        """
+        mutations = tuple(
+            ProviderConnectionMutation(
+                connection_id=connection_id,
+                revision_id=stable_id(
+                    "provider-connection-revision",
+                    {
+                        "connection_id": connection_id,
+                        "config": config.model_dump(mode="json", exclude_none=False),
+                    },
+                ),
+                config=config,
+            )
+            for connection_id, config in sorted(provider_connections.items())
+        )
+        self.require_initialized().upsert_provider_connections_and_activate_direct_alias(
+            organization_id=self.organization_id,
+            alias_id=alias_id,
+            alias_name=alias_name,
+            revision_id=revision_id,
+            pool_id=pool_id,
+            snapshot_ref=snapshot_ref,
+            catalog_sha256=catalog_sha256,
+            provider_connections=mutations,
+            replace=replace,
+        )
+
+    def configure_direct_alias_with_identity(
+        self,
+        *,
+        alias_id: str,
+        alias_name: str,
+        revision_id: str,
+        pool_id: str,
+        snapshot_ref: str,
+        catalog_sha256: str,
+        provider_connections: dict[str, ConnectionConfig],
+        replace: bool,
+        identity_id: str,
+        identity_display_name: str,
+        key_id: str,
+    ) -> tuple[bool, IssuedVirtualKey]:
+        """Atomically activate one alias and create or reuse its setup credentials.
+
+        Args:
+            alias_id: Stable public alias identifier.
+            alias_name: Public model string.
+            revision_id: Immutable alias revision identifier.
+            pool_id: Direct target pool identifier.
+            snapshot_ref: Content-addressed catalog snapshot reference.
+            catalog_sha256: Exact normalized catalog digest.
+            provider_connections: Desired secret-free connection metadata.
+            replace: Whether differing active connection metadata may be revised.
+            identity_id: Stable setup identity identifier.
+            identity_display_name: Operator-facing setup identity name.
+            key_id: Non-secret identifier for the newly issued key.
+
+        Returns:
+            Whether the identity was created, and the one-time key receipt.
+
+        Raises:
+            GatewayStoreError: The requested authority violates an existing invariant.
+        """
+        mutations = tuple(
+            ProviderConnectionMutation(
+                connection_id=connection_id,
+                revision_id=stable_id(
+                    "provider-connection-revision",
+                    {
+                        "connection_id": connection_id,
+                        "config": config.model_dump(mode="json", exclude_none=False),
+                    },
+                ),
+                config=config,
+            )
+            for connection_id, config in sorted(provider_connections.items())
+        )
+        return self.require_initialized().configure_direct_alias_with_identity(
+            organization_id=self.organization_id,
+            alias_id=alias_id,
+            alias_name=alias_name,
+            revision_id=revision_id,
+            pool_id=pool_id,
+            snapshot_ref=snapshot_ref,
+            catalog_sha256=catalog_sha256,
+            provider_connections=mutations,
+            replace=replace,
+            identity_id=identity_id,
+            identity_display_name=identity_display_name,
+            key_id=key_id,
         )
 
     def provider_connections(self) -> tuple[ProviderConnectionAuthority, ...]:

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 import typer
 
+import exp.runtime.gateway.sqlite.setup_authority as setup_authority
+import exp.runtime.gateway.sqlite.store as gateway_store
 from exp.cli.gateway import setup
 from exp.cli.providers import model_picker, provider_picker
 from exp.cli.providers.experiential_cloud import SETUP_PICKER_LABEL, SETUP_PICKER_NAME
@@ -14,6 +17,8 @@ from exp.cli.shared.picker import PickerKey
 from exp.cli.shared.picker_test import ScriptedConsole
 from exp.common.config import load_settings
 from exp.common.models import ConnectionConfig, ModelCapabilities, PricingSource, ProviderConnection
+from exp.runtime.gateway.auth import IssuedVirtualKey
+from exp.runtime.gateway.sqlite.alias_activation import AliasActivationOutcomeUnknownError
 
 _LOCAL_GATEWAY_EXCLUDE = frozenset({SETUP_PICKER_NAME})
 
@@ -188,6 +193,290 @@ def test_gateway_setup_can_edit_the_displayed_defaults(
     assert "Identity ID" in console.output
     assert "Budget" in console.output
     assert "Exact model ID" not in console.output
+    assert setup.resolve_command_budget_usd(tmp_path, None) == 75.0
+
+
+def test_gateway_setup_requires_explicit_reconfigure_opt_in(
+    tmp_path: Path,
+) -> None:
+    """An initialized gateway remains protected unless the caller supplies explicit consent."""
+    setup.GatewayManagement(tmp_path).initialize()
+
+    with pytest.raises(ValueError, match="requires an uninitialized gateway"):
+        setup.interactive_gateway_setup(tmp_path, console=ScriptedConsole(""))
+
+
+def test_gateway_setup_reconfigures_provider_alias_and_existing_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Confirmed reconfiguration replaces serving revisions while retaining gateway authority."""
+    endpoints, models = _prepared_gateway_models()
+    monkeypatch.setattr(
+        setup,
+        "select_providers",
+        lambda *_args, **_kwargs: (("openai",), False),
+    )
+    monkeypatch.setattr(setup, "prepare_providers", lambda *_args, **_kwargs: (endpoints, models))
+    monkeypatch.setattr(
+        setup,
+        "select_gateway_model",
+        lambda *_args, **_kwargs: model_picker.GatewayModelSelection(models[0], "medium"),
+    )
+    first = setup.interactive_gateway_setup(tmp_path, console=ScriptedConsole("\n"))
+    manager = setup.GatewayManagement(tmp_path)
+    first_revision = manager.aliases()[0].revision_id
+
+    updated_connection = ProviderConnection(
+        name="openai",
+        provider="openai",
+        api_key_env="UPDATED_OPENAI_API_KEY",
+    )
+    updated_endpoint = provider_picker.PreparedEndpoint(
+        connection=updated_connection,
+        api_key="secret",
+        configured=False,
+    )
+    updated_model = provider_picker.AvailableModel(
+        alias=models[0].alias,
+        connection="openai",
+        provider="openai",
+        model="gpt-5-6-luna-v2",
+        capabilities=models[0].capabilities,
+        pricing_source=models[0].pricing_source,
+        configured=False,
+    )
+    monkeypatch.setattr(
+        setup,
+        "prepare_providers",
+        lambda *_args, **_kwargs: ((updated_endpoint,), (updated_model,)),
+    )
+    monkeypatch.setattr(
+        setup,
+        "select_gateway_model",
+        lambda *_args, **_kwargs: model_picker.GatewayModelSelection(updated_model, "medium"),
+    )
+
+    result = setup.interactive_gateway_setup(
+        tmp_path,
+        console=ScriptedConsole(f"edit\n{first.alias}\ndefault\n75\n"),
+        allow_reconfigure=True,
+    )
+
+    assert result.alias == first.alias
+    assert result.identity_id == first.identity_id
+    connections = {item.connection_id: item for item in manager.provider_connections()}
+    assert connections["openai"].config.api_key_env == "UPDATED_OPENAI_API_KEY"
+    assert manager.aliases()[0].revision_id != first_revision
+    assert manager.status().active_identities == 1
+    assert manager.status().active_keys == 2
+    assert manager.status().grants == 1
+    assert setup.resolve_command_budget_usd(tmp_path, None) == 75.0
+
+
+def test_gateway_setup_rolls_back_catalog_and_provider_when_alias_activation_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed reconfiguration leaves the prior catalog and SQLite authority active."""
+    endpoints, models = _prepared_gateway_models()
+    monkeypatch.setattr(
+        setup,
+        "select_providers",
+        lambda *_args, **_kwargs: (("openai",), False),
+    )
+    monkeypatch.setattr(setup, "prepare_providers", lambda *_args, **_kwargs: (endpoints, models))
+    monkeypatch.setattr(
+        setup,
+        "select_gateway_model",
+        lambda *_args, **_kwargs: model_picker.GatewayModelSelection(models[0], "medium"),
+    )
+    first = setup.interactive_gateway_setup(tmp_path, console=ScriptedConsole("\n"))
+    manager = setup.GatewayManagement(tmp_path)
+    catalog_before = (tmp_path / "models.toml").read_bytes()
+    providers_before = manager.provider_connections()
+    aliases_before = manager.aliases()
+
+    updated_connection = ProviderConnection(
+        name="openai",
+        provider="openai",
+        api_key_env="UPDATED_OPENAI_API_KEY",
+    )
+    updated_endpoint = provider_picker.PreparedEndpoint(
+        connection=updated_connection,
+        api_key="secret",
+        configured=False,
+    )
+    updated_model = provider_picker.AvailableModel(
+        alias=models[0].alias,
+        connection="openai",
+        provider="openai",
+        model="gpt-5-6-luna-v2",
+        capabilities=models[0].capabilities,
+        pricing_source=models[0].pricing_source,
+        configured=False,
+    )
+    monkeypatch.setattr(
+        setup,
+        "prepare_providers",
+        lambda *_args, **_kwargs: ((updated_endpoint,), (updated_model,)),
+    )
+    monkeypatch.setattr(
+        setup,
+        "select_gateway_model",
+        lambda *_args, **_kwargs: model_picker.GatewayModelSelection(updated_model, "medium"),
+    )
+
+    def fail_alias_activation(*_args: object, **_kwargs: object) -> None:
+        """Fail after provider revisions have been staged in the shared transaction."""
+        raise RuntimeError("alias activation failed")
+
+    monkeypatch.setattr(
+        gateway_store,
+        "activate_alias_revision_in_transaction",
+        fail_alias_activation,
+    )
+
+    with pytest.raises(RuntimeError, match="alias activation failed"):
+        setup.interactive_gateway_setup(
+            tmp_path,
+            console=ScriptedConsole(f"edit\n{first.alias}\ndefault\n50\n"),
+            allow_reconfigure=True,
+        )
+
+    assert (tmp_path / "models.toml").read_bytes() == catalog_before
+    assert manager.provider_connections() == providers_before
+    assert manager.aliases() == aliases_before
+
+
+def test_gateway_setup_rolls_back_all_authority_when_key_issue_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A post-alias credential failure rolls back every serving mutation atomically."""
+    endpoints, models = _prepared_gateway_models()
+    monkeypatch.setattr(
+        setup,
+        "select_providers",
+        lambda *_args, **_kwargs: (("openai",), False),
+    )
+    monkeypatch.setattr(setup, "prepare_providers", lambda *_args, **_kwargs: (endpoints, models))
+    monkeypatch.setattr(
+        setup,
+        "select_gateway_model",
+        lambda *_args, **_kwargs: model_picker.GatewayModelSelection(models[0], "medium"),
+    )
+    first = setup.interactive_gateway_setup(tmp_path, console=ScriptedConsole("\n"))
+    manager = setup.GatewayManagement(tmp_path)
+    before = (
+        (tmp_path / "settings.toml").read_bytes(),
+        (tmp_path / "models.toml").read_bytes(),
+        manager.provider_connections(),
+        manager.aliases(),
+        manager.identities(),
+        manager.grants(),
+        manager.keys(),
+    )
+
+    updated_model = provider_picker.AvailableModel(
+        alias=models[0].alias,
+        connection=models[0].connection,
+        provider=models[0].provider,
+        model="gpt-5-6-luna-v2",
+        capabilities=models[0].capabilities,
+        pricing_source=models[0].pricing_source,
+        configured=False,
+    )
+    updated_endpoint = provider_picker.PreparedEndpoint(
+        connection=endpoints[0].connection,
+        api_key="secret",
+        configured=False,
+    )
+    monkeypatch.setattr(
+        setup,
+        "prepare_providers",
+        lambda *_args, **_kwargs: ((updated_endpoint,), (updated_model,)),
+    )
+    monkeypatch.setattr(
+        setup,
+        "select_gateway_model",
+        lambda *_args, **_kwargs: model_picker.GatewayModelSelection(updated_model, "medium"),
+    )
+
+    def fail_key(*_args: object, **_kwargs: object) -> None:
+        """Fail after alias activation and grant staging inside the shared transaction."""
+        raise RuntimeError("key issue failed")
+
+    monkeypatch.setattr(setup_authority, "_persist_key", fail_key)
+
+    with pytest.raises(RuntimeError, match="key issue failed"):
+        setup.interactive_gateway_setup(
+            tmp_path,
+            console=ScriptedConsole(f"edit\n{first.alias}\ndefault\n75\n"),
+            allow_reconfigure=True,
+        )
+
+    after = (
+        (tmp_path / "settings.toml").read_bytes(),
+        (tmp_path / "models.toml").read_bytes(),
+        manager.provider_connections(),
+        manager.aliases(),
+        manager.identities(),
+        manager.grants(),
+        manager.keys(),
+    )
+    assert after == before
+
+
+def test_gateway_setup_keeps_selected_budget_when_activation_outcome_is_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unknown SQLite outcome keeps settings aligned with potentially committed authority."""
+    endpoints, models = _prepared_gateway_models()
+    monkeypatch.setattr(
+        setup,
+        "select_providers",
+        lambda *_args, **_kwargs: (("openai",), False),
+    )
+    monkeypatch.setattr(setup, "prepare_providers", lambda *_args, **_kwargs: (endpoints, models))
+    monkeypatch.setattr(
+        setup,
+        "select_gateway_model",
+        lambda *_args, **_kwargs: model_picker.GatewayModelSelection(models[0], "medium"),
+    )
+    first = setup.interactive_gateway_setup(tmp_path, console=ScriptedConsole("\n"))
+    issued = IssuedVirtualKey(
+        key_id="key-unknown",
+        organization_id="local",
+        identity_id=first.identity_id,
+        prefix="exp_vk_test",
+        raw_key="exp_vk_test_secret",
+        expires_at=None,
+        created_at=datetime.now(UTC),
+    )
+
+    def unknown_activation(*_args: object, **_kwargs: object) -> tuple[bool, IssuedVirtualKey]:
+        """Simulate an activation whose COMMIT acknowledgement is indeterminate."""
+        raise AliasActivationOutcomeUnknownError(
+            alias_id=first.alias,
+            revision_id="revision-unknown",
+            issued=issued,
+        )
+
+    monkeypatch.setattr(
+        setup.GatewayManagement,
+        "configure_direct_alias_with_identity",
+        unknown_activation,
+    )
+
+    with pytest.raises(AliasActivationOutcomeUnknownError, match="operation_outcome_unknown"):
+        setup.interactive_gateway_setup(
+            tmp_path,
+            console=ScriptedConsole(f"edit\n{first.alias}\ndefault\n75\n"),
+            allow_reconfigure=True,
+        )
+
     assert setup.resolve_command_budget_usd(tmp_path, None) == 75.0
 
 
