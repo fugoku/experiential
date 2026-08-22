@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -17,6 +18,7 @@ from exp.common.models import (
     GatewayTokenPrices,
     ModelCapabilities,
 )
+from exp.runtime.gateway.budgets import BudgetReservationRejected, BudgetScopeKind
 from exp.runtime.gateway.catalog_authority import upsert_singleton_deployment
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
@@ -34,7 +36,6 @@ from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.native_bridge import (
     NativeBridgeError,
     NativeControlPlane,
-    _usage_from_payload,
 )
 from exp.runtime.models.providers.streaming_requests import openai_compatible_stream_payload
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
@@ -129,21 +130,6 @@ def test_bridge_error_payload_is_openai_shaped() -> None:
     }
 
 
-def test_usage_from_payload_handles_tokens_and_tool_names() -> None:
-    """Settlement usage covers token totals, tool-only, and absent cases."""
-    assert _usage_from_payload(None, []) is None
-    tools_only = _usage_from_payload(None, ["search"])
-    assert tools_only is not None and tools_only.tool_names == ("search",)
-    complete = _usage_from_payload(
-        {"input_tokens": 10, "output_tokens": 3, "cached_input_tokens": 2},
-        [],
-    )
-    assert complete is not None
-    assert complete.input_tokens == 10
-    assert complete.output_tokens == 3
-    assert complete.cached_input_tokens == 2
-
-
 def test_admit_decodes_builds_payload_and_settles(tmp_path: Path) -> None:
     """Admission decodes the raw body, returns the shared upstream payload, and
     settlement lands in the usage report."""
@@ -198,6 +184,21 @@ def test_admit_decodes_builds_payload_and_settles(tmp_path: Path) -> None:
         )
     )
     assert repeat == "{}"
+
+
+def test_local_admit_persists_route_context_in_the_attempt(tmp_path: Path) -> None:
+    """The default local composition retains durable route provenance."""
+    control, raw_key = _control_plane(tmp_path)
+
+    admission = _admit(control, raw_key, _chat_body())
+
+    ledger = control._components.ledger  # noqa: SLF001
+    with sqlite3.connect(ledger.database_path) as connection:
+        row = connection.execute(
+            "select route_reason, fallback_reason from gateway_attempts where attempt_id = ?",
+            (admission["attempt_id"],),
+        ).fetchone()
+    assert row == ("direct", None)
 
 
 def test_admit_rejects_invalid_bodies_with_python_parity(tmp_path: Path) -> None:
@@ -445,6 +446,28 @@ def test_claim_scope_matches_the_python_replay_key(tmp_path: Path) -> None:
     assert different_body["canonical_request_sha256"] != scope["canonical_request_sha256"]
     decoded = decode_chat(json.loads(_chat_body()), idempotency_key="operation-one")
     assert decoded.request.idempotency_key == "operation-one"
+
+
+def test_admit_escalates_host_ineligible_route_before_accounting(tmp_path: Path) -> None:
+    """Hosted policy can retain requests whose native semantics are incomplete."""
+    _manager, raw_key = _configured_gateway(tmp_path)
+    components = load_gateway_components(
+        tmp_path,
+        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
+    )
+    seen_requests: list[GatewayRequest] = []
+
+    def native_route_eligible(_route: object, request: GatewayRequest) -> bool:
+        """Reject keyed requests after retaining the decoded request for assertion."""
+        seen_requests.append(request)
+        return request.idempotency_key is None
+
+    control = NativeControlPlane(components, native_route_eligible=native_route_eligible)
+
+    admission = _admit(control, raw_key, _chat_body(), idempotency_key="shared-replay")
+
+    assert admission == {"escalate": "host policy requires the python execution engine"}
+    assert [request.idempotency_key for request in seen_requests] == ["shared-replay"]
     report = json.loads(control.usage_json("{}"))
     assert report["totals"]["requests"] == 0
 
@@ -519,6 +542,28 @@ def test_admit_rejects_an_ungranted_alias(tmp_path: Path) -> None:
     assert payload["code"] == "model_not_granted"
 
 
+def test_budget_rejection_uses_host_error_factory(tmp_path: Path) -> None:
+    """Hosted policy can refine a quota rejection without moving accounting."""
+    control, raw_key = _control_plane(tmp_path)
+    customized = NativeBridgeError(
+        OpenAIProtocolError(
+            status_code=429,
+            code="email_unverified",
+            message="verify your email",
+            error_type="insufficient_quota",
+        )
+    )
+    control._budget_error_factory = lambda key: customized  # noqa: SLF001
+    with mock.patch.object(
+        control._write_ledger,  # noqa: SLF001
+        "start_attempt",
+        side_effect=BudgetReservationRejected(scope_kind=BudgetScopeKind.TEAM, reason="blocked"),
+    ):
+        with pytest.raises(NativeBridgeError) as excinfo:
+            _admit(control, raw_key, _chat_body())
+    assert excinfo.value is customized
+
+
 def test_authenticate_rejects_an_invalid_key(tmp_path: Path) -> None:
     """A bad virtual key maps to the shared 401 public error."""
     control, _raw_key = _control_plane(tmp_path)
@@ -558,6 +603,25 @@ def test_readiness_reflects_startup_proof_and_executor_health(tmp_path: Path) ->
     assert control.readiness("{}") == "true"
     control._components.executor.mark_accounting_unhealthy()  # noqa: SLF001 - fault injection.
     assert control.readiness("{}") == "false"
+
+
+def test_readiness_uses_host_lifecycle_probe_and_fails_closed(tmp_path: Path) -> None:
+    """A hosted composition can add database, catalog, and drain readiness."""
+    _manager, _raw_key = _configured_gateway(tmp_path)
+    components = load_gateway_components(
+        tmp_path,
+        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
+    )
+    ready = True
+    control = NativeControlPlane(components, readiness_probe=lambda: ready)
+    assert control.readiness("{}") == "true"
+    ready = False
+    assert control.readiness("{}") == "false"
+    failed = NativeControlPlane(
+        components,
+        readiness_probe=mock.Mock(side_effect=RuntimeError("database unavailable")),
+    )
+    assert failed.readiness("{}") == "false"
 
 
 def test_rust_failure_taxonomy_matches_public_failure_error() -> None:

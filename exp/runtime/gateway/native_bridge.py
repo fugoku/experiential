@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 
 from exp.common.core.artifacts import JsonObject, stable_id
@@ -42,7 +43,6 @@ from exp.runtime.gateway.contracts import (
     GatewayFailure,
     GatewayFailureClass,
     GatewayRequest,
-    GatewayUsage,
 )
 from exp.runtime.gateway.discovery import (
     listing_metadata_by_alias,
@@ -58,13 +58,14 @@ from exp.runtime.gateway.execution import (
     _require_deployment_identity,  # noqa: PLC2701
 )
 from exp.runtime.gateway.group_commit import SyncGroupCommitLedger
-from exp.runtime.gateway.lifecycle import LocalGatewayComponents
+from exp.runtime.gateway.native_components import NativeGatewayComponents
 from exp.runtime.gateway.native_responses import (
     ContinuationContext,
     continued_request,
     remember_turn,
     responses_envelope,
 )
+from exp.runtime.gateway.native_settlement import terminal_from_settlement
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
 from exp.runtime.gateway.usage import GatewayUsageReport, read_usage_report, usage_html
 from exp.runtime.models.providers import (
@@ -91,12 +92,6 @@ _REQUEST_TIMEOUT_SECONDS = 120.0
 _SWEEP_GRACE_SECONDS = 5.0
 _SWEEP_INTERVAL_SECONDS = 5.0
 _SWEEP_BATCH = 16
-
-_TERMINAL_KINDS = {
-    "completed": GatewayEventKind.COMPLETED,
-    "incomplete": GatewayEventKind.INCOMPLETE,
-    "failed": GatewayEventKind.FAILED,
-}
 
 
 class _NativeDialectUnavailableError(RuntimeError):
@@ -192,19 +187,25 @@ class NativeControlPlane:
 
     def __init__(
         self,
-        components: LocalGatewayComponents,
+        components: NativeGatewayComponents,
         *,
         request_timeout_seconds: float = _REQUEST_TIMEOUT_SECONDS,
         continuation_store: BoundedContinuationStore | None = None,
+        readiness_probe: Callable[[], bool] | None = None,
+        usage_reporter: Callable[[], JsonObject] | None = None,
+        budget_error_factory: Callable[[str], NativeBridgeError] | None = None,
+        native_route_eligible: Callable[[GatewayRoute, GatewayRequest], bool] | None = None,
     ) -> None:
         """Bind loaded gateway components for serving.
 
         Args:
             components: Authority, ledger, routes, and runtime catalogs.
             request_timeout_seconds: Total per-request budget from admission.
-            continuation_store: Optional Responses continuation state, shared
-                with the embedded python engine so both engines resolve and
-                retain the same bounded namespaced history.
+            continuation_store: Optional state shared by native and Python engines.
+            readiness_probe: Optional hosted lifecycle readiness callback.
+            usage_reporter: Optional hosted usage report callback.
+            budget_error_factory: Optional hosted mapping for a rejected reservation.
+            native_route_eligible: Optional hosted policy for complete native semantics.
         """
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
@@ -214,6 +215,10 @@ class NativeControlPlane:
         self._continuations = (
             continuation_store if continuation_store is not None else BoundedContinuationStore()
         )
+        self._readiness_probe = readiness_probe
+        self._usage_reporter = usage_reporter
+        self._budget_error_factory = budget_error_factory
+        self._native_route_eligible = native_route_eligible
         self._inflight: dict[str, _InflightAttempt] = {}
         self._lock = threading.Lock()
         self._accounting_healthy = True
@@ -334,6 +339,13 @@ class NativeControlPlane:
             probe_failure = exc
         if route is not None and route.fallback_deployments:
             return _escalation("multi-deployment pools use the python engine's certified waterfall")
+        if route is not None and self._native_route_eligible is not None:
+            try:
+                native_route_eligible = self._native_route_eligible(route, request)
+            except Exception:  # noqa: BLE001 - hosted policy fails closed to Python.
+                native_route_eligible = False
+            if not native_route_eligible:
+                return _escalation("host policy requires the python execution engine")
 
         provider_request = request.model_copy(update={"stream": True, "include_usage": True})
         accepted = False
@@ -347,17 +359,22 @@ class NativeControlPlane:
             require_gateway_provider(deployment.provider)
             preflight_gateway_request(provider_request, deployment.gateway.capabilities)
             upstream_payload = dialect_stream_payload(profile, provider_request)
+            maximum_cost = maximum_attempt_cost_micro_usd(request, deployment)
             attempt_id = self._write_ledger.start_attempt(
                 snapshot=route.snapshot,
                 deployment=deployment,
                 attempt_ordinal=0,
                 route_depth=0,
-                maximum_cost_micro_usd=maximum_attempt_cost_micro_usd(request, deployment),
+                maximum_cost_micro_usd=maximum_cost,
                 route_reason=route.route_reason,
                 fallback_reason=route.fallback_reason,
             )
         except BudgetReservationRejected as exc:
-            error = _budget_quota_error()
+            error = (
+                _budget_quota_error()
+                if self._budget_error_factory is None
+                else self._budget_error_factory(data["raw_key"])
+            )
             self._finish_request_quietly(
                 authorization,
                 GatewayFailure(
@@ -556,7 +573,7 @@ class NativeControlPlane:
             entry = self._inflight.get(request_id)
         if entry is None:
             return "{}"
-        terminal, failure = _terminal_from_settlement(data)
+        terminal, failure = terminal_from_settlement(data)
         try:
             self._write_ledger.finish_attempt(
                 attempt_id=entry.attempt_id,
@@ -620,6 +637,8 @@ class NativeControlPlane:
         Raises:
             NativeBridgeError: The presented key is invalid, expired, or revoked.
         """
+        if self._usage_reporter is not None:
+            return json.dumps(self._usage_reporter(), separators=(",", ":"))
         report = self._usage_report(argument)
         return json.dumps(report.model_dump(mode="json"), separators=(",", ":"))
 
@@ -671,6 +690,11 @@ class NativeControlPlane:
         del argument
         if not self._accounting_healthy:
             return "false"
+        if self._readiness_probe is not None:
+            try:
+                return "true" if self._readiness_probe() else "false"
+            except Exception:  # noqa: BLE001 - readiness fails closed at the boundary.
+                return "false"
         try:
             self._components.executor.require_healthy()
         except GatewayExecutionError:
@@ -841,7 +865,7 @@ class NativeControlPlane:
             settlement = entry.pending_settlement
             if settlement is None:
                 continue
-            terminal, failure = _terminal_from_settlement(settlement)
+            terminal, failure = terminal_from_settlement(settlement)
             self._settle_swept(request_id, entry, terminal, failure, latch_on_failure=True)
         if not abandoned:
             return
@@ -932,72 +956,3 @@ def _deployment_operation_key(route: GatewayRoute) -> str:
 def _optional_text(value: object) -> str | None:
     """Return one optional boundary string value or ``None``."""
     return value if isinstance(value, str) else None
-
-
-def _terminal_from_settlement(
-    data: JsonObject,
-) -> tuple[GatewayEvent, GatewayFailure | None]:
-    """Build the durable terminal event from one settlement payload.
-
-    Args:
-        data: Parsed settlement with ``outcome``, optional ``usage``,
-            ``tool_names``, and ``failure``.
-
-    Returns:
-        The terminal event and the optional normalized failure.
-    """
-    raw_usage = data.get("usage")
-    raw_tool_names = data.get("tool_names")
-    usage = _usage_from_payload(
-        raw_usage if isinstance(raw_usage, dict) else None,
-        [str(name) for name in raw_tool_names] if isinstance(raw_tool_names, list) else [],
-    )
-    failure_payload = data.get("failure")
-    failure = None
-    if isinstance(failure_payload, dict):
-        failure = GatewayFailure(
-            failure_class=GatewayFailureClass(str(failure_payload["failure_class"])),
-            safe_message=str(failure_payload["safe_message"]),
-        )
-    kind = _TERMINAL_KINDS[str(data["outcome"])]
-    terminal = GatewayEvent(
-        kind=kind,
-        sequence_number=0,
-        usage=usage,
-        failure=failure if kind == GatewayEventKind.FAILED else None,
-    )
-    return terminal, failure
-
-
-def _usage_from_payload(
-    payload: JsonObject | None,
-    tool_names: list[str],
-) -> GatewayUsage | None:
-    """Build normalized usage from settlement scalars.
-
-    Args:
-        payload: Optional token totals observed by the data plane.
-        tool_names: Invoked tool names in first-use order.
-
-    Returns:
-        Normalized usage, or ``None`` when nothing was observed.
-    """
-    names = tuple(str(name) for name in tool_names)
-    if payload is None or payload.get("input_tokens") is None:
-        if not names:
-            return None
-        return GatewayUsage(tool_names=names)
-    return GatewayUsage(
-        input_tokens=_optional_count(payload.get("input_tokens")),
-        output_tokens=_optional_count(payload.get("output_tokens")),
-        cached_input_tokens=_optional_count(payload.get("cached_input_tokens")),
-        reasoning_tokens=_optional_count(payload.get("reasoning_tokens")),
-        tool_names=names,
-    )
-
-
-def _optional_count(value: object) -> int | None:
-    """Return one non-negative settlement token count or ``None``."""
-    if isinstance(value, bool) or not isinstance(value, int):
-        return None
-    return value
