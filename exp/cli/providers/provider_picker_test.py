@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from exp.cli.providers import provider_picker
@@ -15,6 +17,7 @@ from exp.cli.providers.provider_picker import (
 )
 from exp.cli.shared.picker import PickerKey
 from exp.cli.shared.picker_test import ScriptedConsole
+from exp.common.auth import ProviderAuthStore, StoredCredentialBinding, default_auth_path
 from exp.common.models import (
     DiscoveredModel,
     PricingSource,
@@ -101,6 +104,45 @@ def _prepare(
         lister=lister,
         environment=environment,
     )
+
+
+def _persist_openai_key(secret: str, *, connection_id: str = "openai") -> ProviderAuthStore:
+    """Write one bound OpenAI credential into the isolated user-data store.
+
+    Args:
+        secret: Non-empty API key to persist.
+        connection_id: Catalog connection name used as the store key.
+
+    Returns:
+        The store that received the record.
+    """
+    connection = ProviderConnection(
+        name=connection_id,
+        provider="openai",
+        api_key_env="OPENAI_API_KEY",
+    )
+    store = ProviderAuthStore(default_auth_path())
+    store.put(
+        connection_id,
+        secret,
+        binding=StoredCredentialBinding(
+            provider="openai",
+            endpoint_sha256=connection.catalog_config().identity_sha256(),
+        ),
+    )
+    return store
+
+
+def _forbid_getpass(prompt: str = "") -> str:
+    """Fail if setup asks for a credential paste.
+
+    Args:
+        prompt: Masked prompt text setup printed.
+
+    Raises:
+        AssertionError: The test expected no credential prompt.
+    """
+    raise AssertionError(f"unexpected credential prompt: {prompt}")
 
 
 def test_provider_screen_never_names_credential_variables() -> None:
@@ -303,10 +345,13 @@ def test_provider_whose_models_are_all_configured_is_still_prepared() -> None:
     assert models == ()
 
 
-def test_missing_credential_is_pasted_masked_and_stays_process_local(
+def test_missing_credential_is_pasted_masked_and_persisted(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    """A pasted key is read through a masked prompt and never printed or persisted."""
+    """A pasted key is read through a masked prompt, stored, and never printed."""
+    from exp.common.auth import ProviderAuthStore, default_auth_path
+
     prompts: list[str] = []
 
     def _fake_getpass(prompt: str = "") -> str:
@@ -332,10 +377,12 @@ def test_missing_credential_is_pasted_masked_and_stays_process_local(
     endpoints, _ = prepared
     assert prompts and "hidden" in prompts[0]
     assert lister.requests[0].api_key == "pasted-secret"
-    assert environment == {"OPENAI_API_KEY": "pasted-secret"}
+    assert environment == {}
     assert endpoints[0].connection.api_key_env == "OPENAI_API_KEY"
     assert "pasted-secret" not in console.output
-    assert "kept in this process only" in console.output
+    assert "kept in this process only" not in console.output
+    assert ProviderAuthStore(default_auth_path()).get("openai") == "pasted-secret"
+    assert tmp_path.exists()
 
 
 def test_empty_masked_paste_skips_that_provider(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -471,6 +518,9 @@ def test_invalid_credential_retry_prompts_for_and_keeps_a_replacement(
     assert endpoints[0].api_key == "replacement-key"
     assert environment == {"OPENAI_API_KEY": "replacement-key"}
     assert "replacement-key" not in console.output
+    from exp.common.auth import ProviderAuthStore, default_auth_path
+
+    assert ProviderAuthStore(default_auth_path()).get("openai") == "replacement-key"
 
 
 def test_listing_failure_can_return_to_the_provider_screen() -> None:
@@ -671,11 +721,145 @@ def test_an_identical_configured_connection_is_reused_instead_of_duplicated() ->
     assert endpoints[0].connection.name == "primary"
     assert endpoints[0].configured
     assert models[0].connection == "primary"
+    assert "stored credential" not in console.output
 
 
-def test_openai_compatible_endpoint_retries_invalid_credential_env_names() -> None:
-    """A compatible endpoint retries invalid names before resolving its custom variable."""
-    console = ScriptedConsole("https://models.example.test/v1\nnot-a-variable\nINTERNAL_API_KEY\n")
+def test_editing_a_stored_credential_can_keep_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keeping a stored key reuses it without asking the operator to paste again."""
+    monkeypatch.setattr(provider_picker, "getpass", _forbid_getpass)
+    store = _persist_openai_key("stored-secret")
+    existing = (ProviderConnection(name="openai", provider="openai", api_key_env="OPENAI_API_KEY"),)
+    console = ScriptedConsole("1\n")
+    lister = _FakeLister({"openai": [(_LUNA,)]})
+
+    prepared = _prepare(
+        console,
+        providers=("openai",),
+        lister=lister,
+        environment={},
+        existing_connections=existing,
+    )
+
+    assert prepared is not None
+    endpoints, _ = prepared
+    assert endpoints[0].configured
+    assert endpoints[0].api_key == "stored-secret"
+    assert lister.requests == [ProviderEndpoint(provider="openai", api_key="stored-secret")]
+    assert store.get("openai") == "stored-secret"
+    assert "stored-secret" not in console.output
+    assert "Keep the stored credential" in console.output
+
+
+def test_editing_a_stored_credential_can_replace_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Replacing a stored key persists the new paste and never prints the secret."""
+
+    def _fake_getpass(prompt: str = "") -> str:
+        """Answer the replacement credential prompt without echoing the credential.
+
+        Args:
+            prompt: Masked prompt text setup printed.
+
+        Returns:
+            The replacement credential.
+        """
+        return "replacement-secret"
+
+    monkeypatch.setattr(provider_picker, "getpass", _fake_getpass)
+    store = _persist_openai_key("stored-secret")
+    existing = (ProviderConnection(name="openai", provider="openai", api_key_env="OPENAI_API_KEY"),)
+    console = ScriptedConsole("2\n")
+    lister = _FakeLister({"openai": [(_LUNA,)]})
+
+    prepared = _prepare(
+        console,
+        providers=("openai",),
+        lister=lister,
+        environment={},
+        existing_connections=existing,
+    )
+
+    assert prepared is not None
+    endpoints, _ = prepared
+    assert endpoints[0].api_key == "replacement-secret"
+    assert lister.requests == [ProviderEndpoint(provider="openai", api_key="replacement-secret")]
+    assert store.get("openai") == "replacement-secret"
+    assert "stored-secret" not in console.output
+    assert "replacement-secret" not in console.output
+
+
+def test_editing_a_stored_credential_can_remove_it_and_use_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Removing a stored key deletes only that record and then uses a non-empty env override."""
+    monkeypatch.setattr(provider_picker, "getpass", _forbid_getpass)
+    store = _persist_openai_key("stored-secret")
+    existing = (ProviderConnection(name="openai", provider="openai", api_key_env="OPENAI_API_KEY"),)
+    console = ScriptedConsole("3\n")
+    lister = _FakeLister({"openai": [(_LUNA,)]})
+
+    prepared = _prepare(
+        console,
+        providers=("openai",),
+        lister=lister,
+        environment={"OPENAI_API_KEY": "env-secret"},
+        existing_connections=existing,
+    )
+
+    assert prepared is not None
+    endpoints, _ = prepared
+    assert endpoints[0].api_key == "env-secret"
+    assert lister.requests == [ProviderEndpoint(provider="openai", api_key="env-secret")]
+    assert store.get("openai") is None
+    assert "stored-secret" not in console.output
+    assert "env-secret" not in console.output
+
+
+def test_editing_a_stored_credential_can_remove_it_and_paste_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Removing a stored key with no env override asks for a new paste and persists it."""
+
+    def _fake_getpass(prompt: str = "") -> str:
+        """Answer the follow-up credential prompt without echoing the credential.
+
+        Args:
+            prompt: Masked prompt text setup printed.
+
+        Returns:
+            The newly pasted credential.
+        """
+        return "pasted-after-remove"
+
+    monkeypatch.setattr(provider_picker, "getpass", _fake_getpass)
+    store = _persist_openai_key("stored-secret")
+    existing = (ProviderConnection(name="openai", provider="openai", api_key_env="OPENAI_API_KEY"),)
+    console = ScriptedConsole("3\n")
+    lister = _FakeLister({"openai": [(_LUNA,)]})
+
+    prepared = _prepare(
+        console,
+        providers=("openai",),
+        lister=lister,
+        environment={},
+        existing_connections=existing,
+    )
+
+    assert prepared is not None
+    endpoints, _ = prepared
+    assert endpoints[0].api_key == "pasted-after-remove"
+    assert lister.requests == [ProviderEndpoint(provider="openai", api_key="pasted-after-remove")]
+    assert store.get("openai") == "pasted-after-remove"
+    assert "stored-secret" not in console.output
+    assert "pasted-after-remove" not in console.output
+
+
+def test_openai_compatible_uses_generated_env_override_without_asking_for_a_name() -> None:
+    """Compatible setup collects the endpoint and uses the generated env override internally."""
+    console = ScriptedConsole("https://models.example.test/v1\n")
     lister = _FakeLister(
         {
             "openai-compatible": [
@@ -697,17 +881,111 @@ def test_openai_compatible_endpoint_retries_invalid_credential_env_names() -> No
         console,
         providers=("openai-compatible",),
         lister=lister,
-        environment={"INTERNAL_API_KEY": "compat-secret"},
+        environment={"OPENAI_COMPATIBLE_API_KEY": "compat-secret"},
     )
 
     assert prepared is not None
     endpoints, models = prepared
     assert endpoints[0].connection.base_url == "https://models.example.test/v1"
-    assert endpoints[0].connection.api_key_env == "INTERNAL_API_KEY"
+    assert endpoints[0].connection.api_key_env == "OPENAI_COMPATIBLE_API_KEY"
     assert lister.requests[0].base_url == "https://models.example.test/v1"
     assert lister.requests[0].api_key == "compat-secret"
-    assert "must match" in console.output
     assert models[0].pricing_source is PricingSource.PROVIDER
+
+
+def test_openai_compatible_reuses_a_configured_custom_env_name() -> None:
+    """An existing compatible connection keeps its configured override name."""
+    console = ScriptedConsole("https://models.example.test/v1\n")
+    lister = _FakeLister(
+        {
+            "openai-compatible": [
+                (
+                    DiscoveredModel(
+                        provider="openai-compatible",
+                        model="internal-chat",
+                        supports_completions=True,
+                        supports_structured_output=True,
+                        input_cost_per_million_tokens_usd=1.0,
+                        output_cost_per_million_tokens_usd=2.0,
+                    ),
+                )
+            ]
+        }
+    )
+    existing = (
+        ProviderConnection(
+            name="acme",
+            provider="openai-compatible",
+            api_key_env="INTERNAL_API_KEY",
+            base_url="https://models.example.test/v1",
+        ),
+    )
+
+    prepared = _prepare(
+        console,
+        providers=("openai-compatible",),
+        lister=lister,
+        environment={"INTERNAL_API_KEY": "compat-secret"},
+        existing_connections=existing,
+    )
+
+    assert prepared is not None
+    endpoints, models = prepared
+    assert endpoints[0].connection.name == "acme"
+    assert endpoints[0].configured
+    assert endpoints[0].connection.api_key_env == "INTERNAL_API_KEY"
+    assert lister.requests[0].api_key == "compat-secret"
+    assert models[0].connection == "acme"
+
+
+def test_openai_compatible_does_not_reuse_when_multiple_accounts_share_an_endpoint() -> None:
+    """Two compatible connections on one host stay distinct instead of reusing the first."""
+    console = ScriptedConsole("https://models.example.test/v1\n")
+    lister = _FakeLister(
+        {
+            "openai-compatible": [
+                (
+                    DiscoveredModel(
+                        provider="openai-compatible",
+                        model="internal-chat",
+                        supports_completions=True,
+                        supports_structured_output=True,
+                        input_cost_per_million_tokens_usd=1.0,
+                        output_cost_per_million_tokens_usd=2.0,
+                    ),
+                )
+            ]
+        }
+    )
+    existing = (
+        ProviderConnection(
+            name="acme",
+            provider="openai-compatible",
+            api_key_env="ACME_API_KEY",
+            base_url="https://models.example.test/v1",
+        ),
+        ProviderConnection(
+            name="acme-work",
+            provider="openai-compatible",
+            api_key_env="ACME_WORK_API_KEY",
+            base_url="https://models.example.test/v1",
+        ),
+    )
+
+    prepared = _prepare(
+        console,
+        providers=("openai-compatible",),
+        lister=lister,
+        environment={"OPENAI_COMPATIBLE_API_KEY": "compat-secret"},
+        existing_connections=existing,
+    )
+
+    assert prepared is not None
+    endpoints, models = prepared
+    assert endpoints[0].connection.name == "openai-compatible"
+    assert not endpoints[0].configured
+    assert endpoints[0].connection.api_key_env == "OPENAI_COMPATIBLE_API_KEY"
+    assert models[0].connection == "openai-compatible"
 
 
 def test_azure_prepares_exact_connection_for_manual_deployment_declaration() -> None:

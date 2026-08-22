@@ -1,8 +1,10 @@
 """Provider selection, credential resolution, and authenticated model discovery for setup.
 
 Setup opens with one provider screen, resolves each selected provider's credential from its
-canonical environment variable or a masked paste, then asks that provider which models the
-authenticated account may call. Discovery lists identities. Verification is a separate step:
+environment override, a stored local credential, or a masked paste that persists, then asks
+that provider which models the authenticated account may call. Editing a configured connection
+with a stored key can keep, replace, or remove that record. Discovery lists identities.
+Verification is a separate step:
 maintained or provider-published metadata can prove a role, and identity-only OpenAI-compatible
 models stay visible as unknown until the operator declares the minimum fields for a selected role.
 Providers without a safe listing API keep manual declaration on the model screen.
@@ -10,7 +12,6 @@ Providers without a safe listing API keep manual declaration on the model screen
 
 from __future__ import annotations
 
-import re
 from collections.abc import MutableMapping, Sequence
 from dataclasses import dataclass, field
 from getpass import getpass
@@ -26,6 +27,7 @@ from exp.cli.shared.picker import (
     choose_many,
     choose_one,
 )
+from exp.common.auth import CANONICAL_API_KEY_ENV, ProviderAuthStore, derived_api_key_env
 from exp.common.models import (
     ConnectionConfig,
     DiscoveredModel,
@@ -42,6 +44,7 @@ from exp.common.models import (
     resolve_discovered_model,
     served_roles,
 )
+from exp.runtime.models.credentials import resolve_or_prompt_connection_api_key
 from exp.runtime.models.providers import (
     ProviderEndpoint,
     ProviderListingError,
@@ -57,14 +60,7 @@ SETUP_PROVIDER_LABELS = {
     "azure": "azure",
     "bedrock": "bedrock",
 }
-CANONICAL_CREDENTIAL_ENV = {
-    "openai": "OPENAI_API_KEY",
-    "anthropic": "ANTHROPIC_API_KEY",
-    "azure": "AZURE_OPENAI_API_KEY",
-    "gemini": "GEMINI_API_KEY",
-    "openrouter": "OPENROUTER_API_KEY",
-    "openai-compatible": "OPENAI_COMPATIBLE_API_KEY",
-}
+CANONICAL_CREDENTIAL_ENV = CANONICAL_API_KEY_ENV
 _MANUAL_MODEL_PROVIDERS = frozenset({"azure", "bedrock"})
 _OPERATOR_DECLARED_PROVIDERS = frozenset({"openai-compatible"})
 _CONFIGURED_ONLY = "configured-models-only"
@@ -72,8 +68,10 @@ UNKNOWN_METADATA_LABEL = "unknown capabilities/prices"
 _RECOVERY_RETRY = "retry"
 _RECOVERY_SKIP = "skip"
 _RECOVERY_BACK = "back"
+_CREDENTIAL_KEEP = "keep"
+_CREDENTIAL_REPLACE = "replace"
+_CREDENTIAL_REMOVE = "remove"
 _PROVIDER_VISIBLE_ROWS = 3
-_ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 class SetupCancelled(Exception):
@@ -349,25 +347,9 @@ def collect_provider_connection(
             )
             or None
         )
-    api_key_env = CANONICAL_CREDENTIAL_ENV.get(provider)
-    if provider == "openai-compatible":
-        while True:
-            candidate = (
-                ask_text(
-                    "Credential environment variable name",
-                    console=console,
-                    default=CANONICAL_CREDENTIAL_ENV[provider],
-                ).strip()
-                or CANONICAL_CREDENTIAL_ENV[provider]
-            )
-            if _ENVIRONMENT_NAME.fullmatch(candidate):
-                api_key_env = candidate
-                break
-            console.print(
-                "Credential environment variable names must match [A-Za-z_][A-Za-z0-9_]*.",
-                style="yellow",
-                markup=False,
-            )
+    api_key_env = (
+        None if provider == "openai-compatible" else CANONICAL_CREDENTIAL_ENV.get(provider)
+    )
     return ConnectionConfig(
         provider=provider,
         base_url=base_url,
@@ -501,10 +483,11 @@ def _resolve_endpoint(
     )
     configured = connection is not None
     if connection is None:
+        name = derive_connection_name(provider, taken_names)
         connection = ProviderConnection(
-            name=derive_connection_name(provider, taken_names),
+            name=name,
             provider=provider,
-            api_key_env=config.api_key_env,
+            api_key_env=config.api_key_env or derived_api_key_env(provider, name),
             base_url=config.base_url,
             api_version=config.api_version,
             region=config.region,
@@ -514,9 +497,10 @@ def _resolve_endpoint(
     assert connection.api_key_env is not None
     api_key = _resolve_credential(
         label,
-        api_key_env=connection.api_key_env,
+        connection=connection,
         console=console,
         environment=environment,
+        configured=configured,
     )
     if api_key is None:
         return None
@@ -532,35 +516,99 @@ def _reused_connection(
     api_version: str | None,
     region: str | None,
 ) -> ProviderConnection | None:
-    """Return the configured connection that already describes this exact endpoint."""
+    """Return the configured connection that already describes this exact endpoint.
+
+    Args:
+        existing_connections: Connections already configured in the catalog.
+        provider: Selected provider kind.
+        api_key_env: Canonical or collected environment override name, if any.
+        base_url: Optional collected endpoint.
+        api_version: Optional Azure API version.
+        region: Optional Bedrock region.
+
+    Returns:
+        The matching configured connection when exactly one exists, otherwise ``None``.
+    """
+    matches: list[ProviderConnection] = []
     for connection in existing_connections:
         if (
-            connection.provider == provider
-            and connection.api_key_env == api_key_env
-            and connection.base_url == base_url
-            and connection.api_version == api_version
-            and connection.region == region
+            connection.provider != provider
+            or connection.base_url != base_url
+            or connection.api_version != api_version
+            or connection.region != region
         ):
-            return connection
+            continue
+        if provider != "openai-compatible" and connection.api_key_env != api_key_env:
+            continue
+        matches.append(connection)
+    if len(matches) == 1:
+        return matches[0]
     return None
+
+
+def _stored_credential_action(
+    label: str,
+    *,
+    connection_id: str,
+    console: Console,
+    store: ProviderAuthStore,
+) -> str:
+    """Ask how to handle a stored key when editing a configured connection.
+
+    Connections with no stored record keep the current env-then-store path without an extra
+    screen.
+
+    Args:
+        label: Readable provider name.
+        connection_id: Catalog connection being edited.
+        console: Interactive console that owns the menu.
+        store: User-data credential store.
+
+    Returns:
+        One of ``_CREDENTIAL_KEEP``, ``_CREDENTIAL_REPLACE``, or ``_CREDENTIAL_REMOVE``.
+
+    Raises:
+        SetupCancelled: The operator cancelled the menu.
+    """
+    if connection_id not in store.connection_ids():
+        return _CREDENTIAL_KEEP
+    result = choose_one(
+        console,
+        title=f"{label} stored credential",
+        options=(
+            PickerOption(value=_CREDENTIAL_KEEP, label="Keep the stored credential"),
+            PickerOption(value=_CREDENTIAL_REPLACE, label="Replace the stored credential"),
+            PickerOption(value=_CREDENTIAL_REMOVE, label="Remove the stored credential"),
+        ),
+        default=_CREDENTIAL_KEEP,
+    )
+    if result.action is PickerAction.CANCEL:
+        raise SetupCancelled
+    if result.action is PickerAction.BACK:
+        return _CREDENTIAL_KEEP
+    return result.values[0]
 
 
 def _resolve_credential(
     label: str,
     *,
-    api_key_env: str,
+    connection: ProviderConnection,
     console: Console,
     environment: MutableMapping[str, str],
     force_prompt: bool = False,
+    configured: bool = False,
+    store: ProviderAuthStore | None = None,
 ) -> str | None:
-    """Read one provider credential from the environment, or accept a masked paste.
+    """Resolve one credential from env, store, or a masked paste that persists.
 
     Args:
         label: Readable provider name.
-        api_key_env: Credential environment-variable name for this connection.
+        connection: Named secret-free connection being prepared.
         console: Terminal used for the masked prompt.
-        environment: Process environment consulted and updated for pasted credentials.
-        force_prompt: Whether to ignore the current environment value and ask again.
+        environment: Process environment consulted for override values.
+        force_prompt: Whether to ignore the current environment and stored values.
+        configured: Whether this connection already exists in the catalog.
+        store: Optional credential store used by tests.
 
     Returns:
         The resolved credential, or ``None`` when the provider is skipped.
@@ -568,22 +616,47 @@ def _resolve_credential(
     Raises:
         SetupCancelled: The prompt reached end of input.
     """
-    existing = "" if force_prompt else environment.get(api_key_env, "").strip()
-    if existing:
-        return existing
-    console.print(f"[dim]{label} needs {api_key_env}.[/dim]")
-    try:
-        pasted = getpass(f"{label} API key (hidden, empty line skips this provider): ").strip()
-    except (EOFError, KeyboardInterrupt) as exc:
-        raise SetupCancelled from exc
-    if not pasted:
-        return None
-    environment[api_key_env] = pasted
-    console.print(
-        f"[dim]{api_key_env} kept in this process only; export it or add it to .env to "
-        "reuse it later.[/dim]"
+    auth_store = store if store is not None else ProviderAuthStore()
+    if not force_prompt and configured:
+        action = _stored_credential_action(
+            label,
+            connection_id=connection.name,
+            console=console,
+            store=auth_store,
+        )
+        if action == _CREDENTIAL_REPLACE:
+            force_prompt = True
+        elif action == _CREDENTIAL_REMOVE:
+            auth_store.remove(connection.name)
+
+    def _prompt() -> str | None:
+        """Read one hidden API key, or cancel setup on a closed input stream.
+
+        Returns:
+            The pasted key, which may be empty to skip the provider.
+
+        Raises:
+            SetupCancelled: The prompt reached end of input.
+        """
+        console.print(f"[dim]{label} API key[/dim]")
+        try:
+            return getpass(f"{label} API key (hidden, empty line skips this provider): ")
+        except (EOFError, KeyboardInterrupt) as exc:
+            raise SetupCancelled from exc
+
+    api_key = resolve_or_prompt_connection_api_key(
+        connection.catalog_config(),
+        connection_id=connection.name,
+        environment=environment,
+        store=auth_store,
+        prompt=_prompt,
+        force_prompt=force_prompt,
     )
-    return pasted
+    if api_key is None:
+        return None
+    if force_prompt and connection.api_key_env is not None:
+        environment[connection.api_key_env] = api_key
+    return api_key
 
 
 def _discover_models(
@@ -635,11 +708,9 @@ def _discover_models(
             recovery = _recover(f"{label} model listing failed", console=console)
             if recovery == _RECOVERY_RETRY:
                 if _is_credential_rejection(exc):
-                    api_key_env = endpoint.connection.api_key_env
-                    assert api_key_env is not None
                     api_key = _resolve_credential(
                         label,
-                        api_key_env=api_key_env,
+                        connection=endpoint.connection,
                         console=console,
                         environment=environment,
                         force_prompt=True,
