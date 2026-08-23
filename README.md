@@ -1,5 +1,7 @@
 # Experiential
 
+[![gateway latency](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fexperientiallabs%2Fexperiential%2Fbadges%2Fgateway-latency.json)](https://github.com/experientiallabs/experiential/actions/workflows/gateway-latency.yml?query=branch%3Amain)
+
 Experiential is an open source gateway and router for agent workflows:
 
 1. Use hosted, BYOK, and local models through one OpenAI-compatible API.
