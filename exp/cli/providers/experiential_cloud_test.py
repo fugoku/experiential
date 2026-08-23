@@ -169,10 +169,8 @@ def test_hosted_platform_login_receives_key_without_printing_it() -> None:
     assert "Platform login received." in transcript.getvalue()
 
 
-def test_hosted_platform_login_falls_back_when_browser_cannot_open(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A browserless terminal returns to masked paste instead of waiting for a callback."""
+def test_hosted_platform_login_keeps_manual_url_callback_alive() -> None:
+    """A printed URL can complete login when automatic browser opening fails."""
     transcript = io.StringIO()
     console = Console(file=transcript, force_terminal=True, no_color=True)
     connection = ProviderConnection(
@@ -182,16 +180,55 @@ def test_hosted_platform_login_falls_back_when_browser_cannot_open(
         base_url=HOSTED_GATEWAY_DEFAULT_BASE_URL,
     )
 
-    def unexpected_wait(*_args: object, **_kwargs: object) -> str | None:
-        """Fail if browser-unavailable setup waits for a callback."""
-        raise AssertionError("browser-unavailable login should not wait for a callback")
+    approval_url = ""
 
-    monkeypatch.setattr(BrowserLogin, "wait", unexpected_wait)
+    def browser_unavailable(url: str) -> bool:
+        """Record the printed URL while simulating a browser launch failure."""
+        nonlocal approval_url
+        approval_url = url
+        return False
+
+    def approve_from_fallback(_wait_for_callback: object) -> None:
+        """Complete the printed callback while the masked fallback is active."""
+        params = parse_qs(urlparse(approval_url).query)
+        status, _ = _request(
+            f"http://127.0.0.1:{params['port'][0]}/callback",
+            {"state": params["state"][0], "token": "xpl_manual_key"},
+        )
+        assert status == 200
+        return None
+
+    token = hosted_platform_login(
+        connection,
+        console=console,
+        open_browser=browser_unavailable,
+        fallback=approve_from_fallback,
+        timeout=300,
+    )
+
+    assert token == "xpl_manual_key"
+    assert "Open this URL to connect Experiential Cloud:" in transcript.getvalue()
+    assert "Platform login received." in transcript.getvalue()
+
+
+def test_hosted_platform_login_offers_pasted_key_without_waiting_for_timeout() -> None:
+    """A browserless terminal reaches masked paste immediately while its callback stays live."""
+    transcript = io.StringIO()
+    console = Console(file=transcript, force_terminal=True, no_color=True)
+    connection = ProviderConnection(
+        name="experiential-cloud",
+        provider="openai-compatible",
+        api_key_env=HOSTED_GATEWAY_API_KEY_ENV,
+        base_url=HOSTED_GATEWAY_DEFAULT_BASE_URL,
+    )
+
     token = hosted_platform_login(
         connection,
         console=console,
         open_browser=lambda _url: False,
+        fallback=lambda _wait_for_callback: "xpl_pasted_key",
+        timeout=300,
     )
 
-    assert token is None
-    assert "Open this URL to connect Experiential Cloud:" in transcript.getvalue()
+    assert token == "xpl_pasted_key"
+    assert "paste an existing key" in transcript.getvalue()

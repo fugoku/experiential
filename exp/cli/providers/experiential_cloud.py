@@ -12,16 +12,20 @@ from __future__ import annotations
 
 import html
 import os
-import queue
 import secrets
+import select
+import sys
+import termios
 import threading
 import webbrowser
 from collections.abc import Callable, Mapping
+from getpass import getpass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlencode, urlparse
 
 from rich.console import Console
 
+from exp.common.auth import StoredCredentialBinding
 from exp.common.models import ProviderConnection
 
 SETUP_PICKER_NAME = "experiential-cloud"
@@ -39,7 +43,7 @@ _FAILURE_PAGE = b"""<!doctype html>
 <html><body style="font-family: system-ui; padding: 48px; color: #171717;">
 <h1 style="font-size: 18px;">That did not match</h1>
 <p>This callback was not for the login attempt waiting in your terminal.
-Re-run <code>exp config providers --provider experiential-cloud</code> and use the new URL.</p>
+Re-run <code>exp login</code> and use the new URL.</p>
 </body></html>"""
 
 
@@ -54,7 +58,9 @@ class BrowserLogin:
         """
         self.web_url = web_url.rstrip("/")
         self.state = secrets.token_urlsafe(24)
-        self._tokens: queue.Queue[str] = queue.Queue(maxsize=1)
+        self._token: str | None = None
+        self._token_event = threading.Event()
+        self._token_lock = threading.Lock()
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -80,8 +86,10 @@ class BrowserLogin:
         """
         if self._server is not None:
             raise RuntimeError("browser login listener is already running")
-        tokens = self._tokens
+        login = self
         expected_state = self.state
+        token_event = self._token_event
+        token_lock = self._token_lock
         platform_url = html.escape(self.web_url, quote=True)
         success_page = f"""<!doctype html>
 <html><head><meta http-equiv="refresh" content="1;url={platform_url}"></head>
@@ -95,7 +103,7 @@ class BrowserLogin:
             """Accept the Platform key only on the matching loopback callback."""
 
             def do_GET(self) -> None:  # noqa: N802 - http.server contract
-                """Validate one callback and place its key on the login queue."""
+                """Validate one callback and publish its key to the login waiter."""
                 parsed = urlparse(self.path)
                 if parsed.path != "/callback":
                     self.send_error(404)
@@ -108,11 +116,12 @@ class BrowserLogin:
                 ):
                     self._respond(400, _FAILURE_PAGE)
                     return
-                try:
-                    tokens.put_nowait(token)
-                except queue.Full:
-                    self._respond(400, _FAILURE_PAGE)
-                    return
+                with token_lock:
+                    if login._token is not None:
+                        self._respond(400, _FAILURE_PAGE)
+                        return
+                    login._token = token
+                    token_event.set()
                 self._respond(200, success_page)
 
             def _respond(self, status: int, body: bytes) -> None:
@@ -161,10 +170,10 @@ class BrowserLogin:
         """
         if timeout <= 0:
             raise ValueError("browser login timeout must be positive")
-        try:
-            return self._tokens.get(timeout=timeout)
-        except queue.Empty:
+        if not self._token_event.wait(timeout=timeout):
             return None
+        with self._token_lock:
+            return self._token
 
     def close(self) -> None:
         """Stop the callback listener; repeated cleanup is safe."""
@@ -191,6 +200,41 @@ def hosted_gateway_base_url(environment: Mapping[str, str] | None = None) -> str
     return value or HOSTED_GATEWAY_DEFAULT_BASE_URL
 
 
+def hosted_connection(environment: Mapping[str, str] | None = None) -> ProviderConnection:
+    """Return the stable Experiential Cloud connection used by setup and login.
+
+    Args:
+        environment: Optional process environment used for gateway-origin overrides.
+
+    Returns:
+        Secret-free provider metadata for the first-party hosted gateway.
+    """
+    return ProviderConnection(
+        name=SETUP_PICKER_NAME,
+        provider=CATALOG_PROVIDER,
+        api_key_env=HOSTED_GATEWAY_API_KEY_ENV,
+        base_url=hosted_gateway_base_url(environment),
+    )
+
+
+def hosted_credential_binding(
+    environment: Mapping[str, str] | None = None,
+) -> StoredCredentialBinding:
+    """Return the endpoint binding for the hosted Cloud credential record.
+
+    Args:
+        environment: Optional process environment used for gateway-origin overrides.
+
+    Returns:
+        Secret-free binding that prevents a stored key from crossing hosted endpoints.
+    """
+    connection = hosted_connection(environment)
+    return StoredCredentialBinding(
+        provider=connection.provider,
+        endpoint_sha256=connection.catalog_config().identity_sha256(),
+    )
+
+
 def hosted_platform_url(environment: Mapping[str, str] | None = None) -> str:
     """Return the browser-facing Platform origin for Experiential Cloud login.
 
@@ -212,6 +256,7 @@ def hosted_platform_login(
     environment: Mapping[str, str] | None = None,
     open_browser: Callable[[str], bool] = webbrowser.open,
     timeout: float = PLATFORM_LOGIN_TIMEOUT_SECONDS,
+    fallback: Callable[[Callable[[float], str | None]], str | None] | None = None,
 ) -> str | None:
     """Receive an Experiential Cloud key through the Platform browser approval flow.
 
@@ -224,6 +269,8 @@ def hosted_platform_login(
         environment: Optional process environment used for the Platform origin.
         open_browser: Browser opener, injectable for deterministic tests.
         timeout: Maximum time to wait for the browser callback.
+        fallback: Optional masked-key reader used immediately when the browser cannot open. The
+            reader receives a callback waiter so browser approval can win while input is pending.
 
     Returns:
         The new Platform organization key, or ``None`` when browser login is unavailable
@@ -244,7 +291,17 @@ def hosted_platform_login(
             opened = False
         if not opened:
             console.print(f"[yellow]Open this URL to connect Experiential Cloud:[/yellow] {url}")
-            return None
+            if fallback is not None:
+                console.print(
+                    "[dim]Approve the connection in your browser, or paste an existing key "
+                    "to continue.[/dim]"
+                )
+                fallback_key = fallback(attempt.wait)
+                token = attempt.wait(timeout=0.1)
+                if token is not None:
+                    console.print("[green]Platform login received.[/green]")
+                    return token
+                return fallback_key
         console.print("[dim]Approve the connection in your browser to continue.[/dim]")
         token = attempt.wait(timeout)
         if token is None:
@@ -254,6 +311,100 @@ def hosted_platform_login(
         return token
     finally:
         attempt.close()
+
+
+def read_masked_key_with_callback(
+    prompt: str,
+    *,
+    console: Console,
+    wait_for_callback: Callable[[float], str | None],
+) -> str | None:
+    """Read one hidden terminal line while polling a hosted login callback.
+
+    Args:
+        prompt: Prompt written without a trailing newline.
+        console: Terminal receiving the prompt and its final line break.
+        wait_for_callback: Bounded callback waiter polled while input is pending.
+
+    Returns:
+        The pasted key, the callback key, or ``None`` for an empty line.
+
+    Raises:
+        EOFError: The controlling terminal closes before a line is entered.
+        OSError: The terminal cannot be opened or read.
+        termios.error: Terminal echo settings cannot be changed.
+    """
+    try:
+        fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
+        owns_fd = True
+    except OSError:
+        fd = sys.stdin.fileno()
+        owns_fd = False
+
+    old_attributes = termios.tcgetattr(fd)
+    was_blocking = os.get_blocking(fd)
+    hidden_attributes = old_attributes.copy()
+    hidden_attributes[3] &= ~termios.ECHO
+    prompted = False
+    try:
+        # Keep the final read non-blocking even if terminal readiness changes between
+        # select() and os.read(). This lets callback completion restore echo before
+        # returning, with no daemon reader left owning the terminal.
+        os.set_blocking(fd, False)
+        termios.tcsetattr(fd, termios.TCSADRAIN, hidden_attributes)
+        console.print(prompt, end="")
+        prompted = True
+        while True:
+            token = wait_for_callback(0.05)
+            if token is not None:
+                # Do not leave partially entered secret bytes for the next shell or
+                # CLI prompt after callback-driven login takes ownership of the result.
+                termios.tcflush(fd, termios.TCIFLUSH)
+                return token
+            readable, _, _ = select.select([fd], [], [], 0.05)
+            if not readable:
+                continue
+            try:
+                data = os.read(fd, 4096)
+            except BlockingIOError:
+                continue
+            if not data:
+                raise EOFError
+            return data.decode("utf-8", errors="replace").strip() or None
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_attributes)
+        os.set_blocking(fd, was_blocking)
+        if owns_fd:
+            os.close(fd)
+        if prompted:
+            console.print()
+
+
+def read_hosted_key_fallback(
+    prompt: str,
+    wait_for_callback: Callable[[float], str | None],
+    *,
+    console: Console,
+    read_key: Callable[[str], str | None] = getpass,
+) -> str | None:
+    """Read a hosted key through callback-aware hidden input or an injected reader.
+
+    Args:
+        prompt: Prompt written to the terminal.
+        wait_for_callback: Callback waiter polled while the default reader is active.
+        console: Terminal receiving the prompt.
+        read_key: Optional injected reader used by deterministic tests.
+
+    Returns:
+        The pasted key, callback key, or ``None`` for an empty line.
+    """
+    if read_key is getpass:
+        return read_masked_key_with_callback(
+            prompt,
+            console=console,
+            wait_for_callback=wait_for_callback,
+        )
+    return read_key(prompt)
 
 
 def _is_experiential_cloud_connection(

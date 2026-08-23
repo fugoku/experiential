@@ -14,24 +14,22 @@ from __future__ import annotations
 
 from collections.abc import Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, field
+from functools import partial
 from getpass import getpass
 
 from rich.console import Console
 from rich.prompt import Confirm, IntPrompt, Prompt
 
 from exp.cli.providers.experiential_cloud import (
-    CATALOG_PROVIDER as HOSTED_CATALOG_PROVIDER,
-)
-from exp.cli.providers.experiential_cloud import (
-    HOSTED_GATEWAY_API_KEY_ENV,
-    hosted_gateway_base_url,
-    hosted_platform_login,
-)
-from exp.cli.providers.experiential_cloud import (
     SETUP_PICKER_LABEL as HOSTED_SETUP_LABEL,
 )
 from exp.cli.providers.experiential_cloud import (
     SETUP_PICKER_NAME as HOSTED_SETUP_PICKER,
+)
+from exp.cli.providers.experiential_cloud import (
+    hosted_connection,
+    hosted_platform_login,
+    read_hosted_key_fallback,
 )
 from exp.cli.shared.picker import (
     PickerAction,
@@ -351,11 +349,7 @@ def collect_provider_connection(
     if provider not in SETUP_PROVIDER_LABELS:
         raise ValueError(f"unsupported provider {provider!r}")
     if provider == HOSTED_SETUP_PICKER:
-        return ConnectionConfig(
-            provider=HOSTED_CATALOG_PROVIDER,
-            api_key_env=HOSTED_GATEWAY_API_KEY_ENV,
-            base_url=hosted_gateway_base_url(environment),
-        )
+        return hosted_connection(environment).catalog_config()
     base_url = None
     api_version = None
     region = None
@@ -659,15 +653,23 @@ def _resolve_credential(
             auth_store.remove(connection.name)
 
     def _prompt() -> str | None:
-        """Read one hidden API key, or cancel setup on a closed input stream.
+        """Read one hidden API key, or cancel setup on a closed input stream."""
 
-        Returns:
-            The pasted key, which may be empty to skip the provider.
-
-        Raises:
-            SetupCancelled: The prompt reached end of input.
-        """
-        platform_key = hosted_platform_login(connection, console=console, environment=environment)
+        prompt = f"{label} API key (hidden, empty line skips this provider): "
+        try:
+            platform_key = hosted_platform_login(
+                connection,
+                console=console,
+                environment=environment,
+                fallback=partial(
+                    read_hosted_key_fallback,
+                    prompt,
+                    console=console,
+                    read_key=getpass,
+                ),
+            )
+        except (EOFError, KeyboardInterrupt) as exc:
+            raise SetupCancelled from exc
         if platform_key is not None:
             return platform_key
         console.print(f"[dim]{label} API key[/dim]")
