@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from collections.abc import Callable, Mapping
 from getpass import getpass
+from pathlib import Path
 
 import typer
 from rich.console import Console
@@ -15,8 +16,13 @@ from exp.cli.providers.experiential_cloud import (
     hosted_platform_login,
     read_hosted_key_fallback,
 )
+from exp.cli.providers.sync import sync_account_models
+from exp.cli.shared.options import ROOT_OPTION
 from exp.cli.shared.theme import EXP_THEME
 from exp.common.auth import ProviderAuthStore
+from exp.common.config import ARTIFACT_DIR
+from exp.common.models import ProviderConnectionAuthoringError
+from exp.runtime.models.providers import ProviderListingError, ProviderModelLister
 
 
 def run_login(
@@ -26,6 +32,8 @@ def run_login(
     store: ProviderAuthStore | None = None,
     open_browser: Callable[[str], bool] | None = None,
     read_key: Callable[[str], str | None] = getpass,
+    root: Path | None = None,
+    lister: ProviderModelLister | None = None,
 ) -> None:
     """Authenticate the CLI with Experiential Cloud through Platform.
 
@@ -35,6 +43,8 @@ def run_login(
         store: Optional credential store, primarily for deterministic tests.
         open_browser: Optional browser opener used by the Platform approval flow.
         read_key: Masked fallback reader used when a browser cannot be opened.
+        root: Local ``.exp`` root receiving the synchronized provider catalog.
+        lister: Optional account model-listing seam used by deterministic tests.
 
     Raises:
         typer.Abort: The operator cancels or provides an empty fallback key.
@@ -84,6 +94,18 @@ def run_login(
     if key is None or not key.strip():
         raise typer.Abort
 
+    try:
+        sync_account_models(
+            Path(ARTIFACT_DIR) if root is None else root,
+            connection=connection,
+            api_key=key,
+            console=console,
+            lister=lister,
+        )
+    except (ProviderConnectionAuthoringError, ProviderListingError) as exc:
+        raise typer.BadParameter(
+            f"Experiential Cloud authentication succeeded, but model synchronization failed: {exc}"
+        ) from None
     auth_store = store if store is not None else ProviderAuthStore()
     auth_store.put(
         connection.name,
@@ -93,6 +115,6 @@ def run_login(
     console.print("[green]Logged in to Experiential Cloud.[/green]")
 
 
-def login() -> None:
-    """Open Platform login and save the returned Experiential Cloud credential."""
-    run_login(console=Console(theme=EXP_THEME), environment=os.environ)
+def login(root: Path = ROOT_OPTION) -> None:
+    """Open Platform login, save the credential, and synchronize account models."""
+    run_login(console=Console(theme=EXP_THEME), environment=os.environ, root=root)
