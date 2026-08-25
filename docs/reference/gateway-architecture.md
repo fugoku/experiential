@@ -10,6 +10,8 @@ It serves:
 - `GET /v1/models/{model_id}`
 - `POST /v1/chat/completions`
 - `POST /v1/responses`
+- `POST /v1/messages` (the Anthropic Messages API; `POST /v1/messages/count_tokens` answers an
+  explicit Anthropic-shaped refusal because the gateway has no tokenizer authority)
 - `GET /health/live` and `GET /health/ready`
 - `GET /usage` and `GET /usage.json`
 
@@ -69,14 +71,16 @@ output or buffer overflow commits and flushes.
 The public surface is identical under either engine, and `--engine rust` is
 rust-only: no embedded python engine runs, unknown routes answer a native 404
 in the OpenAI error envelope, keyed Chat Completions and keyed Responses run
-the replay protocol natively, and `/usage` plus `/usage.json` are served
-natively. Startup validates that every granted alias is natively servable
-(every pool deployment resolves to a provider client with a native dialect)
-and fails with the offending aliases named otherwise. Hosted compositions may
-still pass an internal ASGI fallback to `serve_native_gateway` while they
-finish migrating off the python data plane; that seam is deprecated and
-scheduled for removal once the native engine has soaked in production.
-Shutdown drains admitted work within `--graceful-timeout`.
+the replay protocol natively (the Messages surface defines no idempotency
+header and never joins either replay store), and `/usage` plus `/usage.json`
+are served natively. Startup validates that every granted alias is natively
+servable (every pool deployment resolves to a provider client with a native
+dialect) and fails with the offending aliases named otherwise. Hosted
+compositions may still pass an internal ASGI fallback to
+`serve_native_gateway` while they finish migrating off the python data plane;
+that seam is deprecated and scheduled for removal once the native engine has
+soaked in production. Shutdown drains admitted work within
+`--graceful-timeout`.
 
 Identity-scoped guardrails are optional and default-off. Policies are keyed by
 organization and identity. See `docs/reference/gateway-guardrails.md` for
@@ -216,6 +220,20 @@ compatibility.
 Chat streaming emits valid completion chunks and one `[DONE]`. Responses streaming emits the
 created, in-progress, output, and exactly one terminal lifecycle. Provider tool-argument fragments
 are accumulated in original order and validated only at the complete-call boundary.
+
+`exp/runtime/anthropic_protocol` is the only Anthropic Messages wire implementation, serving
+`POST /v1/messages` for Anthropic SDK callers over the same canonical gateway request. Callers
+authenticate with `x-api-key` (the Anthropic SDK default) or a standard Bearer header; both carry
+the same virtual key, and every failure on this surface is rendered in the Anthropic error
+envelope `{"type": "error", "error": {...}}`. The decoder translates text, `tool_use`, and
+`tool_result` blocks faithfully, requires `max_tokens`, validates and drops `thinking` and
+`cache_control` (the gateway has no extended-thinking or prompt-caching channel), and rejects
+image and document blocks loudly because the surface is text-only. Streaming emits the Anthropic
+lifecycle (`message_start`, `ping`, content blocks, `message_delta` with the mapped stop reason
+and usage, `message_stop`, or one terminal `error` event); the non-streaming body is the
+Anthropic message object. Completed streams stop with `end_turn` (`tool_use` when tool calls are
+present) and token-limited streams with `max_tokens`. The Anthropic protocol defines no
+idempotency header, so this surface never joins the keyed replay stores.
 
 Commit-independent headers are available before streaming begins. Route-dependent headers are
 emitted only after an execution snapshot exists. Stable public IDs do not expose raw key,

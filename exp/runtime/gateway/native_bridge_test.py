@@ -2085,3 +2085,287 @@ def test_hosted_components_without_group_commit_writer_settle(
     report = json.loads(control.usage_json("{}"))
     assert report["totals"]["requests"] == 1
     assert report["totals"]["terminal_counts"] == [{"state": "completed", "attempts": 1}]
+
+
+def _messages_fixture_json() -> str:
+    """Return the Rust fixture-event JSON for the shared Messages stream."""
+    return json.dumps(
+        [
+            {"kind": "text_delta", "text": "Hel"},
+            {"kind": "text_delta", "text": "lo é"},
+            {"kind": "tool_call_started", "index": 0, "call_id": "call-1", "name": "search"},
+            {"kind": "tool_arguments_delta", "index": 0, "text": '{"q": '},
+            {"kind": "tool_arguments_delta", "index": 0, "text": '"x"}'},
+            {
+                "kind": "tool_call_completed",
+                "index": 0,
+                "call_id": "call-1",
+                "name": "search",
+                "raw_arguments": '{"q": "x"}',
+            },
+            {"kind": "usage", "input_tokens": 10, "output_tokens": 4, "cached_input_tokens": 3},
+            {"kind": "completed"},
+        ]
+    )
+
+
+def test_rust_messages_sse_frames_match_python_and_the_committed_golden() -> None:
+    """Rust Messages SSE frames equal the python encoder and the golden fixture.
+
+    The committed golden frames are the durable contract: they outlive the
+    python encoder, which is deprecated and scheduled for removal with the
+    python data plane.
+    """
+    native = pytest.importorskip("exp_gateway_native")
+    from exp.runtime.anthropic_protocol.encoding_test import (
+        TOOL_STREAM_GOLDEN_FRAMES,
+        encode,
+        tool_stream_events,
+    )
+
+    actual = native.encode_messages_fixture("request-abc", "coding", _messages_fixture_json())
+    assert tuple(actual) == TOOL_STREAM_GOLDEN_FRAMES
+    assert tuple(actual) == encode(tool_stream_events())
+
+
+def test_rust_messages_failure_frames_match_python_encoder() -> None:
+    """A failed Messages terminal is one identical Anthropic error event."""
+    native = pytest.importorskip("exp_gateway_native")
+    from exp.runtime.anthropic_protocol.encoding import MessagesSseEncoder
+
+    events = [
+        GatewayEvent(kind=GatewayEventKind.TEXT_DELTA, sequence_number=0, text_delta="oops"),
+        GatewayEvent(
+            kind=GatewayEventKind.FAILED,
+            sequence_number=1,
+            failure=GatewayFailure(
+                failure_class=GatewayFailureClass.PROVIDER_INTERNAL,
+                safe_message="provider stream failed",
+            ),
+        ),
+    ]
+    encoder = MessagesSseEncoder(request_id="request-abc", model="coding")
+    expected = list(encoder.start())
+    for event in events:
+        expected.extend(encoder.feed(event))
+    fixture = json.dumps(
+        [
+            {"kind": "text_delta", "text": "oops"},
+            {"kind": "failed", "text": "provider stream failed"},
+        ]
+    )
+    actual = native.encode_messages_fixture("request-abc", "coding", fixture)
+    assert list(actual) == expected
+
+
+def test_rust_messages_completed_body_matches_python_and_the_committed_golden() -> None:
+    """The Rust non-streaming Anthropic message equals the python body."""
+    native = pytest.importorskip("exp_gateway_native")
+    from exp.runtime.anthropic_protocol.encoding import completed_messages_body
+    from exp.runtime.anthropic_protocol.encoding_test import (
+        TOOL_STREAM_GOLDEN_BODY,
+        tool_stream_events,
+    )
+
+    actual = native.completed_messages_fixture("request-abc", "coding", _messages_fixture_json())
+    assert actual == TOOL_STREAM_GOLDEN_BODY
+    expected = completed_messages_body(
+        request_id="request-abc", model="coding", events=tool_stream_events()
+    )
+    assert actual == json.dumps(expected, separators=(",", ":"), ensure_ascii=False)
+
+
+def test_rust_anthropic_error_translation_matches_python() -> None:
+    """The Rust Anthropic error envelope equals the python translation.
+
+    Every failure class is exercised through the shared public-error mapping,
+    plus one param-carrying protocol error to prove the param folding.
+    """
+    native = pytest.importorskip("exp_gateway_native")
+    from exp.runtime.anthropic_protocol.errors import anthropic_error_body
+
+    def _rust_translation(error: OpenAIProtocolError) -> JsonObject:
+        """Translate one OpenAI-shaped error through the Rust fixture."""
+        payload = json.dumps(
+            {
+                "status_code": error.status_code,
+                "code": error.detail.code,
+                "message": error.detail.message,
+                "error_type": error.detail.type,
+                "param": error.detail.param,
+                "retry_after_seconds": error.retry_after_seconds,
+            }
+        )
+        return cast("JsonObject", json.loads(native.anthropic_error_fixture(payload)))
+
+    for failure_class in GatewayFailureClass:
+        error = public_failure_error(
+            GatewayFailure(failure_class=failure_class, safe_message="parity probe message")
+        )
+        assert _rust_translation(error) == anthropic_error_body(error), failure_class
+    with_param = OpenAIProtocolError(
+        status_code=400,
+        code="unsupported_parameter",
+        message="The parameter 'top_k' is not supported.",
+        param="top_k",
+    )
+    assert _rust_translation(with_param) == anthropic_error_body(with_param)
+
+
+def test_rust_messages_body_preserves_interleaved_block_order() -> None:
+    """Both engines keep provider block order in the non-streaming body."""
+    native = pytest.importorskip("exp_gateway_native")
+    from exp.common.models.model import ToolCall
+    from exp.runtime.anthropic_protocol.encoding import completed_messages_body
+
+    events = (
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_CALL_STARTED,
+            sequence_number=0,
+            tool_call_index=0,
+            tool_call_id="call-1",
+            tool_name="search",
+        ),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_CALL_COMPLETED,
+            sequence_number=1,
+            tool_call_index=0,
+            tool_call=ToolCall(call_id="call-1", name="search", arguments={}, raw_arguments="{}"),
+        ),
+        GatewayEvent(kind=GatewayEventKind.TEXT_DELTA, sequence_number=2, text_delta="after"),
+        GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=3),
+    )
+    fixture = json.dumps(
+        [
+            {"kind": "tool_call_started", "index": 0, "call_id": "call-1", "name": "search"},
+            {
+                "kind": "tool_call_completed",
+                "index": 0,
+                "call_id": "call-1",
+                "name": "search",
+                "raw_arguments": "{}",
+            },
+            {"kind": "text_delta", "text": "after"},
+            {"kind": "completed"},
+        ]
+    )
+    actual = native.completed_messages_fixture("request-abc", "coding", fixture)
+    expected = completed_messages_body(request_id="request-abc", model="coding", events=events)
+    assert actual == json.dumps(expected, separators=(",", ":"), ensure_ascii=False)
+    assert json.loads(actual)["content"][0]["type"] == "tool_use"
+    assert json.loads(actual)["content"][1] == {"type": "text", "text": "after"}
+
+
+def test_rust_messages_deferred_tool_completion_matches_python() -> None:
+    """Deferred completions (OpenAI-compatible [DONE] ordering) stay in parity.
+
+    Text arriving between a tool's arguments and its completion must stream
+    and aggregate identically on both engines, with the tool block anchored
+    at its start position.
+    """
+    native = pytest.importorskip("exp_gateway_native")
+    from exp.common.models.model import ToolCall
+    from exp.runtime.anthropic_protocol.encoding import (
+        MessagesSseEncoder,
+        completed_messages_body,
+    )
+
+    events = (
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_CALL_STARTED,
+            sequence_number=0,
+            tool_call_index=0,
+            tool_call_id="call-1",
+            tool_name="search",
+        ),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_ARGUMENTS_DELTA,
+            sequence_number=1,
+            tool_call_index=0,
+            raw_arguments_delta="{}",
+        ),
+        GatewayEvent(kind=GatewayEventKind.TEXT_DELTA, sequence_number=2, text_delta="after"),
+        GatewayEvent(
+            kind=GatewayEventKind.TOOL_CALL_COMPLETED,
+            sequence_number=3,
+            tool_call_index=0,
+            tool_call=ToolCall(call_id="call-1", name="search", arguments={}, raw_arguments="{}"),
+        ),
+        GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=4),
+    )
+    fixture = json.dumps(
+        [
+            {"kind": "tool_call_started", "index": 0, "call_id": "call-1", "name": "search"},
+            {"kind": "tool_arguments_delta", "index": 0, "text": "{}"},
+            {"kind": "text_delta", "text": "after"},
+            {
+                "kind": "tool_call_completed",
+                "index": 0,
+                "call_id": "call-1",
+                "name": "search",
+                "raw_arguments": "{}",
+            },
+            {"kind": "completed"},
+        ]
+    )
+    encoder = MessagesSseEncoder(request_id="request-abc", model="coding")
+    expected_frames = list(encoder.start())
+    for event in events:
+        expected_frames.extend(encoder.feed(event))
+    actual_frames = native.encode_messages_fixture("request-abc", "coding", fixture)
+    assert list(actual_frames) == expected_frames
+    expected_body = completed_messages_body(request_id="request-abc", model="coding", events=events)
+    actual_body = native.completed_messages_fixture("request-abc", "coding", fixture)
+    assert actual_body == json.dumps(expected_body, separators=(",", ":"), ensure_ascii=False)
+
+
+def test_rust_messages_interleaved_parallel_tools_match_python_and_golden() -> None:
+    """Interleaved parallel tool calls stay in byte parity across engines.
+
+    The canonical stream may legally interleave tool A arguments, tool B
+    start, and more tool A arguments; both encoders must schedule blocks in
+    start order, streaming the open block live and buffering the rest.
+    """
+    native = pytest.importorskip("exp_gateway_native")
+    from exp.runtime.anthropic_protocol.encoding import completed_messages_body
+    from exp.runtime.anthropic_protocol.encoding_test import (
+        INTERLEAVED_GOLDEN_BODY,
+        INTERLEAVED_GOLDEN_FRAMES,
+        encode,
+        interleaved_parallel_tool_events,
+    )
+
+    fixture = json.dumps(
+        [
+            {"kind": "tool_call_started", "index": 0, "call_id": "call-a", "name": "alpha"},
+            {"kind": "tool_arguments_delta", "index": 0, "text": '{"a": '},
+            {"kind": "tool_call_started", "index": 1, "call_id": "call-b", "name": "beta"},
+            {"kind": "tool_arguments_delta", "index": 1, "text": '{"b": 2}'},
+            {"kind": "tool_arguments_delta", "index": 0, "text": "1}"},
+            {
+                "kind": "tool_call_completed",
+                "index": 0,
+                "call_id": "call-a",
+                "name": "alpha",
+                "raw_arguments": '{"a": 1}',
+            },
+            {
+                "kind": "tool_call_completed",
+                "index": 1,
+                "call_id": "call-b",
+                "name": "beta",
+                "raw_arguments": '{"b": 2}',
+            },
+            {"kind": "usage", "input_tokens": 6, "output_tokens": 3},
+            {"kind": "completed"},
+        ]
+    )
+    actual_frames = native.encode_messages_fixture("request-abc", "coding", fixture)
+    assert tuple(actual_frames) == INTERLEAVED_GOLDEN_FRAMES
+    assert tuple(actual_frames) == encode(interleaved_parallel_tool_events())
+    actual_body = native.completed_messages_fixture("request-abc", "coding", fixture)
+    assert actual_body == INTERLEAVED_GOLDEN_BODY
+    expected_body = completed_messages_body(
+        request_id="request-abc", model="coding", events=interleaved_parallel_tool_events()
+    )
+    assert actual_body == json.dumps(expected_body, separators=(",", ":"), ensure_ascii=False)
