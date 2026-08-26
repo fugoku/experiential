@@ -15,8 +15,7 @@ from exp.common.models import (
     ToolChoice,
     Usage,
 )
-from exp.runtime.gateway.contracts import GatewayRequest
-from exp.runtime.models.providers.async_transport import AsyncJsonHttpTransport, RequestDeadline
+from exp.runtime.models.providers.async_transport import AsyncJsonHttpTransport
 from exp.runtime.models.providers.base import (
     DEFAULT_MAXIMUM_OUTPUT_TOKENS,
     DEFAULT_RETRY_POLICY,
@@ -34,10 +33,6 @@ from exp.runtime.models.providers.errors import (
     require_string,
 )
 from exp.runtime.models.providers.reasoning_compat import anthropic_reasoning_effort
-from exp.runtime.models.providers.streaming import (
-    NormalizedProviderStream,
-    start_anthropic_messages_stream,
-)
 from exp.runtime.models.providers.transport import JsonHttpTransport, RetryPolicy
 
 ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1"
@@ -203,48 +198,6 @@ class AnthropicClient(ProviderHttpClient):
         self._supports_logprobs = supports_logprobs
         self._supports_reasoning = supports_reasoning
         self._reasoning_effort = reasoning_effort
-
-    async def stream(
-        self,
-        request: GatewayRequest,
-        *,
-        deadline: RequestDeadline,
-        idempotency_key: str,
-        retry_policy: RetryPolicy | None = None,
-    ) -> NormalizedProviderStream:
-        """Start one true native Messages stream under the gateway deadline.
-
-        Args:
-            request: Canonical streaming gateway request.
-            deadline: Immutable request-wide deadline.
-            idempotency_key: Stable identity for safe pre-commit opening retries.
-            retry_policy: Optional caller-owned physical dispatch limit.
-
-        Returns:
-            A cancellable provider-neutral event stream.
-
-        Raises:
-            ValueError: The canonical request did not ask for streaming.
-        """
-        if not request.stream:
-            raise ValueError("gateway provider stream requires request.stream")
-        return await start_anthropic_messages_stream(
-            self._transport,
-            f"{self._base_url}/{self._request_path(self._completion_path())}",
-            headers=self._headers(),
-            request=request,
-            model_id=self._model.model_id,
-            deadline=deadline,
-            idempotency_key=idempotency_key,
-            retry_policy=retry_policy or self._retry_policy,
-            timeout_seconds=self._timeout_seconds,
-            supports_temperature=self._supports_temperature,
-            supports_top_p=self._supports_top_p,
-            supports_top_k=self._supports_top_k,
-            supports_logprobs=self._supports_logprobs,
-            supports_reasoning=self._supports_reasoning,
-            reasoning_effort=self._reasoning_effort,
-        )
 
     def _headers(self) -> dict[str, str]:
         """Build native Anthropic Messages headers with the versioned API key scheme."""

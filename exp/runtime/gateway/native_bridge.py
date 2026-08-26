@@ -18,17 +18,16 @@ per deployment) plus the frozen retry-policy facts, accepting the request
 without starting any attempt. The data plane then reserves each physical
 dispatch through ``start_attempt`` immediately before network work and lands
 each attempt's durable terminal through ``settle`` (finalizing the request
-only on the terminal attempt); candidate selection stays here, mirroring the
-python executor's waterfall policy, health circuits, and budget skipping.
+only on the terminal attempt); candidate selection stays here: the frozen
+waterfall policy, health circuits, and budget skipping.
 
 Boundary errors raise :class:`NativeBridgeError`, whose ``public_error_json``
 attribute carries the sanitized OpenAI-shaped error the data plane returns to
-the caller, mirroring ``GatewayService`` error mapping. Requests the native
-path cannot serve (resolved clients exposing no native wire profile) are
-answered with an ``{"escalate": reason}`` admission disposition before any
-ledger write; the data plane replays those against the embedded python
-engine, which performs its own full authorization and accounting, so nothing
-is double-counted.
+the caller through the shared boundary mapping. Requests the native path
+cannot serve (resolved clients exposing no native wire profile) are answered
+with an ``{"escalate": reason}`` admission disposition after the accepted
+request is finalized content-free; the data plane classifies the reason for
+metrics and fails the request closed with the shared internal error.
 """
 
 from __future__ import annotations
@@ -53,7 +52,6 @@ from exp.runtime.gateway.discovery import (
     public_model_object,
     require_granted_authority,
 )
-from exp.runtime.gateway.execution import GatewayExecutionError
 from exp.runtime.gateway.group_commit import SyncGroupCommitLedger
 from exp.runtime.gateway.guardrails.client import assert_not_internal_classification
 from exp.runtime.gateway.guardrails.contracts import GuardrailRejected
@@ -118,10 +116,10 @@ _REQUEST_TIMEOUT_SECONDS = 120.0
 
 
 def _escalation(reason: str) -> str:
-    """Return the admission disposition that hands this request to python.
+    """Return the admission disposition for a request the plane cannot serve.
 
-    No ledger row exists when this is returned; the embedded python engine
-    performs complete authorization and accounting on the replayed request.
+    The data plane classifies the reason for content-free metrics and fails
+    the request closed.
 
     Args:
         reason: Display-safe reason the native path cannot serve the request.
@@ -167,9 +165,9 @@ class NativeControlPlane:
                 content-free metrics snapshot as one JSON string; the local
                 launch injects ``exp_gateway_native.metrics_snapshot_json``.
                 Without it the snapshot reports ``data_plane`` as ``None``.
-            continuation_store: Optional Responses continuation state, shared
-                with the embedded python engine so both engines resolve and
-                retain the same bounded namespaced history.
+            continuation_store: Optional injected Responses continuation
+                state; a host supplies its own bounded namespaced history,
+                and the default is one in-process bounded store.
             readiness_probe: Optional hosted lifecycle readiness callback.
             usage_reporter: Optional hosted usage report callback.
             budget_error_factory: Optional hosted mapping for a rejected reservation.
@@ -256,8 +254,9 @@ class NativeControlPlane:
             ``route`` (one dialect, endpoint, headers, payload, and
             per-deployment idempotency key entry per deployment) plus the
             frozen retry-policy facts, or an ``{"escalate": reason}``
-            disposition (returned only before any ledger write) handing the
-            request to the python engine.
+            disposition (its accepted request already finalized, with no
+            attempt row) naming why the native plane cannot serve the
+            request.
 
         Raises:
             NativeBridgeError: Decoding, authorization, routing, or
@@ -291,8 +290,8 @@ class NativeControlPlane:
             raise _authority_error(exc) from exc
 
         # Responses continuation resolves after authorization and before any
-        # ledger write, the same order the python engine uses; unavailable,
-        # expired, evicted, or cross-namespace state fails closed here.
+        # ledger write; unavailable, expired, evicted, or cross-namespace
+        # state fails closed here.
         continuation_context: ContinuationContext | None = None
         if request.surface == GatewayApiSurface.RESPONSES:
             try:
@@ -315,36 +314,50 @@ class NativeControlPlane:
         except GuardrailRejected as exc:
             raise NativeBridgeError(public_failure_error(exc.failure)) from exc
 
-        # Escalation runs after input enforcement and before any ledger write.
-        # The python engine re-inspects the original public body when it
-        # serves the request. Routing failures found by the probe are recorded
-        # against the accepted request below.
+        # The ledger accepts the logical request before route selection, so a
+        # keyed operation whose durable terminal already exists (or whose key
+        # was reused with different content) fails closed here, before
+        # learned selection can run request-time embedding or any other
+        # provider-touching work.
+        try:
+            self._write_ledger.accept_request(authorization=authorization)
+        except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
+            raise _authority_error(exc) from exc
+
+        # Escalation runs after acceptance; the accepted request is finished
+        # quietly before the disposition returns, so an unservable request is
+        # accounted content-free and never billed. Routing failures found by
+        # the probe are raised against the accepted request below.
         probe_failure: Exception | None = None
         route: GatewayRoute | None = None
         resolved_wires: tuple[tuple[GatewayWireProfile, NativeWireClient], ...] | None = None
         try:
-            route = self._resolve_route(authorization, request)
+            route = self._resolve_route(
+                authorization,
+                request,
+                continuation=continuation_context,
+            )
             resolved_wires = resolve_route_profiles(self._components.runtime_catalogs, route)
         except NativeDialectUnavailableError as exc:
-            return _escalation(str(exc))
-        except Exception as exc:  # noqa: BLE001 - recorded after acceptance below.
+            return self._escalate_accepted(authorization, str(exc))
+        except Exception as exc:  # noqa: BLE001 - raised after route packaging below.
             probe_failure = exc
         if route is not None and self._native_route_eligible is not None:
             try:
                 native_route_eligible = self._native_route_eligible(route, request)
-            except Exception:  # noqa: BLE001 - hosted policy fails closed to Python.
+            except Exception:  # noqa: BLE001 - hosted policy fails closed.
                 native_route_eligible = False
             if not native_route_eligible:
-                return _escalation("host policy requires the python execution engine")
+                return self._escalate_accepted(
+                    authorization,
+                    "host policy does not permit native execution of this route",
+                )
 
-        # Admission accepts the request and returns the full ordered route;
-        # no attempt row exists until the data plane's first `start_attempt`.
+        # Admission returns the full ordered route; no attempt row exists
+        # until the data plane's first `start_attempt`.
         public_request = request
         provider_request = request.model_copy(update={"stream": True, "include_usage": True})
-        accepted = False
         try:
-            self._write_ledger.accept_request(authorization=authorization)
-            accepted = True
             if probe_failure is not None or route is None or resolved_wires is None:
                 raise probe_failure or GatewayRoutingError("authorized route did not resolve")
             public_request, provider_request = route_generation_parameter_requests(
@@ -394,8 +407,7 @@ class NativeControlPlane:
                 failure_class=GatewayFailureClass.INTERNAL,
                 safe_message="gateway admission failed before provider dispatch",
             )
-            if accepted:
-                self._accounting.finish_request_quietly(authorization, failure)
+            self._accounting.finish_request_quietly(authorization, failure)
             raise error from exc
 
         self._accounting.register(
@@ -535,15 +547,15 @@ class NativeControlPlane:
         """Resolve the replay-store scope for one keyed request.
 
         The data plane owns the bounded in-process replay store; this call
-        performs the same decode and authorization the python engine runs so
-        the store key (tenant namespace, hashed caller operation, canonical
-        request digest) is computed by exactly one implementation. The
-        surface is part of the key, so keyed Chat Completions and keyed
-        Responses operations never collide. A direct route whose provider has
-        no native dialect is escalated before any replay claim, so one caller
-        operation never spans both engines' replay stores; project targets
-        resolve their deployment at admission through the same frozen
-        selection, so their scope claims natively.
+        performs the decode and authorization once so the store key (tenant
+        namespace, hashed caller operation, canonical request digest) is
+        computed by exactly one implementation. The surface is part of the
+        key, so keyed Chat Completions and keyed Responses operations never
+        collide. A direct route whose provider has no native dialect is
+        escalated before any replay claim, so an unservable caller operation
+        never occupies the replay store; project targets resolve their
+        deployment at admission through the same frozen selection, so their
+        scope claims natively.
 
         Args:
             argument: JSON object with ``raw_key``, ``body``, optional
@@ -555,7 +567,7 @@ class NativeControlPlane:
             JSON replay scope with ``organization_id``, ``identity_id``,
             ``alias_revision_id``, ``surface``, ``caller_operation_sha256``,
             and ``canonical_request_sha256``, or an ``{"escalate": reason}``
-            disposition handing the request to the python engine.
+            disposition naming why the native plane cannot serve the request.
 
         Raises:
             NativeBridgeError: Decoding or authorization failed.
@@ -785,19 +797,26 @@ class NativeControlPlane:
         return json.dumps({"text": text}, separators=(",", ":"))
 
     def readiness(self, argument: str) -> str:
-        """Return whether shared executor and bridge accounting stay healthy."""
+        """Return whether bridge settlement and composition accounting stay healthy.
+
+        Readiness fails closed once the bridge's own settlement registry has
+        latched a durable-write loss, once the composition's accounting
+        surface reports unhealthy, or when an injected hosted lifecycle probe
+        answers false or raises.
+        """
         del argument
         if not self._accounting.accounting_healthy:
+            return "false"
+        try:
+            if not self._components.accounting_healthy:
+                return "false"
+        except Exception:  # noqa: BLE001 - readiness fails closed at the boundary.
             return "false"
         if self._readiness_probe is not None:
             try:
                 return "true" if self._readiness_probe() else "false"
             except Exception:  # noqa: BLE001 - readiness fails closed at the boundary.
                 return "false"
-        try:
-            self._components.executor.require_healthy()
-        except GatewayExecutionError:
-            return "false"
         return "true"
 
     def _decode_body(
@@ -819,32 +838,69 @@ class NativeControlPlane:
         except NativeDecodeError as exc:
             raise NativeBridgeError(exc.error) from exc
 
+    def _escalate_accepted(self, authorization: AuthorizationSnapshot, reason: str) -> str:
+        """Finish one accepted-but-unservable request and return its disposition.
+
+        The request was durably accepted before route probing, so the plane
+        finalizes it content-free (no attempt row ever exists) before the
+        escalation disposition tells the data plane to fail the request
+        closed.
+
+        Args:
+            authorization: Frozen authority for the accepted request.
+            reason: Display-safe reason the native path cannot serve it.
+
+        Returns:
+            The JSON admission body carrying the escalation disposition.
+        """
+        self._accounting.finish_request_quietly(
+            authorization,
+            GatewayFailure(
+                failure_class=GatewayFailureClass.INTERNAL,
+                safe_message="the native engine cannot serve the authorized route",
+            ),
+        )
+        return _escalation(reason)
+
     def _resolve_route(
         self,
         authorization: AuthorizationSnapshot,
         request: GatewayRequest,
+        *,
+        continuation: ContinuationContext | None = None,
     ) -> GatewayRoute:
         """Resolve one direct or project route without an event loop.
 
         Direct pools resolve entirely inside frozen in-memory catalogs.
         Project targets run frozen learned selection synchronously on this
-        worker thread through the same selection seam and the same episode
-        identity derivation the python engine uses, so the two engines share
-        one policy execution path. Request-time embedding failure falls back
-        to the frozen conservative baseline inside the shared runtime, and
-        neither path mutates policy or evidence.
+        worker thread through the shared selection seam and episode identity
+        derivation, so there is exactly one policy execution path. A
+        Responses continuation carries its original turn's episode key, so a
+        continued request joins the same selection episode instead of
+        re-running request-time embedding for a fresh one. Request-time
+        embedding failure falls back to the frozen conservative baseline
+        inside the shared runtime, and neither path mutates policy or
+        evidence.
         """
         if isinstance(authorization.target, DirectTarget):
             return self._components.routes.resolve_direct(authorization)
-        episode = episode_namespace(
-            namespace=ProtocolNamespace(
-                organization_id=authorization.organization_id,
-                identity_id=authorization.identity_id,
-                alias_revision_id=authorization.alias_revision_id,
-            ),
-            caller_episode_key=request.idempotency_key or request.client_request_id,
-            request_id=authorization.request_id,
-        )
+        if continuation is not None:
+            episode = (
+                authorization.organization_id,
+                authorization.identity_id,
+                authorization.alias_revision_id,
+                continuation.episode_key,
+            )
+        else:
+            episode = episode_namespace(
+                namespace=ProtocolNamespace(
+                    organization_id=authorization.organization_id,
+                    identity_id=authorization.identity_id,
+                    alias_revision_id=authorization.alias_revision_id,
+                ),
+                caller_episode_key=request.idempotency_key or request.client_request_id,
+                request_id=authorization.request_id,
+            )
         return self._components.routes.resolve_project_blocking(
             authorization=authorization,
             request=request,

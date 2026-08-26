@@ -4,9 +4,7 @@ One shared native serving subprocess (the same driver pattern as
 ``native_engine_disconnect_test``) serves a seeded root whose ``coding``
 alias points at a local OpenAI-compatible SSE mock upstream. The tests drive
 ``POST /v1/messages`` with Anthropic-shaped requests through the real Rust
-data plane and shared python control plane, then prove the deprecated
-python engine (scheduled for removal with the python data plane) serves the
-identical surface over the same root.
+data plane and shared python control plane.
 
 The Anthropic passthrough upstream dialect is deliberately not driven here:
 ``anthropic`` is a fixed-origin provider whose connection config rejects a
@@ -19,7 +17,6 @@ from __future__ import annotations
 import json
 import os
 import signal
-import socket
 import subprocess
 import sys
 import textwrap
@@ -32,11 +29,9 @@ from pathlib import Path
 
 import httpx
 import pytest
-from fastapi.testclient import TestClient
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelCapabilities
-from exp.runtime.gateway.lifecycle import load_local_gateway
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
 
 pytest.importorskip("exp_gateway_native")
@@ -87,7 +82,6 @@ _DRIVER_SOURCE = textwrap.dedent(
                             "port": port,
                             "max_active_requests": 8,
                             "request_timeout_seconds": config["request_timeout_seconds"],
-                            "fallback_port": config["fallback_port"],
                             "graceful_timeout_seconds": 2.0,
                         }
                     ),
@@ -129,6 +123,26 @@ def _terminal_frames(finish_reason: str) -> bytes:
                     "usage": {
                         "prompt_tokens": 9,
                         "completion_tokens": 4,
+                        "prompt_tokens_details": {"cached_tokens": 2},
+                    },
+                }
+            ),
+            b"data: [DONE]\n\n",
+        )
+    )
+
+
+def _zero_output_terminal_frames(finish_reason: str) -> bytes:
+    """Encode a terminal with no content deltas: finish, real usage, done sentinel."""
+    return b"".join(
+        (
+            _sse_frame({"choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]}),
+            _sse_frame(
+                {
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": 9,
+                        "completion_tokens": 0,
                         "prompt_tokens_details": {"cached_tokens": 2},
                     },
                 }
@@ -200,6 +214,10 @@ class _SseUpstream(BaseHTTPRequestHandler):
                     )
                 )
                 self.wfile.write(_terminal_frames("tool_calls"))
+            elif prompt == "empty-token":
+                self.wfile.write(_zero_output_terminal_frames("stop"))
+            elif prompt == "truncated-token":
+                self.wfile.write(_zero_output_terminal_frames("length"))
             else:
                 self.wfile.write(_content_chunk("hello "))
                 self.wfile.write(_content_chunk("world"))
@@ -225,13 +243,6 @@ class _ServingEngine:
     def base(self) -> str:
         """Return the public gateway origin."""
         return f"http://{_HOST}:{self.port}"
-
-
-def _closed_port() -> int:
-    """Return an ephemeral port with no listener behind it."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.bind((_HOST, 0))
-        return probe.getsockname()[1]
 
 
 def _messages_body(prompt: str, *, stream: bool = False, tools: bool = False) -> JsonObject:
@@ -279,7 +290,6 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
         {
             "root": str(root),
             "request_timeout_seconds": _REQUEST_TIMEOUT_SECONDS,
-            "fallback_port": _closed_port(),
         }
     )
     stderr_log = root / "driver-stderr.log"
@@ -417,7 +427,7 @@ def test_streaming_message_emits_the_full_anthropic_lifecycle(
         timeout=30.0,
     ) as response:
         assert response.status_code == 200
-        assert response.headers["content-type"] == "text/event-stream"
+        assert response.headers["content-type"] == "text/event-stream; charset=utf-8"
         raw = b"".join(response.iter_bytes()).decode()
     names = [
         line.removeprefix("event: ") for line in raw.splitlines() if line.startswith("event: ")
@@ -508,10 +518,10 @@ def test_protocol_and_key_failures_are_anthropic_shaped(engine: _ServingEngine) 
     assert count_tokens.json()["error"]["type"] == "not_found_error"
 
 
-def test_native_and_python_reject_unsupported_reasoning_effort_identically(
+def test_native_rejects_unsupported_reasoning_effort_with_the_public_field_error(
     engine: _ServingEngine,
 ) -> None:
-    """Both data planes return the local field error before provider dispatch."""
+    """The native plane returns the local field error before any provider dispatch."""
     payload = {
         "model": "coding",
         "input": "hello",
@@ -524,13 +534,6 @@ def test_native_and_python_reject_unsupported_reasoning_effort_identically(
         json=payload,
         timeout=10.0,
     )
-    runtime = load_local_gateway(
-        engine.root,
-        graceful_timeout_seconds=1,
-        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
-    )
-    with TestClient(runtime.app) as client:
-        python = client.post("/v1/responses", headers=headers, json=payload)
 
     expected = {
         "error": {
@@ -544,15 +547,13 @@ def test_native_and_python_reject_unsupported_reasoning_effort_identically(
         }
     }
     assert native.status_code == 400
-    assert python.status_code == 400
     assert native.json() == expected
-    assert python.json() == expected
 
 
-def test_native_and_python_reject_unsupported_sampling_identically(
+def test_native_rejects_unsupported_sampling_with_the_public_field_error(
     engine: _ServingEngine,
 ) -> None:
-    """Generic route parameter failures retain parity across both data planes."""
+    """A route without top-k support fails the request locally with the field name."""
     payload = {**_messages_body("fast-token"), "top_k": 3}
     headers = {"x-api-key": engine.raw_key}
     native = httpx.post(
@@ -561,17 +562,8 @@ def test_native_and_python_reject_unsupported_sampling_identically(
         json=payload,
         timeout=10.0,
     )
-    runtime = load_local_gateway(
-        engine.root,
-        graceful_timeout_seconds=1,
-        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
-    )
-    with TestClient(runtime.app) as client:
-        python = client.post("/v1/messages", headers=headers, json=payload)
 
     assert native.status_code == 400
-    assert python.status_code == 400
-    assert native.json() == python.json()
     assert "top_k" in native.json()["error"]["message"]
 
 
@@ -579,12 +571,12 @@ def test_native_and_python_reject_unsupported_sampling_identically(
     ("field", "value"),
     (("temperature", 1.1), ("max_tokens", 129)),
 )
-def test_native_and_python_enforce_catalog_generation_limits_before_dispatch(
+def test_native_enforces_catalog_generation_limits_before_dispatch(
     engine: _ServingEngine,
     field: str,
     value: float | int,
 ) -> None:
-    """Model-specific sampling and output ceilings are shared by both engines."""
+    """Model-specific sampling and output ceilings fail locally, with no upstream dispatch."""
     payload = _messages_body("must-not-dispatch")
     payload[field] = value
     headers = {"x-api-key": engine.raw_key}
@@ -597,47 +589,192 @@ def test_native_and_python_enforce_catalog_generation_limits_before_dispatch(
         json=payload,
         timeout=10.0,
     )
-    runtime = load_local_gateway(
-        engine.root,
-        graceful_timeout_seconds=1,
-        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
-    )
-    with TestClient(runtime.app) as client:
-        python = client.post("/v1/messages", headers=headers, json=payload)
 
     assert native.status_code == 400
-    assert python.status_code == 400
-    assert native.json() == python.json()
     assert field in native.json()["error"]["message"]
     with _SseUpstream.payloads_lock:
         assert len(_SseUpstream.payloads) == dispatched_before
 
 
-def test_python_engine_serves_the_identical_surface(engine: _ServingEngine) -> None:
-    """The deprecated python engine answers the same bytes modulo request identity."""
-    native = httpx.post(
-        f"{engine.base}/v1/messages",
-        headers={"x-api-key": engine.raw_key},
-        json=_messages_body("fast-token"),
+_ZERO_OUTPUT_CHAT_CASES = (
+    pytest.param("empty-token", "stop", id="empty-completion"),
+    pytest.param("truncated-token", "length", id="max-tokens-truncation"),
+)
+_ZERO_OUTPUT_RESPONSES_CASES = (
+    pytest.param("empty-token", "completed", id="empty-completion"),
+    pytest.param("truncated-token", "incomplete", id="max-tokens-truncation"),
+)
+_ZERO_OUTPUT_MESSAGES_CASES = (
+    pytest.param("empty-token", "end_turn", id="empty-completion"),
+    pytest.param("truncated-token", "max_tokens", id="max-tokens-truncation"),
+)
+
+
+@pytest.mark.parametrize(("prompt", "finish_reason"), _ZERO_OUTPUT_CHAT_CASES)
+def test_chat_non_stream_zero_output_keeps_client_visible_usage(
+    engine: _ServingEngine,
+    prompt: str,
+    finish_reason: str,
+) -> None:
+    """A successful zero-output completion still returns the real token usage."""
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={"model": "coding", "messages": [{"role": "user", "content": prompt}]},
         timeout=30.0,
     )
-    runtime = load_local_gateway(
-        engine.root,
-        graceful_timeout_seconds=1,
-        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["choices"][0]["finish_reason"] == finish_reason
+    usage = body["usage"]
+    assert usage is not None, "zero-output completion dropped client-visible usage"
+    assert usage["prompt_tokens"] == 9
+    assert usage["completion_tokens"] == 0
+    assert usage["total_tokens"] == 9
+    assert usage["prompt_tokens_details"]["cached_tokens"] == 2
+
+
+@pytest.mark.parametrize(("prompt", "finish_reason"), _ZERO_OUTPUT_CHAT_CASES)
+def test_chat_stream_zero_output_emits_the_include_usage_chunk(
+    engine: _ServingEngine,
+    prompt: str,
+    finish_reason: str,
+) -> None:
+    """A zero-output stream still ends with the requested usage chunk."""
+    with httpx.stream(
+        "POST",
+        f"{engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        },
+        timeout=30.0,
+    ) as response:
+        assert response.status_code == 200
+        raw = b"".join(response.iter_bytes()).decode()
+    payloads = [
+        json.loads(line.removeprefix("data: "))
+        for line in raw.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    finish_reasons = [
+        choice["finish_reason"]
+        for payload in payloads
+        for choice in payload.get("choices", ())
+        if choice.get("finish_reason")
+    ]
+    assert finish_reasons == [finish_reason]
+    usage_chunks = [payload["usage"] for payload in payloads if payload.get("usage")]
+    assert usage_chunks, "zero-output stream never emitted the include_usage chunk"
+    assert usage_chunks[-1]["prompt_tokens"] == 9
+    assert usage_chunks[-1]["completion_tokens"] == 0
+
+
+@pytest.mark.parametrize(("prompt", "status"), _ZERO_OUTPUT_RESPONSES_CASES)
+def test_responses_non_stream_zero_output_keeps_client_visible_usage(
+    engine: _ServingEngine,
+    prompt: str,
+    status: str,
+) -> None:
+    """A zero-output Responses result still carries the real token usage."""
+    response = httpx.post(
+        f"{engine.base}/v1/responses",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={"model": "coding", "input": prompt},
+        timeout=30.0,
     )
-    with TestClient(runtime.app) as client:
-        python_engine = client.post(
-            "/v1/messages",
-            headers={"x-api-key": engine.raw_key},
-            json=_messages_body("fast-token"),
-        )
-        python_bad_key = client.post(
-            "/v1/messages",
-            headers={"x-api-key": "exp_vk_invalid"},
-            json=_messages_body("fast-token"),
-        )
-    assert python_engine.status_code == 200
-    assert _normalized(python_engine.json()) == _normalized(native.json())
-    assert python_bad_key.status_code == 401
-    assert python_bad_key.json()["error"]["type"] == "authentication_error"
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == status
+    usage = body["usage"]
+    assert usage is not None, "zero-output response dropped client-visible usage"
+    assert usage["input_tokens"] == 9
+    assert usage["output_tokens"] == 0
+    assert usage["input_tokens_details"]["cached_tokens"] == 2
+
+
+@pytest.mark.parametrize(("prompt", "status"), _ZERO_OUTPUT_RESPONSES_CASES)
+def test_responses_stream_zero_output_keeps_terminal_usage(
+    engine: _ServingEngine,
+    prompt: str,
+    status: str,
+) -> None:
+    """A zero-output Responses stream still reports usage on its terminal event."""
+    with httpx.stream(
+        "POST",
+        f"{engine.base}/v1/responses",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={"model": "coding", "input": prompt, "stream": True},
+        timeout=30.0,
+    ) as response:
+        assert response.status_code == 200
+        raw = b"".join(response.iter_bytes()).decode()
+    payloads = [
+        json.loads(line.removeprefix("data: "))
+        for line in raw.splitlines()
+        if line.startswith("data: ")
+    ]
+    terminal = next(payload for payload in payloads if payload["type"] == f"response.{status}")
+    usage = terminal["response"]["usage"]
+    assert usage is not None, "zero-output stream terminal dropped client-visible usage"
+    assert usage["input_tokens"] == 9
+    assert usage["output_tokens"] == 0
+
+
+@pytest.mark.parametrize(("prompt", "stop_reason"), _ZERO_OUTPUT_MESSAGES_CASES)
+def test_messages_non_stream_zero_output_keeps_real_input_tokens(
+    engine: _ServingEngine,
+    prompt: str,
+    stop_reason: str,
+) -> None:
+    """A zero-output Messages result reports the real input count, never zero."""
+    response = httpx.post(
+        f"{engine.base}/v1/messages",
+        headers={"x-api-key": engine.raw_key},
+        json=_messages_body(prompt),
+        timeout=30.0,
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["stop_reason"] == stop_reason
+    assert body["usage"] == {
+        "input_tokens": 7,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 2,
+    }
+
+
+@pytest.mark.parametrize(("prompt", "stop_reason"), _ZERO_OUTPUT_MESSAGES_CASES)
+def test_messages_stream_zero_output_keeps_real_input_tokens(
+    engine: _ServingEngine,
+    prompt: str,
+    stop_reason: str,
+) -> None:
+    """A zero-output Messages stream reports the real input count on its final delta."""
+    with httpx.stream(
+        "POST",
+        f"{engine.base}/v1/messages",
+        headers={"x-api-key": engine.raw_key},
+        json=_messages_body(prompt, stream=True),
+        timeout=30.0,
+    ) as response:
+        assert response.status_code == 200
+        raw = b"".join(response.iter_bytes()).decode()
+    payloads = [
+        json.loads(line.removeprefix("data: "))
+        for line in raw.splitlines()
+        if line.startswith("data: ")
+    ]
+    message_delta = next(payload for payload in payloads if payload["type"] == "message_delta")
+    assert message_delta["delta"]["stop_reason"] == stop_reason
+    assert message_delta["usage"] == {
+        "input_tokens": 7,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 2,
+    }

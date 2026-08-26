@@ -1,5 +1,6 @@
 """Type stubs for the exp_gateway_native extension module."""
 
+from collections.abc import Callable
 from typing import Protocol
 
 __version__: str
@@ -24,7 +25,18 @@ class _ControlPlane(Protocol):
     def metrics_text(self, argument: str) -> str: ...
     def readiness(self, argument: str) -> str: ...
 
-def serve(control_plane: _ControlPlane, config_json: str) -> None: ...
+class ShutdownHandle:
+    """Embedder-owned stop signal for one `serve` call."""
+
+    def request_shutdown(self) -> None: ...
+
+def shutdown_handle() -> ShutdownHandle: ...
+def serve(
+    control_plane: _ControlPlane,
+    config_json: str,
+    shutdown: ShutdownHandle | None = None,
+    on_listening: Callable[[], None] | None = None,
+) -> None: ...
 def metrics_snapshot_json() -> str: ...
 def encode_chat_fixture(
     request_id: str,
@@ -33,6 +45,20 @@ def encode_chat_fixture(
     include_usage: bool,
     events_json: str,
 ) -> list[str]: ...
+def encode_responses_fixture(
+    request_id: str,
+    model: str,
+    created_at: float,
+    envelope_json: str,
+    events_json: str,
+) -> list[str]: ...
+def completed_responses_fixture(
+    request_id: str,
+    model: str,
+    created_at: float,
+    envelope_json: str,
+    events_json: str,
+) -> str: ...
 def encode_messages_fixture(
     request_id: str,
     model: str,

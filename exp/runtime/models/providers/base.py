@@ -163,7 +163,6 @@ class GatewayWireProfile:
             "openai_compatible",
             "gemini_generate_content",
             "bedrock_converse_stream",
-            "python_stream",
         }:
             raise ValueError("gateway wire dialect is not implemented")
         if self.reasoning_wire_format not in {
@@ -349,7 +348,7 @@ class ProviderHttpClient(abc.ABC):
 
         Raises:
             ProviderCapabilityError: This provider has no native-dialect
-                implementation; the request belongs on the Python engine.
+                implementation, so the gateway cannot serve its routes.
         """
         raise ProviderCapabilityError(capability="native_data_plane")
 

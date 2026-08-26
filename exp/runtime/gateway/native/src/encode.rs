@@ -36,10 +36,6 @@ pub struct ChatSseEncoder {
 }
 
 impl ChatSseEncoder {
-    pub fn new(request_id: &str, model: &str, created_at: i64, include_usage: bool) -> Self {
-        Self::new_with_ignored(request_id, model, created_at, include_usage, Vec::new())
-    }
-
     /// Build an encoder that discloses controls omitted by route shaping.
     pub fn new_with_ignored(
         request_id: &str,

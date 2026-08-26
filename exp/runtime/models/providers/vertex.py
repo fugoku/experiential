@@ -18,7 +18,6 @@ from urllib.parse import urlsplit
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelRequest, ModelResponse, ModelSnapshot
-from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.models.providers.async_transport import (
     AsyncJsonHttpTransport,
     ProviderDeadlineExceeded,
@@ -35,10 +34,7 @@ from exp.runtime.models.providers.gemini import (
     gemini_generate_request,
     gemini_generate_response,
 )
-from exp.runtime.models.providers.gemini_streaming import start_gemini_generate_stream
-from exp.runtime.models.providers.streaming import NormalizedProviderStream
 from exp.runtime.models.providers.transport import JsonHttpTransport, RetryPolicy
-from exp.runtime.openai_protocol.model_adapter import model_request as gateway_model_request
 
 VERTEX_TOKEN_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 """OAuth scope requested for every Vertex access token."""
@@ -240,56 +236,6 @@ class VertexClient(ProviderHttpClient):
         await self._warm_bearer_token(request_deadline)
         return await super().complete_async(
             request, deadline=request_deadline, idempotency_key=idempotency_key
-        )
-
-    async def stream(
-        self,
-        request: GatewayRequest,
-        *,
-        deadline: RequestDeadline,
-        idempotency_key: str,
-        retry_policy: RetryPolicy | None = None,
-    ) -> NormalizedProviderStream:
-        """Start one native Vertex SSE stream under the gateway deadline.
-
-        Args:
-            request: Canonical streaming gateway request.
-            deadline: Immutable request-wide deadline.
-            idempotency_key: Stable identity for this deployment operation.
-            retry_policy: Optional caller-owned physical dispatch limit.
-
-        Returns:
-            A cancellable provider-neutral event stream.
-        """
-        bearer_token = await self._warm_bearer_token(deadline)
-        return await start_gemini_generate_stream(
-            self._transport,
-            f"{self._base_url}/{self._stream_path()}",
-            headers={
-                "authorization": f"Bearer {bearer_token}",
-                "content-type": "application/json",
-            },
-            payload=gemini_generate_request(
-                self._model.model_id,
-                gateway_model_request(request),
-                supports_temperature=self._supports_temperature,
-                supports_top_p=self._supports_top_p,
-                supports_top_k=self._supports_top_k,
-                supports_logprobs=self._supports_logprobs,
-                supports_reasoning=self._supports_reasoning,
-                reasoning_effort=self._reasoning_effort,
-                stop_sequences=request.stop,
-                response_json_schema=(
-                    request.structured_text.json_schema
-                    if request.structured_text is not None
-                    else None
-                ),
-            ),
-            request=request,
-            deadline=deadline,
-            idempotency_key=idempotency_key,
-            retry_policy=retry_policy or self._retry_policy,
-            timeout_seconds=self._timeout_seconds,
         )
 
     async def _warm_bearer_token(self, deadline: RequestDeadline) -> str:
