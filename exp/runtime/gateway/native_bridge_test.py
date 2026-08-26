@@ -251,7 +251,7 @@ def test_local_admit_persists_route_context_in_the_attempt(tmp_path: Path) -> No
 
 
 def test_admit_rejects_invalid_bodies_with_python_parity(tmp_path: Path) -> None:
-    """Invalid JSON, non-objects, and protocol violations use the shared codes."""
+    """Invalid JSON, non-objects, and unsupported protocol fields use shared codes."""
     control, raw_key = _control_plane(tmp_path)
     with pytest.raises(NativeBridgeError) as invalid_json:
         control.admit(json.dumps({"raw_key": raw_key, "body": "{not json"}))
@@ -260,7 +260,7 @@ def test_admit_rejects_invalid_bodies_with_python_parity(tmp_path: Path) -> None
         control.admit(json.dumps({"raw_key": raw_key, "body": "[1, 2]"}))
     assert json.loads(not_object.value.public_error_json)["code"] == "invalid_request"
     rejected = json.dumps(
-        {"model": "coding", "messages": [{"role": "user", "content": "x"}], "logprobs": True}
+        {"model": "coding", "messages": [{"role": "user", "content": "x"}], "logit_bias": {}}
     )
     with pytest.raises(NativeBridgeError) as protocol:
         control.admit(json.dumps({"raw_key": raw_key, "body": rejected}))
@@ -440,8 +440,16 @@ def test_admit_serves_bedrock_natively_with_a_signed_frozen_body(
         provider_model="us.anthropic.claude-sonnet-4-5",
         exact_model_id="bedrock-revision-exact",
         revision=None,
-        capabilities=ModelCapabilities(),
-        gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+        capabilities=ModelCapabilities(
+            supports_tools=True,
+            supports_structured_output=True,
+        ),
+        gateway_capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True,
+            supports_stop_sequences=True,
+            supports_strict_tools=True,
+            supports_structured_text=True,
+        ),
         prices=GatewayTokenPrices(),
         pricing_source=None,
         replace=False,
@@ -460,7 +468,38 @@ def test_admit_serves_bedrock_natively_with_a_signed_frozen_body(
         environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
     )
     control = NativeControlPlane(components)
-    admission = _admit(control, raw_key, _chat_body(model="bed"))
+    body_schema = {"type": "object", "properties": {"answer": {"type": "string"}}}
+    admission = _admit(
+        control,
+        raw_key,
+        json.dumps(
+            {
+                "model": "bed",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stop": ["DONE"],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "description": "Find a record.",
+                            "parameters": {"type": "object"},
+                            "strict": True,
+                        },
+                    }
+                ],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "answer",
+                        "description": "Return one answer.",
+                        "schema": body_schema,
+                        "strict": True,
+                    },
+                },
+            }
+        ),
+    )
     assert "escalate" not in admission
     # The route entry, not admission itself, carries the per-deployment wire
     # fields; the data plane reserves the physical dispatch through
@@ -480,6 +519,20 @@ def test_admit_serves_bedrock_natively_with_a_signed_frozen_body(
     assert body == json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
     assert "modelId" not in payload
     assert payload["messages"] == [{"role": "user", "content": [{"text": "hi"}]}]
+    assert payload["inferenceConfig"] == {"stopSequences": ["DONE"]}
+    assert payload["toolConfig"]["tools"][0]["toolSpec"]["strict"] is True
+    assert payload["outputConfig"] == {
+        "textFormat": {
+            "type": "json_schema",
+            "structure": {
+                "jsonSchema": {
+                    "schema": '{"properties":{"answer":{"type":"string"}},"type":"object"}',
+                    "name": "answer",
+                    "description": "Return one answer.",
+                }
+            },
+        }
+    }
     # The route entry carries no signature: the data plane signs at dispatch
     # time, after its bounded permit, so queue wait cannot age the signature.
     assert started["headers"] == {}
@@ -519,6 +572,102 @@ def test_admit_serves_bedrock_natively_with_a_signed_frozen_body(
     assert settled == "{}"
     report = json.loads(control.usage_json("{}"))
     assert report["totals"]["requests"] == 1
+
+
+def test_admit_serves_gemini_stop_and_schema_on_the_native_wire(tmp_path: Path) -> None:
+    """Rust admission receives Gemini's exact stop and structured-output payload."""
+    from exp.common.models import GatewayTokenPrices
+    from exp.runtime.gateway.catalog_authority import (
+        ConnectionConfig,
+        upsert_connection,
+        upsert_singleton_deployment,
+    )
+
+    manager, raw_key = _configured_gateway(tmp_path)
+    upsert_connection(
+        tmp_path,
+        name="gemini-main",
+        connection=ConnectionConfig(provider="gemini", api_key_env="GEMINI_TEST_KEY"),
+        replace=False,
+    )
+    normalized, snapshot, _changed = upsert_singleton_deployment(
+        tmp_path,
+        deployment_alias="gem",
+        connection_name="gemini-main",
+        provider_model="gemini-2.5-pro",
+        exact_model_id="gemini-revision-exact",
+        revision=None,
+        capabilities=ModelCapabilities(supports_structured_output=True),
+        gateway_capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True,
+            supports_stop_sequences=True,
+            supports_structured_text=True,
+        ),
+        prices=GatewayTokenPrices(),
+        pricing_source=None,
+        replace=False,
+    )
+    manager.activate_direct_alias(
+        alias_id="gem",
+        alias_name="gem",
+        revision_id="revision-gem",
+        pool_id="gem",
+        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+        catalog_sha256=normalized.identity_sha256(),
+    )
+    manager.add_grant(identity_id="default", alias_id="gem")
+    components = load_gateway_components(
+        tmp_path,
+        environment={
+            "TEST_PROVIDER_KEY": "provider-secret-canary",
+            "GEMINI_TEST_KEY": "gemini-secret-canary",
+        },
+    )
+    control = NativeControlPlane(components)
+    schema = {"type": "object", "properties": {"answer": {"type": "string"}}}
+    admission = _admit_started(
+        control,
+        raw_key,
+        json.dumps(
+            {
+                "model": "gem",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stop": ["DONE"],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "answer",
+                        "schema": schema,
+                        "strict": True,
+                    },
+                },
+            }
+        ),
+    )
+
+    assert admission["dialect"] == "gemini_generate_content"
+    payload = admission["upstream_payload"]
+    assert isinstance(payload, dict)
+    generation = payload["generationConfig"]
+    assert isinstance(generation, dict)
+    assert generation["stopSequences"] == ["DONE"]
+    assert generation["responseMimeType"] == "application/json"
+    assert generation["responseJsonSchema"] == schema
+    settled = control.settle(
+        json.dumps(
+            {
+                "request_id": admission["request_id"],
+                "attempt_id": admission["attempt_id"],
+                "outcome": "completed",
+                "usage": {"input_tokens": 3, "output_tokens": 2},
+                "tool_names": [],
+                "failure": None,
+                "finalize": True,
+                "opened": True,
+            }
+        )
+    )
+    assert settled == "{}"
 
 
 def _configured_pool_gateway(
@@ -1346,6 +1495,7 @@ def _responses_body(
     stream: bool = False,
     previous_response_id: str | None = None,
     with_tools: bool = False,
+    reasoning_summary: str | None = None,
 ) -> str:
     """Return one raw Responses API request body."""
     payload: JsonObject = {"model": model, "input": [{"role": "user", "content": "hi"}]}
@@ -1353,6 +1503,8 @@ def _responses_body(
         payload["stream"] = True
     if previous_response_id is not None:
         payload["previous_response_id"] = previous_response_id
+    if reasoning_summary is not None:
+        payload["reasoning"] = {"effort": "high", "summary": reasoning_summary}
     if with_tools:
         payload["tools"] = [
             {
@@ -1401,24 +1553,31 @@ def _responses_parity_case() -> tuple[list[GatewayEvent], str]:
     from exp.common.models.model import ToolCall
 
     events = [
-        GatewayEvent(kind=GatewayEventKind.TEXT_DELTA, sequence_number=0, text_delta="Hel"),
-        GatewayEvent(kind=GatewayEventKind.TEXT_DELTA, sequence_number=1, text_delta="lo é"),
+        GatewayEvent(
+            kind=GatewayEventKind.REASONING_SUMMARY_DELTA,
+            sequence_number=0,
+            reasoning_summary_output_index=0,
+            reasoning_summary_index=0,
+            text_delta="Checked the plan.",
+        ),
+        GatewayEvent(kind=GatewayEventKind.TEXT_DELTA, sequence_number=1, text_delta="Hel"),
+        GatewayEvent(kind=GatewayEventKind.TEXT_DELTA, sequence_number=2, text_delta="lo é"),
         GatewayEvent(
             kind=GatewayEventKind.TOOL_CALL_STARTED,
-            sequence_number=2,
+            sequence_number=3,
             tool_call_index=0,
             tool_call_id="call-1",
             tool_name="search",
         ),
         GatewayEvent(
             kind=GatewayEventKind.TOOL_ARGUMENTS_DELTA,
-            sequence_number=3,
+            sequence_number=4,
             tool_call_index=0,
             raw_arguments_delta='{"q": "x"}',
         ),
         GatewayEvent(
             kind=GatewayEventKind.TOOL_CALL_COMPLETED,
-            sequence_number=4,
+            sequence_number=5,
             tool_call_index=0,
             tool_call=ToolCall(
                 call_id="call-1",
@@ -1429,12 +1588,18 @@ def _responses_parity_case() -> tuple[list[GatewayEvent], str]:
         ),
         GatewayEvent(
             kind=GatewayEventKind.USAGE,
-            sequence_number=5,
+            sequence_number=6,
             usage=GatewayUsage(input_tokens=10, output_tokens=4, cached_input_tokens=1),
         ),
-        GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=6),
+        GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=7),
     ]
     fixture = [
+        {
+            "kind": "reasoning_summary_delta",
+            "output_index": 0,
+            "summary_index": 0,
+            "text": "Checked the plan.",
+        },
         {"kind": "text_delta", "text": "Hel"},
         {"kind": "text_delta", "text": "lo é"},
         {"kind": "tool_call_started", "index": 0, "call_id": "call-1", "name": "search"},
@@ -1484,7 +1649,7 @@ def _native_envelope(body: str) -> str:
 def test_rust_responses_sse_frames_match_python_encoder() -> None:
     """Rust Responses SSE frames are byte-identical to the python encoder."""
     native = pytest.importorskip("exp_gateway_native")
-    body = _responses_body(stream=True, with_tools=True)
+    body = _responses_body(stream=True, with_tools=True, reasoning_summary="concise")
     events, fixture = _responses_parity_case()
     expected = _python_responses_frames(body, events, created_at=1_700_000_000.25)
     actual = native.encode_responses_fixture(
@@ -1555,7 +1720,7 @@ def test_rust_responses_completed_body_matches_python() -> None:
     native = pytest.importorskip("exp_gateway_native")
     from exp.runtime.openai_protocol.response import completed_body
 
-    body = _responses_body(with_tools=True)
+    body = _responses_body(with_tools=True, reasoning_summary="concise")
     events, fixture = _responses_parity_case()
     decoded = decode_responses(json.loads(body))
     expected = completed_body(
@@ -1599,21 +1764,28 @@ def test_rust_responses_rejects_streams_without_terminals() -> None:
 
 def test_responses_admission_is_native_with_envelope_and_payload(tmp_path: Path) -> None:
     """A Responses request admits natively (no escalation) with the exact
-    request-reflecting envelope and the shared dialect payload."""
+    request-reflecting envelope and a route-safe dialect payload."""
     from exp.runtime.gateway.native_responses import responses_envelope
 
     control, raw_key = _control_plane(tmp_path)
-    body = _responses_body(with_tools=True)
+    payload = json.loads(_responses_body(with_tools=True))
+    body = json.dumps(payload)
     admission = _flatten_started(control, _admit_responses(control, raw_key, body))
     assert "escalate" not in admission
     assert admission["surface"] == "responses"
     assert admission["dialect"] == "openai_compatible"
     decoded = decode_responses(json.loads(body))
-    assert admission["envelope"] == responses_envelope(decoded.request)
-    provider_request = decoded.request.model_copy(update={"stream": True, "include_usage": True})
+    public_request = decoded.request
+    assert admission["ignored_parameters"] == []
+    assert admission["envelope"] == responses_envelope(public_request)
+    provider_request = public_request.model_copy(update={"stream": True, "include_usage": True})
     assert admission["upstream_payload"] == openai_compatible_stream_payload(
         "provider-model-exact", provider_request
     )
+    upstream_payload = admission["upstream_payload"]
+    assert isinstance(upstream_payload, dict)
+    assert "reasoning" not in upstream_payload
+    assert "reasoning_effort" not in upstream_payload
     settled = control.settle(
         json.dumps(
             {
@@ -1629,6 +1801,23 @@ def test_responses_admission_is_native_with_envelope_and_payload(tmp_path: Path)
     assert settled == "{}"
     report = json.loads(control.usage_json("{}"))
     assert report["totals"]["requests"] == 1
+
+
+def test_responses_admission_rejects_unsupported_reasoning_effort(tmp_path: Path) -> None:
+    """Native admission returns the same local parameter error before Rust dispatch."""
+    control, raw_key = _control_plane(tmp_path)
+    payload = json.loads(_responses_body())
+    payload["reasoning"] = {"effort": "high"}
+
+    with pytest.raises(NativeBridgeError) as raised:
+        _admit_responses(control, raw_key, json.dumps(payload))
+
+    error = json.loads(raised.value.public_error_json)
+    assert error["status_code"] == 400
+    assert error["code"] == "unsupported_parameter"
+    assert error["error_type"] == "invalid_request_error"
+    assert error["param"] == "reasoning.effort"
+    assert "not supported by this model route" in error["message"]
 
 
 def test_responses_continuation_round_trip_and_fail_closed(tmp_path: Path) -> None:

@@ -19,6 +19,7 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayToolDefinition,
 )
+from exp.runtime.models.providers import streaming_events
 from exp.runtime.models.providers.anthropic import AnthropicClient
 from exp.runtime.models.providers.async_transport import (
     HttpxAsyncJsonTransport,
@@ -232,6 +233,30 @@ def test_openai_responses_stream_preserves_raw_tools_usage_and_commitment() -> N
                     "arguments": raw_arguments,
                 }
             ),
+            _sse(
+                {
+                    "type": "response.reasoning_summary_text.delta",
+                    "output_index": 1,
+                    "summary_index": 0,
+                    "delta": "Checked ",
+                }
+            ),
+            _sse(
+                {
+                    "type": "response.reasoning_summary_text.delta",
+                    "output_index": 1,
+                    "summary_index": 0,
+                    "delta": "the tool.",
+                }
+            ),
+            _sse(
+                {
+                    "type": "response.reasoning_summary_text.done",
+                    "output_index": 1,
+                    "summary_index": 0,
+                    "text": "Checked the tool.",
+                }
+            ),
             _sse({"type": "response.output_text.delta", "delta": "done"}),
             _sse(
                 {
@@ -285,6 +310,8 @@ def test_openai_responses_stream_preserves_raw_tools_usage_and_commitment() -> N
         GatewayEventKind.TOOL_ARGUMENTS_DELTA,
         GatewayEventKind.TOOL_ARGUMENTS_DELTA,
         GatewayEventKind.TOOL_CALL_COMPLETED,
+        GatewayEventKind.REASONING_SUMMARY_DELTA,
+        GatewayEventKind.REASONING_SUMMARY_DELTA,
         GatewayEventKind.TEXT_DELTA,
         GatewayEventKind.USAGE,
         GatewayEventKind.COMPLETED,
@@ -292,9 +319,12 @@ def test_openai_responses_stream_preserves_raw_tools_usage_and_commitment() -> N
     assert events[3].tool_call is not None
     assert events[3].tool_call_index == 0
     assert events[3].tool_call.arguments_json() == raw_arguments
-    assert events[5].usage is not None
-    assert events[5].usage.cached_input_tokens == 4
-    assert events[5].usage.reasoning_tokens == 3
+    assert events[4].reasoning_summary_output_index == 1
+    assert events[4].reasoning_summary_index == 0
+    assert "".join(event.text_delta or "" for event in events[4:6]) == "Checked the tool."
+    assert events[7].usage is not None
+    assert events[7].usage.cached_input_tokens == 4
+    assert events[7].usage.reasoning_tokens == 3
     assert observed_payloads[0]["stream"] is True
     assert observed_payloads[0]["store"] is False
     assert observed_payloads[0]["instructions"] == "Be precise."
@@ -1098,6 +1128,144 @@ def test_launch_adapters_sanitize_native_stream_errors(provider: str) -> None:
     assert event.failure.failure_class is GatewayFailureClass.PROVIDER_INTERNAL
     assert canary not in event.failure.safe_message
     assert committed is False
+
+
+@pytest.mark.parametrize("provider", ["openai", "anthropic", "openai-compatible"])
+def test_launch_adapters_bound_aggregate_tool_argument_bytes(
+    provider: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every Python HTTP adapter rejects tool fragments beyond one shared ceiling."""
+    monkeypatch.setattr(streaming_events, "MAXIMUM_RETAINED_OUTPUT_BYTES", 5)
+    if provider == "openai":
+        frames = b"".join(
+            (
+                _sse(
+                    {
+                        "type": "response.output_item.added",
+                        "output_index": 0,
+                        "item": {
+                            "type": "function_call",
+                            "call_id": "i",
+                            "name": "n",
+                            "arguments": "",
+                        },
+                    }
+                ),
+                _sse(
+                    {
+                        "type": "response.function_call_arguments.delta",
+                        "output_index": 0,
+                        "delta": "abc",
+                    }
+                ),
+                _sse(
+                    {
+                        "type": "response.function_call_arguments.delta",
+                        "output_index": 0,
+                        "delta": "x",
+                    }
+                ),
+            )
+        )
+    elif provider == "anthropic":
+        frames = b"".join(
+            (
+                _sse(
+                    {
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": "i",
+                            "name": "n",
+                            "input": {},
+                        },
+                    }
+                ),
+                _sse(
+                    {
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "input_json_delta", "partial_json": "abc"},
+                    }
+                ),
+                _sse(
+                    {
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "input_json_delta", "partial_json": "x"},
+                    }
+                ),
+            )
+        )
+    else:
+        frames = b"".join(
+            (
+                _sse(
+                    {
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "tool_calls": [
+                                        {
+                                            "index": 0,
+                                            "id": "i",
+                                            "function": {"name": "n", "arguments": "abc"},
+                                        }
+                                    ]
+                                },
+                                "finish_reason": None,
+                            }
+                        ]
+                    }
+                ),
+                _sse(
+                    {
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "tool_calls": [
+                                        {
+                                            "index": 0,
+                                            "function": {"arguments": "x"},
+                                        }
+                                    ]
+                                },
+                                "finish_reason": None,
+                            }
+                        ]
+                    }
+                ),
+            )
+        )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        """Return one tool stream that exceeds its retained-output budget."""
+        del request
+        return httpx.Response(200, stream=_ChunkStream((frames,)))
+
+    async def scenario() -> list[GatewayEvent]:
+        """Consume the bounded stream through its normalized failure."""
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            stream = await _provider_client(provider, http_client).stream(
+                _request(_provider_surface(provider)),
+                deadline=RequestDeadline.after(1),
+                idempotency_key=f"bounded-tool-{provider}",
+            )
+            return await _collect(stream)
+
+    events = asyncio.run(scenario())
+
+    assert [event.kind for event in events] == [
+        GatewayEventKind.TOOL_CALL_STARTED,
+        GatewayEventKind.TOOL_ARGUMENTS_DELTA,
+        GatewayEventKind.FAILED,
+    ]
+    assert events[-1].failure is not None
+    assert events[-1].failure.failure_class is GatewayFailureClass.MALFORMED_RESPONSE
 
 
 @pytest.mark.parametrize("provider", ["openai", "anthropic", "openai-compatible"])

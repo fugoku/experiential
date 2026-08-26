@@ -14,6 +14,7 @@ from typing import Literal
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelMessage, ModelRequest, ToolChoice
 from exp.runtime.models.providers.base import DEFAULT_MAXIMUM_OUTPUT_TOKENS
+from exp.runtime.models.providers.reasoning_compat import gemini_thinking_level
 
 
 def gemini_model_path(model_id: str) -> str:
@@ -28,7 +29,19 @@ def gemini_model_path(model_id: str) -> str:
     return model_id.removeprefix("models/")
 
 
-def gemini_generate_request(model_id: str, request: ModelRequest) -> JsonObject:
+def gemini_generate_request(
+    model_id: str,
+    request: ModelRequest,
+    *,
+    supports_temperature: bool = True,
+    supports_top_p: bool = True,
+    supports_top_k: bool = False,
+    supports_logprobs: bool = False,
+    supports_reasoning: bool = False,
+    reasoning_effort: str | None = None,
+    stop_sequences: tuple[str, ...] = (),
+    response_json_schema: JsonObject | None = None,
+) -> JsonObject:
     """Convert a EXP request into Gemini's native generateContent payload.
 
     Args:
@@ -36,6 +49,14 @@ def gemini_generate_request(model_id: str, request: ModelRequest) -> JsonObject:
             travels in the route path, never the body; the parameter keeps the
             shared provider builder signature.
         request: Typed visible messages, tools, and sampling parameters.
+        supports_temperature: Whether this exact deployment accepts temperature.
+        supports_top_p: Whether this exact deployment accepts top-p sampling.
+        supports_top_k: Whether this exact deployment accepts top-k sampling.
+        supports_logprobs: Reserved response-projection capability flag.
+        supports_reasoning: Whether this exact deployment accepts thinking controls.
+        reasoning_effort: Catalog-pinned reasoning effort used when the request omits one.
+        stop_sequences: Exact stop strings admitted for the selected route.
+        response_json_schema: Strict JSON schema admitted for structured output.
 
     Returns:
         A native payload for the generateContent and streamGenerateContent
@@ -44,7 +65,6 @@ def gemini_generate_request(model_id: str, request: ModelRequest) -> JsonObject:
     Raises:
         ValueError: A visible request message cannot preserve its tool linkage on Gemini's wire.
     """
-    del model_id
     system_parts: list[JsonObject] = []
     contents: list[JsonObject] = []
     tool_names: dict[str, str] = {}
@@ -74,8 +94,26 @@ def gemini_generate_request(model_id: str, request: ModelRequest) -> JsonObject:
     if request.tool_choice is not None:
         payload["toolConfig"] = {"functionCallingConfig": _gemini_tool_choice(request.tool_choice)}
     generation: JsonObject = {}
-    if request.temperature is not None:
+    if request.temperature is not None and supports_temperature:
         generation["temperature"] = request.temperature
+    if request.top_p is not None and supports_top_p:
+        generation["topP"] = request.top_p
+    if request.top_k is not None and supports_top_k:
+        generation["topK"] = request.top_k
+    if stop_sequences:
+        generation["stopSequences"] = list(stop_sequences)
+    if response_json_schema is not None:
+        generation["responseMimeType"] = "application/json"
+        generation["responseJsonSchema"] = response_json_schema
+    effective_reasoning_effort = request.reasoning_effort or reasoning_effort
+    if supports_reasoning and effective_reasoning_effort is not None:
+        generation["thinkingConfig"] = {
+            "thinkingLevel": gemini_thinking_level(model_id, effective_reasoning_effort).upper()
+        }
+    # The normalized gateway response has no logprob representation. Keep the
+    # route flag for shared capability plumbing, but ignore these controls so
+    # provider output is never requested and then silently discarded.
+    del supports_logprobs
     if request.maximum_output_tokens is not None:
         generation["maxOutputTokens"] = request.maximum_output_tokens
     else:

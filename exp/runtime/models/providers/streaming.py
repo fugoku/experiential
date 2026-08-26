@@ -9,10 +9,10 @@ from contextlib import suppress
 from dataclasses import dataclass
 from typing import cast
 
-from pydantic import JsonValue, ValidationError
+from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject
-from exp.common.models import ToolCall
+from exp.common.models import ChatMaxTokensField
 from exp.runtime.gateway.contracts import (
     GatewayEvent,
     GatewayEventKind,
@@ -38,6 +38,17 @@ from exp.runtime.models.providers.errors import (
     require_string,
 )
 from exp.runtime.models.providers.stream_attempts import StreamAttemptController
+from exp.runtime.models.providers.streaming_events import (
+    SEMANTIC_EVENT_KINDS,
+    TERMINAL_EVENT_KINDS,
+    OpenAIReasoningSummaryParser,
+    ProviderOutputRetentionBudget,
+    ProviderToolAccumulator,
+    append_provider_tool_arguments,
+    provider_refusal_failure,
+    require_provider_tool,
+    start_provider_tool_accumulator,
+)
 from exp.runtime.models.providers.streaming_requests import (
     anthropic_messages_stream_payload,
     openai_compatible_stream_payload,
@@ -51,17 +62,6 @@ from exp.runtime.models.providers.transport import ProviderTransportError, Retry
 
 _MAXIMUM_SSE_EVENT_BYTES = 4_000_000
 _CANCELLATION_BOUND_SECONDS = 1.0
-_SEMANTIC_KINDS = {
-    GatewayEventKind.TEXT_DELTA,
-    GatewayEventKind.REFUSAL_DELTA,
-    GatewayEventKind.TOOL_CALL_STARTED,
-    GatewayEventKind.TOOL_ARGUMENTS_DELTA,
-}
-_TERMINAL_KINDS = {
-    GatewayEventKind.COMPLETED,
-    GatewayEventKind.INCOMPLETE,
-    GatewayEventKind.FAILED,
-}
 
 
 @dataclass(frozen=True)
@@ -70,42 +70,6 @@ class _SseEvent:
 
     event: str | None
     data: str
-
-
-@dataclass
-class _ToolAccumulator:
-    """Provider-order state for one incrementally emitted function call."""
-
-    index: int
-    call_id: str
-    name: str
-    raw_arguments: str = ""
-    completed: bool = False
-
-    def complete(self) -> ToolCall:
-        """Parse the accumulated raw JSON once the provider closes the call.
-
-        Returns:
-            A complete tool call retaining provider-order argument text.
-
-        Raises:
-            ProviderResponseError: The raw arguments are not one JSON object.
-        """
-        try:
-            arguments = json.loads(self.raw_arguments)
-        except json.JSONDecodeError as exc:
-            raise ProviderResponseError("streamed tool arguments are not valid JSON") from exc
-        if not isinstance(arguments, dict):
-            raise ProviderResponseError("streamed tool arguments must decode to an object")
-        try:
-            return ToolCall(
-                call_id=self.call_id,
-                name=self.name,
-                arguments=arguments,
-                raw_arguments=self.raw_arguments,
-            )
-        except ValidationError as exc:
-            raise ProviderResponseError("streamed tool call is incomplete") from exc
 
 
 class _EventFactory:
@@ -311,9 +275,9 @@ class NormalizedProviderStream:
                 failure=normalized_provider_failure(exc),
             )
         self._last_sequence = event.sequence_number
-        if event.kind in _SEMANTIC_KINDS:
+        if event.kind in SEMANTIC_EVENT_KINDS:
             self._committed = True
-        if event.kind in _TERMINAL_KINDS:
+        if event.kind in TERMINAL_EVENT_KINDS:
             self._done = True
             await self._close()
         return event
@@ -342,7 +306,12 @@ async def start_openai_responses_stream(
     retry_policy: RetryPolicy,
     timeout_seconds: float,
     supports_temperature: bool,
-    reasoning_effort: str | None,
+    supports_top_p: bool | None = None,
+    supports_top_k: bool = False,
+    supports_logprobs: bool = False,
+    supports_reasoning: bool = False,
+    reasoning_effort: str | None = None,
+    sampling_requires_reasoning_none: bool = False,
 ) -> NormalizedProviderStream:
     """Open and normalize one native OpenAI Responses stream.
 
@@ -356,17 +325,17 @@ async def start_openai_responses_stream(
         idempotency_key: Stable identity reused by safe opening retries.
         retry_policy: Same-endpoint retry bounds before response commitment.
         timeout_seconds: Per-phase timeout ceiling.
-        supports_temperature: Whether this model accepts explicit temperature.
-        reasoning_effort: Optional catalog-pinned reasoning effort.
-
-    Returns:
-        A true upstream normalized stream.
     """
     payload = openai_responses_stream_payload(
         model_id,
         request,
         supports_temperature=supports_temperature,
+        supports_top_p=supports_top_p,
+        supports_top_k=supports_top_k,
+        supports_logprobs=supports_logprobs,
+        supports_reasoning=supports_reasoning,
         reasoning_effort=reasoning_effort,
+        sampling_requires_reasoning_none=sampling_requires_reasoning_none,
     )
     return await _start_stream(
         transport,
@@ -392,9 +361,14 @@ async def start_anthropic_messages_stream(
     idempotency_key: str,
     retry_policy: RetryPolicy,
     timeout_seconds: float,
+    supports_temperature: bool = True,
+    supports_top_p: bool = True,
+    supports_top_k: bool = False,
+    supports_logprobs: bool = False,
+    supports_reasoning: bool = False,
+    reasoning_effort: str | None = None,
 ) -> NormalizedProviderStream:
     """Open and normalize one native Anthropic Messages stream.
-
     Args:
         transport: Async provider transport supporting incremental responses.
         url: Native Messages endpoint.
@@ -404,12 +378,17 @@ async def start_anthropic_messages_stream(
         deadline: Immutable request-wide deadline.
         idempotency_key: Stable identity reused by safe opening retries.
         retry_policy: Same-endpoint retry bounds before response commitment.
-        timeout_seconds: Per-phase timeout ceiling.
-
-    Returns:
-        A true upstream normalized stream.
     """
-    payload = anthropic_messages_stream_payload(model_id, request)
+    payload = anthropic_messages_stream_payload(
+        model_id,
+        request,
+        supports_temperature=supports_temperature,
+        supports_top_p=supports_top_p,
+        supports_top_k=supports_top_k,
+        supports_logprobs=supports_logprobs,
+        supports_reasoning=supports_reasoning,
+        reasoning_effort=reasoning_effort,
+    )
     return await _start_stream(
         transport,
         url,
@@ -434,10 +413,17 @@ async def start_openai_compatible_stream(
     idempotency_key: str,
     retry_policy: RetryPolicy,
     timeout_seconds: float,
-    token_limit_key: str = "max_tokens",
+    token_limit_key: ChatMaxTokensField = "max_tokens",
+    supports_temperature: bool = True,
+    supports_top_p: bool | None = None,
+    supports_top_k: bool = False,
+    supports_logprobs: bool = False,
+    supports_reasoning: bool = False,
+    reasoning_wire_format: str = "reasoning_effort",
+    reasoning_effort: str | None = None,
+    sampling_requires_reasoning_none: bool = False,
 ) -> NormalizedProviderStream:
     """Open and normalize one generic OpenAI-compatible Chat stream.
-
     Args:
         transport: Async provider transport supporting incremental responses.
         url: Chat Completions endpoint.
@@ -449,11 +435,20 @@ async def start_openai_compatible_stream(
         retry_policy: Same-endpoint retry bounds before response commitment.
         timeout_seconds: Per-phase timeout ceiling.
         token_limit_key: Wire field carrying the output-token ceiling.
-
-    Returns:
-        A true upstream normalized stream.
     """
-    payload = openai_compatible_stream_payload(model_id, request, token_limit_key=token_limit_key)
+    payload = openai_compatible_stream_payload(
+        model_id,
+        request,
+        token_limit_key=token_limit_key,
+        supports_temperature=supports_temperature,
+        supports_top_p=supports_top_p,
+        supports_top_k=supports_top_k,
+        supports_logprobs=supports_logprobs,
+        supports_reasoning=supports_reasoning,
+        reasoning_wire_format=reasoning_wire_format,
+        reasoning_effort=reasoning_effort,
+        sampling_requires_reasoning_none=sampling_requires_reasoning_none,
+    )
     return await _start_stream(
         transport,
         url,
@@ -515,13 +510,22 @@ async def _start_stream(
 async def _openai_responses_events(sse: _SseDecoder) -> AsyncIterator[GatewayEvent]:
     """Map native Responses lifecycle events to provider-neutral events."""
     factory = _EventFactory()
-    tools: dict[int, _ToolAccumulator] = {}
+    tools: dict[int, ProviderToolAccumulator] = {}
+    retained_output = ProviderOutputRetentionBudget()
+    reasoning_summaries = OpenAIReasoningSummaryParser(budget=retained_output)
     refusal_seen = False
     async for frame in sse.events():
         if frame.data == "[DONE]":
             raise ProviderResponseError("OpenAI Responses stream ended before a terminal event")
         payload = _json_object(frame.data)
         event_type = payload.get("type") or frame.event
+        summary_consumed, summary_event = reasoning_summaries.consume(
+            event_type, payload, create=factory.create
+        )
+        if summary_consumed:
+            if summary_event is not None:
+                yield summary_event
+            continue
         if event_type == "response.output_text.delta":
             delta = _optional_string(payload.get("delta"), "OpenAI text delta")
             if delta:
@@ -540,8 +544,13 @@ async def _openai_responses_events(sse: _SseDecoder) -> AsyncIterator[GatewayEve
                     item.get("call_id") or item.get("id"), "OpenAI function call ID"
                 )
                 name = require_string(item.get("name"), "OpenAI function call name")
-                tool = _ToolAccumulator(index=index, call_id=call_id, name=name)
-                tools[index] = tool
+                tool = start_provider_tool_accumulator(
+                    tools,
+                    index=index,
+                    call_id=call_id,
+                    name=name,
+                    budget=retained_output,
+                )
                 yield factory.create(
                     GatewayEventKind.TOOL_CALL_STARTED,
                     tool_call_index=index,
@@ -550,7 +559,7 @@ async def _openai_responses_events(sse: _SseDecoder) -> AsyncIterator[GatewayEve
                 )
                 initial = item.get("arguments")
                 if isinstance(initial, str) and initial:
-                    tool.raw_arguments += initial
+                    append_provider_tool_arguments(tool, initial, budget=retained_output)
                     yield factory.create(
                         GatewayEventKind.TOOL_ARGUMENTS_DELTA,
                         tool_call_index=index,
@@ -560,9 +569,9 @@ async def _openai_responses_events(sse: _SseDecoder) -> AsyncIterator[GatewayEve
                 raise ProviderResponseError("OpenAI stream emitted an unsupported output item")
         elif event_type == "response.function_call_arguments.delta":
             index = require_integer(payload.get("output_index"), "OpenAI output_index")
-            tool = _require_tool(tools, index)
+            tool = require_provider_tool(tools, index)
             delta = _optional_string(payload.get("delta"), "OpenAI argument delta")
-            tool.raw_arguments += delta
+            append_provider_tool_arguments(tool, delta, budget=retained_output)
             yield factory.create(
                 GatewayEventKind.TOOL_ARGUMENTS_DELTA,
                 tool_call_index=index,
@@ -586,7 +595,9 @@ async def _openai_responses_events(sse: _SseDecoder) -> AsyncIterator[GatewayEve
                             "OpenAI tool argument fragments changed at done"
                         )
                     if not tool.raw_arguments and final_arguments:
-                        tool.raw_arguments = final_arguments
+                        append_provider_tool_arguments(
+                            tool, final_arguments, budget=retained_output
+                        )
                         yield factory.create(
                             GatewayEventKind.TOOL_ARGUMENTS_DELTA,
                             tool_call_index=index,
@@ -612,7 +623,7 @@ async def _openai_responses_events(sse: _SseDecoder) -> AsyncIterator[GatewayEve
                 if refusal_seen:
                     yield factory.create(
                         GatewayEventKind.FAILED,
-                        failure=_provider_refusal_failure(),
+                        failure=provider_refusal_failure(),
                     )
                 else:
                     yield factory.create(GatewayEventKind.COMPLETED)
@@ -626,7 +637,7 @@ async def _openai_responses_events(sse: _SseDecoder) -> AsyncIterator[GatewayEve
             elif reason in {"content_filter", "safety"}:
                 yield factory.create(
                     GatewayEventKind.FAILED,
-                    failure=_provider_refusal_failure(),
+                    failure=provider_refusal_failure(),
                 )
             else:
                 yield factory.create(
@@ -654,7 +665,8 @@ async def _openai_responses_events(sse: _SseDecoder) -> AsyncIterator[GatewayEve
 async def _anthropic_messages_events(sse: _SseDecoder) -> AsyncIterator[GatewayEvent]:
     """Map native Anthropic Messages events to provider-neutral events."""
     factory = _EventFactory()
-    tools: dict[int, _ToolAccumulator] = {}
+    tools: dict[int, ProviderToolAccumulator] = {}
+    retained_output = ProviderOutputRetentionBudget()
     input_tokens = 0
     output_tokens = 0
     cache_read = 0
@@ -684,7 +696,13 @@ async def _anthropic_messages_events(sse: _SseDecoder) -> AsyncIterator[GatewayE
                 name = require_string(block.get("name"), "Anthropic tool name")
                 if index in tools:
                     raise ProviderResponseError("Anthropic stream repeated a tool-call start")
-                tools[index] = _ToolAccumulator(index=index, call_id=call_id, name=name)
+                tool = start_provider_tool_accumulator(
+                    tools,
+                    index=index,
+                    call_id=call_id,
+                    name=name,
+                    budget=retained_output,
+                )
                 yield factory.create(
                     GatewayEventKind.TOOL_CALL_STARTED,
                     tool_call_index=index,
@@ -713,8 +731,8 @@ async def _anthropic_messages_events(sse: _SseDecoder) -> AsyncIterator[GatewayE
                     yield factory.create(GatewayEventKind.TEXT_DELTA, text_delta=text)
             elif delta_type == "input_json_delta":
                 fragment = _optional_string(delta.get("partial_json"), "Anthropic argument delta")
-                tool = _require_tool(tools, index)
-                tool.raw_arguments += fragment
+                tool = require_provider_tool(tools, index)
+                append_provider_tool_arguments(tool, fragment, budget=retained_output)
                 yield factory.create(
                     GatewayEventKind.TOOL_ARGUMENTS_DELTA,
                     tool_call_index=index,
@@ -761,7 +779,7 @@ async def _anthropic_messages_events(sse: _SseDecoder) -> AsyncIterator[GatewayE
             if refusal_seen or stop_reason == "refusal":
                 yield factory.create(
                     GatewayEventKind.FAILED,
-                    failure=_provider_refusal_failure(),
+                    failure=provider_refusal_failure(),
                 )
             else:
                 terminal = (
@@ -791,7 +809,8 @@ async def _anthropic_messages_events(sse: _SseDecoder) -> AsyncIterator[GatewayE
 async def _openai_compatible_events(sse: _SseDecoder) -> AsyncIterator[GatewayEvent]:
     """Map generic Chat Completions chunks to provider-neutral events."""
     factory = _EventFactory()
-    tools: dict[int, _ToolAccumulator] = {}
+    tools: dict[int, ProviderToolAccumulator] = {}
+    retained_output = ProviderOutputRetentionBudget()
     usage: GatewayUsage | None = None
     finish_reason: str | None = None
     refusal_seen = False
@@ -804,7 +823,7 @@ async def _openai_compatible_events(sse: _SseDecoder) -> AsyncIterator[GatewayEv
             if refusal_seen or finish_reason in {"content_filter", "safety"}:
                 yield factory.create(
                     GatewayEventKind.FAILED,
-                    failure=_provider_refusal_failure(),
+                    failure=provider_refusal_failure(),
                 )
             else:
                 terminal = (
@@ -852,8 +871,13 @@ async def _openai_compatible_events(sse: _SseDecoder) -> AsyncIterator[GatewayEv
                 if tool is None:
                     call_id = require_string(item.get("id"), "OpenAI-compatible tool ID")
                     name = require_string(function.get("name"), "OpenAI-compatible tool name")
-                    tool = _ToolAccumulator(index=index, call_id=call_id, name=name)
-                    tools[index] = tool
+                    tool = start_provider_tool_accumulator(
+                        tools,
+                        index=index,
+                        call_id=call_id,
+                        name=name,
+                        budget=retained_output,
+                    )
                     yield factory.create(
                         GatewayEventKind.TOOL_CALL_STARTED,
                         tool_call_index=index,
@@ -874,7 +898,7 @@ async def _openai_compatible_events(sse: _SseDecoder) -> AsyncIterator[GatewayEv
                 fragment = function.get("arguments")
                 if fragment is not None:
                     raw_fragment = _optional_string(fragment, "OpenAI-compatible argument delta")
-                    tool.raw_arguments += raw_fragment
+                    append_provider_tool_arguments(tool, raw_fragment, budget=retained_output)
                     yield factory.create(
                         GatewayEventKind.TOOL_ARGUMENTS_DELTA,
                         tool_call_index=index,
@@ -891,7 +915,7 @@ async def _openai_compatible_events(sse: _SseDecoder) -> AsyncIterator[GatewayEv
 
 async def _finish_open_tools(
     factory: _EventFactory,
-    tools: Mapping[int, _ToolAccumulator],
+    tools: Mapping[int, ProviderToolAccumulator],
 ) -> AsyncIterator[GatewayEvent]:
     """Complete every still-open tool call in provider index order."""
     for index in sorted(tools):
@@ -903,15 +927,6 @@ async def _finish_open_tools(
                 tool_call_index=index,
                 tool_call=tool.complete(),
             )
-
-
-def _provider_refusal_failure() -> GatewayFailure:
-    """Return the shared sanitized terminal classification for provider refusals."""
-    return GatewayFailure(
-        failure_class=GatewayFailureClass.REFUSAL,
-        safe_message="provider refused the request",
-        safe_details={"signal": "content_policy"},
-    )
 
 
 def _json_object(raw: str) -> JsonObject:
@@ -942,17 +957,6 @@ def _optional_string(value: JsonValue | None, label: str) -> str:
     if not isinstance(value, str):
         raise ProviderResponseError(f"{label} must be text")
     return value
-
-
-def _require_tool(
-    tools: Mapping[int, _ToolAccumulator],
-    index: int,
-) -> _ToolAccumulator:
-    """Return one previously started provider tool call."""
-    try:
-        return tools[index]
-    except KeyError as exc:
-        raise ProviderResponseError("provider emitted arguments before a tool start") from exc
 
 
 async def _next_with_deadline[ValueT](

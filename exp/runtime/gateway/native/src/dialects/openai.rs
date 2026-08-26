@@ -42,6 +42,61 @@ impl Normalizer {
                 self.refusal_seen = true;
                 events.push(Event::RefusalDelta(delta));
             }
+            "response.reasoning_summary_text.delta" => {
+                let output_index =
+                    require_u64(&payload, "output_index", "OpenAI reasoning output_index")
+                        .map_err(|message| malformed(&message))? as u32;
+                let summary_index =
+                    require_u64(&payload, "summary_index", "OpenAI reasoning summary_index")
+                        .map_err(|message| malformed(&message))? as u32;
+                let delta = optional_text(&payload, "delta", "OpenAI reasoning summary delta")?;
+                if delta.is_empty() {
+                    return Ok(events);
+                }
+                let key = (output_index, summary_index);
+                self.reserve_summary_entry(key)?;
+                self.reserve_summary_bytes(delta.len())?;
+                self.reasoning_summaries
+                    .entry(key)
+                    .or_default()
+                    .push_str(&delta);
+                events.push(Event::ReasoningSummaryDelta {
+                    output_index,
+                    summary_index,
+                    delta,
+                });
+            }
+            "response.reasoning_summary_text.done" => {
+                let output_index =
+                    require_u64(&payload, "output_index", "OpenAI reasoning output_index")
+                        .map_err(|message| malformed(&message))? as u32;
+                let summary_index =
+                    require_u64(&payload, "summary_index", "OpenAI reasoning summary_index")
+                        .map_err(|message| malformed(&message))? as u32;
+                let final_text = require_string(&payload, "text", "OpenAI reasoning summary text")
+                    .map_err(|message| malformed(&message))?;
+                let key = (output_index, summary_index);
+                let streamed = self
+                    .reasoning_summaries
+                    .get(&key)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                if !streamed.is_empty() && streamed != final_text {
+                    return Err(malformed(
+                        "OpenAI reasoning summary fragments changed at done",
+                    ));
+                }
+                if streamed.is_empty() && !final_text.is_empty() {
+                    self.reserve_summary_entry(key)?;
+                    self.reserve_summary_bytes(final_text.len())?;
+                    self.reasoning_summaries.insert(key, final_text.clone());
+                    events.push(Event::ReasoningSummaryDelta {
+                        output_index,
+                        summary_index,
+                        delta: final_text,
+                    });
+                }
+            }
             "response.output_item.added" => {
                 let item = payload
                     .get("item")
@@ -63,6 +118,7 @@ impl Normalizer {
                         .to_string();
                     let name = require_string(item, "name", "OpenAI function call name")
                         .map_err(|message| malformed(&message))?;
+                    self.reserve_tool_entry(index)?;
                     let mut tool = ToolAccumulator::new(call_id.clone(), name.clone());
                     events.push(Event::ToolCallStarted {
                         index,
@@ -285,6 +341,7 @@ impl Normalizer {
                             .map_err(|message| malformed(&message))?;
                         let name = require_string(function, "name", "OpenAI-compatible tool name")
                             .map_err(|message| malformed(&message))?;
+                        self.reserve_tool_entry(index)?;
                         self.tools
                             .insert(index, ToolAccumulator::new(call_id.clone(), name.clone()));
                         events.push(Event::ToolCallStarted {
@@ -323,5 +380,106 @@ impl Normalizer {
             }
         }
         Ok(events)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dialects::{Dialect, MAXIMUM_RETAINED_PROVIDER_ENTRIES, OUTPUT_OVERFLOW_MESSAGE};
+    use crate::sse::SseEvent;
+
+    fn reasoning_delta(output_index: u32, summary_index: u32, delta: &str) -> SseEvent {
+        SseEvent {
+            event: None,
+            data: serde_json::json!({
+                "type": "response.reasoning_summary_text.delta",
+                "output_index": output_index,
+                "summary_index": summary_index,
+                "delta": delta,
+            })
+            .to_string(),
+        }
+    }
+
+    #[test]
+    fn responses_reasoning_summary_is_normalized_and_verified() {
+        let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+        let delta = SseEvent {
+            event: None,
+            data: serde_json::json!({
+                "type": "response.reasoning_summary_text.delta",
+                "output_index": 2,
+                "summary_index": 1,
+                "delta": "checked",
+            })
+            .to_string(),
+        };
+        let events = normalizer
+            .feed(&delta)
+            .expect("summary delta must normalize");
+        assert!(matches!(
+            events.as_slice(),
+            [Event::ReasoningSummaryDelta {
+                output_index: 2,
+                summary_index: 1,
+                delta,
+            }] if delta == "checked"
+        ));
+
+        let done = SseEvent {
+            event: None,
+            data: serde_json::json!({
+                "type": "response.reasoning_summary_text.done",
+                "output_index": 2,
+                "summary_index": 1,
+                "text": "checked",
+            })
+            .to_string(),
+        };
+        assert!(normalizer
+            .feed(&done)
+            .expect("matching summary completion must validate")
+            .is_empty());
+    }
+
+    #[test]
+    fn empty_reasoning_deltas_do_not_allocate_provider_state() {
+        let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+        for output_index in 0..=MAXIMUM_RETAINED_PROVIDER_ENTRIES as u32 {
+            assert!(normalizer
+                .feed(&reasoning_delta(output_index, 0, ""))
+                .expect("empty summary delta must be ignored")
+                .is_empty());
+        }
+        assert!(normalizer.reasoning_summaries.is_empty());
+
+        assert_eq!(
+            normalizer
+                .feed(&reasoning_delta(0, 0, "bounded"))
+                .expect("non-empty summary still fits")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn retained_provider_entries_are_bounded_across_tools_and_summaries() {
+        let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+        for index in 0..MAXIMUM_RETAINED_PROVIDER_ENTRIES as u32 {
+            normalizer
+                .reserve_tool_entry(index)
+                .expect("entry below ceiling must fit");
+            normalizer.tools.insert(
+                index,
+                ToolAccumulator::new(format!("call-{index}"), "lookup".to_string()),
+            );
+        }
+
+        let failure = normalizer
+            .feed(&reasoning_delta(0, 0, "overflow"))
+            .expect_err("entry above ceiling must fail");
+        assert_eq!(failure.failure_class, FailureClass::ProviderInternal);
+        assert_eq!(failure.safe_message, OUTPUT_OVERFLOW_MESSAGE);
     }
 }

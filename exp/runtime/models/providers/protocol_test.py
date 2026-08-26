@@ -10,6 +10,7 @@ import pytest
 from exp.common.models import (
     AssistantAction,
     BillingSource,
+    ModelCapabilities,
     ModelMessage,
     ModelRequest,
     ModelResponse,
@@ -147,6 +148,35 @@ def test_preflight_rejects_unsupported_semantics_before_dispatch() -> None:
     )
 
     with pytest.raises(ProviderCapabilityError, match="strict_tools"):
+        preflight_gateway_request(request, GatewayDeploymentCapabilities())
+
+
+def test_preflight_rejects_explicitly_unsupported_plain_tools_before_dispatch() -> None:
+    """A tool request cannot reach a model whose exact route explicitly rejects tools."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        tools=(GatewayToolDefinition(name="lookup", parameters={"type": "object"}),),
+    )
+
+    with pytest.raises(ProviderCapabilityError, match="function_tools"):
+        preflight_gateway_request(
+            request,
+            GatewayDeploymentCapabilities(),
+            model_capabilities=ModelCapabilities(supports_tools=False),
+        )
+
+
+def test_preflight_treats_false_parallel_control_as_semantic() -> None:
+    """Explicitly disabling parallel calls requires deployment support too."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        tools=(GatewayToolDefinition(name="lookup", parameters={"type": "object"}),),
+        parallel_tool_calls=False,
+    )
+
+    with pytest.raises(ProviderCapabilityError, match="parallel_tool_calls"):
         preflight_gateway_request(request, GatewayDeploymentCapabilities())
 
 

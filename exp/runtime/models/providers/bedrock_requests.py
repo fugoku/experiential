@@ -9,19 +9,43 @@ builders import it without creating a cycle through the streaming stack.
 
 from __future__ import annotations
 
+import json
+from collections.abc import Collection, Sequence
 from typing import cast
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelMessage, ModelRequest, ToolChoice
 
 
-def converse_request(model_id: str, request: ModelRequest) -> JsonObject:
+def converse_request(
+    model_id: str,
+    request: ModelRequest,
+    *,
+    supports_temperature: bool = True,
+    supports_top_p: bool = True,
+    supports_top_k: bool = False,
+    supports_logprobs: bool = False,
+    stop_sequences: Sequence[str] = (),
+    structured_output_name: str | None = None,
+    structured_output_description: str | None = None,
+    structured_output_schema: JsonObject | None = None,
+    strict_tool_names: Collection[str] = (),
+) -> JsonObject:
     """Translate one EXP request into boto Converse keyword arguments.
 
     Args:
         model_id: Exact foundation-model or inference-profile ID sent as the
             boto ``modelId`` routing key.
         request: Typed EXP request.
+        supports_temperature: Whether this exact deployment accepts temperature.
+        supports_top_p: Whether this exact deployment accepts top-p sampling.
+        supports_top_k: Whether this exact deployment accepts top-k sampling.
+        supports_logprobs: Reserved response-projection capability flag.
+        stop_sequences: Exact stop strings admitted for the selected route.
+        structured_output_name: Optional name for a strict JSON output contract.
+        structured_output_description: Optional description for that output contract.
+        structured_output_schema: Strict JSON schema admitted for structured output.
+        strict_tool_names: Tool definitions whose schemas Bedrock must enforce.
 
     Returns:
         Keyword arguments accepted by ``bedrock-runtime`` Converse.
@@ -29,10 +53,36 @@ def converse_request(model_id: str, request: ModelRequest) -> JsonObject:
     Raises:
         ValueError: A message cannot be represented without dropping tool context.
     """
-    return {"modelId": model_id, **converse_body(request)}
+    return {
+        "modelId": model_id,
+        **converse_body(
+            request,
+            supports_temperature=supports_temperature,
+            supports_top_p=supports_top_p,
+            supports_top_k=supports_top_k,
+            supports_logprobs=supports_logprobs,
+            stop_sequences=stop_sequences,
+            structured_output_name=structured_output_name,
+            structured_output_description=structured_output_description,
+            structured_output_schema=structured_output_schema,
+            strict_tool_names=strict_tool_names,
+        ),
+    }
 
 
-def converse_body(request: ModelRequest) -> JsonObject:
+def converse_body(
+    request: ModelRequest,
+    *,
+    supports_temperature: bool = True,
+    supports_top_p: bool = True,
+    supports_top_k: bool = False,
+    supports_logprobs: bool = False,
+    stop_sequences: Sequence[str] = (),
+    structured_output_name: str | None = None,
+    structured_output_description: str | None = None,
+    structured_output_schema: JsonObject | None = None,
+    strict_tool_names: Collection[str] = (),
+) -> JsonObject:
     """Translate one EXP request into the Converse wire document.
 
     The body carries no routing key: boto callers splice ``modelId`` beside it
@@ -40,6 +90,15 @@ def converse_body(request: ModelRequest) -> JsonObject:
 
     Args:
         request: Typed EXP request.
+        supports_temperature: Whether this exact deployment accepts temperature.
+        supports_top_p: Whether this exact deployment accepts top-p sampling.
+        supports_top_k: Whether this exact deployment accepts top-k sampling.
+        supports_logprobs: Reserved response-projection capability flag.
+        stop_sequences: Exact stop strings admitted for the selected route.
+        structured_output_name: Optional name for a strict JSON output contract.
+        structured_output_description: Optional description for that output contract.
+        structured_output_schema: Strict JSON schema admitted for structured output.
+        strict_tool_names: Tool definitions whose schemas Bedrock must enforce.
 
     Returns:
         The native Converse request document.
@@ -47,6 +106,10 @@ def converse_body(request: ModelRequest) -> JsonObject:
     Raises:
         ValueError: A message cannot be represented without dropping tool context.
     """
+    # Converse has no provider-neutral logprobs field. Keep the flag in the
+    # shared signature so all provider lanes use one capability contract, but
+    # omit the request until response projection exists.
+    del supports_logprobs
     system: list[JsonObject] = []
     messages: list[JsonObject] = []
 
@@ -83,12 +146,41 @@ def converse_body(request: ModelRequest) -> JsonObject:
         )
 
     payload: JsonObject = {"messages": messages}
-    inference = _inference_config(request)
+    inference = _inference_config(
+        request,
+        supports_temperature=supports_temperature,
+        supports_top_p=supports_top_p,
+        stop_sequences=stop_sequences,
+    )
     if inference:
         payload["inferenceConfig"] = inference
+    if request.top_k is not None and supports_top_k:
+        # Converse exposes model-specific controls at the request root, not
+        # inside inferenceConfig. The route flag is explicit because support
+        # varies by foundation model.
+        payload["additionalModelRequestFields"] = {"top_k": request.top_k}
     if system:
         payload["system"] = system
-    tool_config = _tool_config(request)
+    if structured_output_schema is not None:
+        json_schema: JsonObject = {
+            "schema": json.dumps(
+                structured_output_schema,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+        }
+        if structured_output_name is not None:
+            json_schema["name"] = structured_output_name
+        if structured_output_description is not None:
+            json_schema["description"] = structured_output_description
+        payload["outputConfig"] = {
+            "textFormat": {
+                "type": "json_schema",
+                "structure": {"jsonSchema": json_schema},
+            }
+        }
+    tool_config = _tool_config(request, strict_tool_names=strict_tool_names)
     if tool_config is not None:
         payload["toolConfig"] = tool_config
     return payload
@@ -131,32 +223,49 @@ def _message_blocks(message: ModelMessage) -> list[JsonObject]:
     return blocks
 
 
-def _inference_config(request: ModelRequest) -> JsonObject:
+def _inference_config(
+    request: ModelRequest,
+    *,
+    supports_temperature: bool,
+    supports_top_p: bool,
+    stop_sequences: Sequence[str] = (),
+) -> JsonObject:
     """Return Converse inference controls without inventing omitted sampling fields."""
     inference: JsonObject = {}
     if request.maximum_output_tokens is not None:
         inference["maxTokens"] = request.maximum_output_tokens
-    if request.temperature is not None:
+    if request.temperature is not None and supports_temperature:
         inference["temperature"] = request.temperature
+    if request.top_p is not None and supports_top_p:
+        inference["topP"] = request.top_p
+    if stop_sequences:
+        inference["stopSequences"] = list(stop_sequences)
     return inference
 
 
-def _tool_config(request: ModelRequest) -> JsonObject | None:
+def _tool_config(
+    request: ModelRequest,
+    *,
+    strict_tool_names: Collection[str] = (),
+) -> JsonObject | None:
     """Return Converse tool configuration, or omit it when tools are disabled."""
     if request.tool_choice == "none" or not request.tools:
         return None
-    config: JsonObject = {
-        "tools": [
-            {
-                "toolSpec": {
-                    "name": tool.name,
-                    "description": tool.description,
-                    "inputSchema": {"json": tool.input_schema},
-                }
-            }
-            for tool in request.tools
-        ]
-    }
+    known_tool_names = {tool.name for tool in request.tools}
+    unknown_strict_tools = set(strict_tool_names) - known_tool_names
+    if unknown_strict_tools:
+        raise ValueError("strict Bedrock tools must name request tool definitions")
+    tools: list[JsonObject] = []
+    for tool in request.tools:
+        tool_spec: JsonObject = {
+            "name": tool.name,
+            "description": tool.description,
+            "inputSchema": {"json": tool.input_schema},
+        }
+        if tool.name in strict_tool_names:
+            tool_spec["strict"] = True
+        tools.append({"toolSpec": tool_spec})
+    config: JsonObject = {"tools": tools}
     if request.tool_choice == "required":
         config["toolChoice"] = {"any": {}}
     elif isinstance(request.tool_choice, ToolChoice):
