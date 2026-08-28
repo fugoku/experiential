@@ -7,9 +7,14 @@ from typing import cast
 import pytest
 
 from exp.common.models import BillingSource, ModelCapabilities, ModelSnapshot
-from exp.common.models.catalog import GatewayDeploymentMetadata, GatewayTokenPrices
+from exp.common.models.catalog import (
+    GatewayDeploymentCapabilities,
+    GatewayDeploymentMetadata,
+    GatewayTokenPrices,
+)
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.execution_resolution import (
+    GatewayWireContractError,
     _require_deployment_identity,
     _resolved_wire_profile,
 )
@@ -29,7 +34,10 @@ def _snapshot() -> ModelSnapshot:
     )
 
 
-def _deployment(capabilities: ModelCapabilities | None) -> ExactModelDeployment:
+def _deployment(
+    capabilities: ModelCapabilities | None,
+    gateway_capabilities: GatewayDeploymentCapabilities | None = None,
+) -> ExactModelDeployment:
     """Build one exact deployment carrying the given catalog capability contract."""
     return ExactModelDeployment(
         deployment_id="primary",
@@ -42,6 +50,7 @@ def _deployment(capabilities: ModelCapabilities | None) -> ExactModelDeployment:
         capabilities_sha256="a" * 64,
         capabilities=capabilities,
         gateway=GatewayDeploymentMetadata(
+            capabilities=gateway_capabilities or GatewayDeploymentCapabilities(),
             prices=GatewayTokenPrices(),
             pricing_source="test",
         ),
@@ -102,6 +111,55 @@ def test_profile_ranges_intersect_with_the_catalog_contract() -> None:
     assert resolved.maximum_output_tokens == 128
     assert resolved.token_limit_key == "max_completion_tokens"
     assert resolved.model_id == "provider-model"
+
+
+def test_profile_resolution_applies_exact_gateway_reasoning_values() -> None:
+    """Deployment metadata replaces a family guess with provider-published values."""
+    capabilities = ModelCapabilities(
+        supports_reasoning=True,
+        reasoning_effort="max",
+    )
+    profile = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://example.test/v1/chat/completions",
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning",
+        reasoning_effort="max",
+    )
+    gateway_capabilities = GatewayDeploymentCapabilities(
+        supported_reasoning_efforts=("low", "high", "max"),
+        reasoning_default_effort="high",
+        reasoning_effort_required=True,
+    )
+
+    resolved = _resolved_wire_profile(
+        _deployment(capabilities, gateway_capabilities),
+        _resolved(_NativeClient(profile), capabilities),
+    )
+
+    assert resolved.supported_reasoning_efforts == ("low", "high", "max")
+    assert resolved.reasoning_effort == "high"
+    assert resolved.reasoning_effort_required is True
+
+
+def test_profile_resolution_rejects_provider_reasoning_contract_conflict() -> None:
+    """A provider profile cannot silently weaken frozen gateway reasoning metadata."""
+    capabilities = ModelCapabilities(supports_reasoning=True)
+    profile = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://example.test/v1/chat/completions",
+    )
+    gateway_capabilities = GatewayDeploymentCapabilities(
+        supported_reasoning_efforts=("medium",),
+        reasoning_default_effort="medium",
+        reasoning_effort_required=True,
+    )
+
+    with pytest.raises(GatewayWireContractError, match="reasoning metadata conflicts"):
+        _resolved_wire_profile(
+            _deployment(capabilities, gateway_capabilities),
+            _resolved(_NativeClient(profile), capabilities),
+        )
 
 
 def test_profile_resolution_requires_a_native_wire_client() -> None:

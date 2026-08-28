@@ -20,6 +20,7 @@ from exp.common.models import (
     ModelRecord,
     ModelRoles,
     ModelSnapshot,
+    ReasoningEffort,
     SFTModelProvenance,
     load_model_catalog,
     write_model_catalog,
@@ -281,7 +282,7 @@ def test_connections_only_catalog_round_trips_without_optimizer_roles(tmp_path: 
 def test_gateway_metadata_is_deployment_local_and_secret_free(tmp_path: Path) -> None:
     """Gateway protocol and integer pricing metadata persist outside frozen capabilities."""
     path = tmp_path / "models.toml"
-    capabilities = ModelCapabilities(supports_tools=True)
+    capabilities = ModelCapabilities(supports_tools=True, supports_reasoning=True)
     original_identity = capabilities.identity_sha256()
     catalog = ModelCatalog(
         connections={"openai": ConnectionConfig(provider="openai", api_key_env="OPENAI_API_KEY")},
@@ -296,6 +297,9 @@ def test_gateway_metadata_is_deployment_local_and_secret_free(tmp_path: Path) ->
                     capabilities=GatewayDeploymentCapabilities(
                         supports_streaming=True,
                         supports_streaming_tool_arguments=True,
+                        supported_reasoning_efforts=("low", "high", "max"),
+                        reasoning_default_effort="max",
+                        reasoning_effort_required=True,
                     ),
                     prices=GatewayTokenPrices(
                         input_micro_usd_per_million_tokens=1_250_000,
@@ -312,7 +316,68 @@ def test_gateway_metadata_is_deployment_local_and_secret_free(tmp_path: Path) ->
     assert loaded == catalog
     assert loaded.models["coding"].capabilities is not None
     assert loaded.models["coding"].capabilities.identity_sha256() == original_identity
+    assert loaded.models["coding"].gateway is not None
+    assert loaded.models["coding"].gateway.capabilities.supported_reasoning_efforts == (
+        "low",
+        "high",
+        "max",
+    )
     assert "input_micro_usd_per_million_tokens = 1250000" in path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "values",
+    (("high", "low"), ("high", "high")),
+)
+def test_gateway_reasoning_efforts_require_unique_canonical_order(
+    values: tuple[ReasoningEffort, ...],
+) -> None:
+    """Ambiguous provider effort sets fail when the catalog is authored."""
+    with pytest.raises(ValueError):
+        GatewayDeploymentCapabilities(supported_reasoning_efforts=values)
+
+
+def test_required_gateway_reasoning_effort_needs_supported_values() -> None:
+    """A mandatory wire parameter cannot omit its provider value domain."""
+    with pytest.raises(ValueError, match="at least one supported reasoning effort"):
+        GatewayDeploymentCapabilities(reasoning_effort_required=True)
+
+
+def test_required_gateway_reasoning_effort_needs_an_explicit_default() -> None:
+    """A mandatory wire parameter cannot force admission to guess its value."""
+    with pytest.raises(ValueError, match="needs reasoning_default_effort"):
+        GatewayDeploymentCapabilities(
+            supported_reasoning_efforts=("low", "high"),
+            reasoning_effort_required=True,
+        )
+
+
+def test_gateway_reasoning_default_must_be_supported() -> None:
+    """A provider default outside the exact domain fails catalog loading."""
+    with pytest.raises(ValueError, match="must be one of the supported"):
+        GatewayDeploymentCapabilities(
+            supported_reasoning_efforts=("low", "high"),
+            reasoning_default_effort="max",
+        )
+
+
+@pytest.mark.parametrize("capabilities", (None, ModelCapabilities()))
+def test_gateway_reasoning_metadata_requires_model_reasoning_support(
+    capabilities: ModelCapabilities | None,
+) -> None:
+    """Authored reasoning metadata cannot contradict the model capability contract."""
+    with pytest.raises(ValueError, match="supports_reasoning=true"):
+        ModelRecord(
+            connection="openai",
+            model="gpt-coding",
+            billing_source=BillingSource.CUSTOMER_MANAGED,
+            capabilities=capabilities,
+            gateway=GatewayDeploymentMetadata(
+                capabilities=GatewayDeploymentCapabilities(
+                    supported_reasoning_efforts=("medium",),
+                )
+            ),
+        )
 
 
 def test_model_catalog_rejects_credential_values_and_embedded_url_credentials(

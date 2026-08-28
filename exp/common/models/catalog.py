@@ -230,9 +230,53 @@ class GatewayDeploymentCapabilities(ContractModel):
     field). A concrete value lets admission reject an over-limit list locally with a
     named parameter error instead of forwarding it and surfacing the provider's
     opaque 4xx (e.g. Gemini caps ``stopSequences`` at 5)."""
+    supported_reasoning_efforts: tuple[ReasoningEffort, ...] = ()
+    """Exact caller values this deployment can preserve without normalization.
+
+    An empty tuple means the gateway should use its maintained provider-family
+    contract. OpenRouter and other catalog-driven providers declare the exact
+    ordered set here because their supported values vary by model.
+    """
+    reasoning_default_effort: ReasoningEffort | None = None
+    """Explicit provider default used only when the wire requires this field."""
+    reasoning_effort_required: bool = False
+    """Whether this deployment requires an explicit reasoning effort on its wire."""
     reports_refusals: bool = False
     reports_cached_input_tokens: bool = False
     reports_reasoning_tokens: bool = False
+
+    @property
+    def declares_reasoning_contract(self) -> bool:
+        """Whether this metadata overrides provider-family reasoning behavior."""
+        return bool(
+            self.supported_reasoning_efforts
+            or self.reasoning_default_effort is not None
+            or self.reasoning_effort_required
+        )
+
+    @model_validator(mode="after")
+    def _require_valid_reasoning_contract(self) -> GatewayDeploymentCapabilities:
+        """Reject ambiguous or non-canonical reasoning declarations."""
+        order = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+        indexes = tuple(order.index(effort) for effort in self.supported_reasoning_efforts)
+        if len(set(self.supported_reasoning_efforts)) != len(self.supported_reasoning_efforts):
+            raise ValueError("supported_reasoning_efforts cannot repeat values")
+        if indexes != tuple(sorted(indexes)):
+            raise ValueError("supported_reasoning_efforts must use canonical order")
+        if (
+            self.reasoning_default_effort is not None
+            and self.reasoning_default_effort not in self.supported_reasoning_efforts
+        ):
+            raise ValueError(
+                "reasoning_default_effort must be one of the supported reasoning efforts"
+            )
+        if self.reasoning_effort_required and not self.supported_reasoning_efforts:
+            raise ValueError(
+                "reasoning_effort_required needs at least one supported reasoning effort"
+            )
+        if self.reasoning_effort_required and self.reasoning_default_effort is None:
+            raise ValueError("reasoning_effort_required needs reasoning_default_effort")
+        return self
 
 
 class GatewayTokenPrices(ContractModel):
@@ -320,6 +364,15 @@ class ModelRecord(ContractModel):
 
     @model_validator(mode="after")
     def _require_secret_free_model_identity(self) -> ModelRecord:
+        """Reject contradictory reasoning metadata and credential-bearing identity fields."""
+        if (
+            self.gateway is not None
+            and self.gateway.capabilities.declares_reasoning_contract
+            and (self.capabilities is None or not self.capabilities.supports_reasoning)
+        ):
+            raise ValueError(
+                "gateway reasoning metadata requires model capabilities.supports_reasoning=true"
+            )
         if (
             self.sft_provenance is not None
             and self.sft_provenance.sampling_handle_sha256

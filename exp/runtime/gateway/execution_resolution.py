@@ -10,6 +10,10 @@ from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.protocol import NativeWireClient
 
 
+class GatewayWireContractError(ValueError):
+    """A resolved provider profile contradicts the frozen gateway contract."""
+
+
 def _resolved_wire_profile(
     deployment: ExactModelDeployment,
     runtime_model: ResolvedModel,
@@ -25,11 +29,20 @@ def _resolved_wire_profile(
         intersected against the deployment's catalog capabilities.
 
     Raises:
+        GatewayWireContractError: Catalog reasoning metadata contradicts the
+            resolved model or provider wire profile.
         TypeError: The resolved client exposes no native wire profile.
     """
     capabilities = runtime_model.capabilities
+    gateway_capabilities = deployment.gateway.capabilities
     if isinstance(runtime_model.client, NativeWireClient):
         profile = runtime_model.client.gateway_wire_profile()
+        if gateway_capabilities.declares_reasoning_contract and (
+            not capabilities.supports_reasoning or not profile.supports_reasoning
+        ):
+            raise GatewayWireContractError(
+                "gateway reasoning metadata conflicts with the resolved provider wire profile"
+            )
         output_limits = tuple(
             limit
             for limit in (
@@ -74,6 +87,16 @@ def _resolved_wire_profile(
                 else profile.maximum_top_k
             ),
             sampling_requires_reasoning_none=capabilities.sampling_requires_reasoning_none,
+            supported_reasoning_efforts=(
+                gateway_capabilities.supported_reasoning_efforts
+                or profile.supported_reasoning_efforts
+            ),
+            reasoning_effort=(
+                gateway_capabilities.reasoning_default_effort or profile.reasoning_effort
+            ),
+            reasoning_effort_required=(
+                gateway_capabilities.reasoning_effort_required or profile.reasoning_effort_required
+            ),
             token_limit_key=capabilities.chat_max_tokens_field or profile.token_limit_key,
             maximum_output_tokens=min(output_limits) if output_limits else None,
         )
