@@ -33,9 +33,9 @@ metrics and fails the request closed with the shared internal error.
 from __future__ import annotations
 
 import json
+import logging
 import time
 from collections.abc import Callable
-from typing import cast
 
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import (
@@ -46,17 +46,11 @@ from exp.runtime.gateway.contracts import (
     GatewayFailureClass,
     GatewayRequest,
 )
-from exp.runtime.gateway.discovery import (
-    public_model_list,
-    public_model_object,
-    require_granted_authority,
-)
 from exp.runtime.gateway.group_commit import SyncGroupCommitLedger
 from exp.runtime.gateway.guardrails.client import assert_not_internal_classification
 from exp.runtime.gateway.guardrails.contracts import GuardrailRejected
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 from exp.runtime.gateway.guardrails.native import enforce_native_input, enforce_native_output
-from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.native_accounting import (
     NativeAttemptAccounting,
     NativeBridgeError,
@@ -70,13 +64,16 @@ from exp.runtime.gateway.native_dispatch import dispatch_signature_headers, froz
 from exp.runtime.gateway.native_execution import (
     MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS,
     MAXIMUM_TOTAL_ATTEMPTS,
+    DeadRung,
     InflightRequest,
     NativeDialectUnavailableError,
+    deployment_health_key,
     deployment_wire_entry,
+    dispatchable_route_profiles,
     resolve_route_profiles,
     select_route_deployments,
 )
-from exp.runtime.gateway.native_metrics_text import render_metrics_text
+from exp.runtime.gateway.native_observability import NativeObservabilityMixin
 from exp.runtime.gateway.native_responses import (
     ContinuationContext,
     continued_request,
@@ -87,8 +84,6 @@ from exp.runtime.gateway.native_settlement import (
     optional_text,
 )
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
-from exp.runtime.gateway.sqlite.migrations import close_idle_connections
-from exp.runtime.gateway.usage import GatewayUsageReport, read_usage_report, usage_html
 from exp.runtime.models.providers import (
     preflight_gateway_request,
     require_gateway_provider,
@@ -118,6 +113,8 @@ from exp.runtime.openai_protocol.state import (
 
 _REQUEST_TIMEOUT_SECONDS = 120.0
 
+_logger = logging.getLogger(__name__)
+
 
 def _escalation(reason: str) -> str:
     """Return the admission disposition for a request the plane cannot serve.
@@ -134,7 +131,7 @@ def _escalation(reason: str) -> str:
     return json.dumps({"escalate": reason}, separators=(",", ":"))
 
 
-class NativeControlPlane:
+class NativeControlPlane(NativeObservabilityMixin):
     """Authority and accounting callbacks for the native data plane.
 
     Methods are called from multiple Rust worker threads. Ledger writes block
@@ -341,7 +338,25 @@ class NativeControlPlane:
                 request,
                 continuation=continuation_context,
             )
-            resolved_wires = resolve_route_profiles(self._components.runtime_catalogs, route)
+            # A rung that is dead at admission (a lost credential, a drifted
+            # connection) is skipped so a live fallback still serves the
+            # request instead of the whole request failing on a dead lead.
+            dispatchable = dispatchable_route_profiles(self._components.runtime_catalogs, route)
+            self._record_dead_admission_rungs(
+                authorization,
+                dispatchable.dead,
+                fallback_available=bool(dispatchable.indexes),
+            )
+            if not dispatchable.indexes:
+                # Every certified rung was operationally dead at admission;
+                # there is nothing live to serve, so the accepted request is
+                # finished closed.
+                return self._escalate_accepted(
+                    authorization,
+                    "every certified deployment was unavailable at admission",
+                )
+            route = select_route_deployments(route, dispatchable.indexes)
+            resolved_wires = dispatchable.resolved_wires
         except NativeDialectUnavailableError as exc:
             return self._escalate_accepted(authorization, str(exc))
         except Exception as exc:  # noqa: BLE001 - raised after route packaging below.
@@ -709,165 +724,6 @@ class NativeControlPlane:
             raise _authority_error(exc) from exc
         return "{}"
 
-    def models(self, argument: str) -> str:
-        """Return the granted model list body for one authenticated key."""
-        data = json.loads(argument)
-        try:
-            authorities = self._components.store.granted_alias_authorities(raw_key=data["raw_key"])
-            body = public_model_list(authorities)
-        except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
-            raise _authority_error(exc) from exc
-        return json.dumps(body, separators=(",", ":"))
-
-    def model_detail(self, argument: str) -> str:
-        """Return one granted model object or the shared no-oracle 404."""
-        data = json.loads(argument)
-        try:
-            authorities = self._components.store.granted_alias_authorities(raw_key=data["raw_key"])
-            authority = require_granted_authority(authorities, data["model_id"])
-            body = public_model_object(authority)
-        except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
-            raise _authority_error(exc) from exc
-        return json.dumps(body, separators=(",", ":"))
-
-    def usage_json(self, argument: str) -> str:
-        """Return the content-free usage report body.
-
-        Args:
-            argument: JSON object with an optional ``raw_key``. A presented
-                key scopes the report to its owning identity; an absent key
-                returns the organization-wide report.
-
-        Returns:
-            The schema-versioned usage report as one JSON object.
-
-        Raises:
-            NativeBridgeError: The presented key is invalid, expired, or revoked.
-        """
-        if self._usage_reporter is not None:
-            return json.dumps(self._usage_reporter(), separators=(",", ":"))
-        report = self._usage_report(argument)
-        return json.dumps(report.model_dump(mode="json"), separators=(",", ":"))
-
-    def usage_page(self, argument: str) -> str:
-        """Return the content-free usage page rendering.
-
-        Args:
-            argument: JSON object with an optional ``raw_key``, scoped exactly
-                like :meth:`usage_json`.
-
-        Returns:
-            JSON object with one ``html`` field holding the rendered page.
-
-        Raises:
-            NativeBridgeError: The presented key is invalid, expired, or revoked.
-        """
-        report = self._usage_report(argument)
-        return json.dumps({"html": usage_html(report)}, separators=(",", ":"))
-
-    def _usage_report(self, argument: str) -> GatewayUsageReport:
-        """Read the usage report for one optionally key-scoped callback.
-
-        Args:
-            argument: JSON object with an optional ``raw_key``.
-
-        Returns:
-            The organization-wide report, or the report scoped to the
-            presented key's identity.
-
-        Raises:
-            NativeBridgeError: The presented key is invalid, expired, or revoked.
-        """
-        data = json.loads(argument)
-        raw_key = data.get("raw_key")
-        identity_id: str | None = None
-        if raw_key is not None:
-            try:
-                _, identity_id = self._components.store.authenticated_identity(raw_key=str(raw_key))
-            except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
-                raise _authority_error(exc) from exc
-        # Only the local composition (SQLite ledger) serves native usage;
-        # hosted compositions disable it and own their own usage surface.
-        return read_usage_report(
-            cast("SQLiteAttemptLedger", self._components.ledger),
-            organization_id=self._components.organization_id,
-            identity_id=identity_id,
-        )
-
-    def metrics_snapshot(self) -> JsonObject:
-        """Compose the one content-free observability snapshot.
-
-        ``data_plane`` carries the native engine's registry when a provider
-        is bound, otherwise ``None``; ``control_plane`` carries this bridge's
-        own sweep recoveries, in-flight registry size, reconciliation counts,
-        and accounting health. The native ``/metrics.json`` route serves
-        exactly this body; ``/metrics`` serves its Prometheus text rendering.
-        """
-        data_plane: JsonObject | None = None
-        if self._data_plane_metrics is not None:
-            data_plane = json.loads(self._data_plane_metrics())
-        retained_replayed, abandoned_cancelled, inflight = self._accounting.counters()
-        control_plane: JsonObject = {
-            "sweep_retained_settlements_replayed": retained_replayed,
-            "sweep_abandoned_attempts_cancelled": abandoned_cancelled,
-            "inflight_attempts": inflight,
-            "reconciled_expired_requests": self._components.reconciled_expired_requests,
-            "reconciled_unknown_attempts": self._components.reconciled_unknown_attempts,
-            "accounting_healthy": self._accounting.accounting_healthy,
-        }
-        return {"data_plane": data_plane, "control_plane": control_plane}
-
-    def metrics_json(self, argument: str) -> str:
-        """Return the content-free metrics snapshot body for the data plane."""
-        del argument
-        return json.dumps(self.metrics_snapshot(), separators=(",", ":"))
-
-    def metrics_text(self, argument: str) -> str:
-        """Return ``{"text": ...}`` holding the snapshot's Prometheus exposition."""
-        del argument
-        text = render_metrics_text(self.metrics_snapshot())
-        return json.dumps({"text": text}, separators=(",", ":"))
-
-    def readiness(self, argument: str) -> str:
-        """Return whether bridge settlement and composition accounting stay healthy.
-
-        Readiness fails closed once the bridge's own settlement registry has
-        latched a durable-write loss, once the composition's accounting
-        surface reports unhealthy, or when an injected hosted lifecycle probe
-        answers false or raises.
-        """
-        del argument
-        if not self._accounting.accounting_healthy:
-            return "false"
-        try:
-            if not self._components.accounting_healthy:
-                return "false"
-        except Exception:  # noqa: BLE001 - readiness fails closed at the boundary.
-            return "false"
-        if self._readiness_probe is not None:
-            try:
-                return "true" if self._readiness_probe() else "false"
-            except Exception:  # noqa: BLE001 - readiness fails closed at the boundary.
-                return "false"
-        return "true"
-
-    def close_thread_resources(self, argument: str) -> str:
-        """Release the calling thread's cached resources before it exits.
-
-        The data plane pins control-plane callbacks to a fixed pool of worker
-        threads and calls this once per worker as the pool shuts down, so the
-        SQLite connections cached per thread by ``persistent_connection``
-        close with the worker instead of outliving it.
-
-        Args:
-            argument: Empty JSON object, matching the callback shape.
-
-        Returns:
-            JSON object reporting the number of connections closed.
-        """
-        del argument
-        return json.dumps({"closed_connections": close_idle_connections()}, separators=(",", ":"))
-
     def _decode_body(
         self,
         body: str,
@@ -886,6 +742,47 @@ class NativeControlPlane:
             )
         except NativeDecodeError as exc:
             raise NativeBridgeError(exc.error) from exc
+
+    def _record_dead_admission_rungs(
+        self,
+        authorization: AuthorizationSnapshot,
+        dead: tuple[DeadRung, ...],
+        *,
+        fallback_available: bool,
+    ) -> None:
+        """Feed each admission-dead rung into its health circuit and surface it.
+
+        A rung skipped because it was operationally dead at admission is
+        recorded in the same deployment health circuit as a runtime failure,
+        so the existing cooldown and half-open probe bring it back
+        automatically when it heals; it is never permanently blacklisted. A
+        skipped lead rung is logged and counted so a persistently dead lead
+        reaches a human instead of being silently masked behind a healthy
+        fallback forever. That masking signal only exists when a live
+        fallback actually serves: a total route outage escalates loudly on
+        its own path and must not read as one more fallback-served request.
+
+        Args:
+            authorization: Frozen authority for the accepted request.
+            dead: Every rung skipped as operationally dead, in route order.
+            fallback_available: Whether any live rung remains to serve.
+        """
+        if not dead:
+            return
+        health = self._accounting.health
+        for rung in dead:
+            health.failed(deployment_health_key(authorization, rung.deployment), rung.failure)
+        lead = next((rung for rung in dead if rung.index == 0), None)
+        lead_masked = lead is not None and fallback_available
+        self._accounting.record_admission_rung_skips(len(dead), lead_skipped=lead_masked)
+        if lead is not None and fallback_available:
+            _logger.warning(
+                "gateway admission skipped the lead rung for alias %r: served off a "
+                "fallback because deployment %r (provider %r) was dead at admission",
+                authorization.alias,
+                lead.deployment.deployment_id,
+                lead.deployment.provider,
+            )
 
     def _escalate_accepted(self, authorization: AuthorizationSnapshot, reason: str) -> str:
         """Finish one accepted-but-unservable request and return its disposition.
