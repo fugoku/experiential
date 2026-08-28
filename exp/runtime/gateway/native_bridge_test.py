@@ -1744,11 +1744,14 @@ def _responses_body(
     previous_response_id: str | None = None,
     with_tools: bool = False,
     reasoning_summary: str | None = None,
+    store: bool | None = None,
 ) -> str:
     """Return one raw Responses API request body."""
     payload: JsonObject = {"model": model, "input": [{"role": "user", "content": "hi"}]}
     if stream:
         payload["stream"] = True
+    if store is not None:
+        payload["store"] = store
     if previous_response_id is not None:
         payload["previous_response_id"] = previous_response_id
     if reasoning_summary is not None:
@@ -2804,3 +2807,366 @@ def test_rust_messages_interleaved_parallel_tools_match_the_goldens() -> None:
     assert list(actual_frames) == _parity_golden("messages_interleaved_frames")
     actual_body = native.completed_messages_fixture("request-abc", "coding", fixture)
     assert actual_body == _parity_golden("messages_interleaved_body")
+
+
+def test_store_false_skips_continuation_retention(tmp_path: Path) -> None:
+    """A store:false response is never remembered, so continuing from it fails
+    closed with the shared continuation_unavailable error."""
+    control, raw_key = _control_plane(tmp_path)
+    first = _admit_responses(control, raw_key, _responses_body(store=False))
+    assert (
+        control.remember(
+            json.dumps(
+                {
+                    "request_id": first["request_id"],
+                    "text": "The answer is 42.",
+                    "refusal": False,
+                    "tool_calls": [],
+                }
+            )
+        )
+        == "{}"
+    )
+    response_id = stable_public_id("resp", _admitted_request_id(first))
+    with pytest.raises(NativeBridgeError) as raised:
+        _admit_responses(control, raw_key, _responses_body(previous_response_id=response_id))
+    payload = json.loads(raised.value.public_error_json)
+    assert payload["code"] == "continuation_unavailable"
+
+    # An explicit store:true keeps the default retention behavior.
+    stored = _admit_responses(control, raw_key, _responses_body(store=True))
+    control.remember(
+        json.dumps(
+            {
+                "request_id": stored["request_id"],
+                "text": "kept",
+                "refusal": False,
+                "tool_calls": [],
+            }
+        )
+    )
+    continued = _admit_responses(
+        control,
+        raw_key,
+        _responses_body(
+            previous_response_id=stable_public_id("resp", _admitted_request_id(stored))
+        ),
+    )
+    assert [message["role"] for message in _payload_messages(continued)] == [
+        "user",
+        "assistant",
+        "user",
+    ]
+
+
+def _thinking_fixture_json() -> str:
+    """Return the Rust fixture-event JSON for the thinking Messages stream."""
+    return json.dumps(
+        [
+            {"kind": "thinking_delta", "index": 0, "text": "Let me "},
+            {"kind": "thinking_delta", "index": 0, "text": "check."},
+            {"kind": "thinking_signature", "index": 0, "signature": "c2lnbmF0dXJl"},
+            {"kind": "redacted_thinking", "index": 1, "data": "b3BhcXVl"},
+            {"kind": "text_delta", "text": "Hello"},
+            {"kind": "usage", "input_tokens": 12, "output_tokens": 7, "cached_input_tokens": 2},
+            {"kind": "completed"},
+        ]
+    )
+
+
+def test_rust_messages_thinking_stream_matches_the_hand_authored_goldens() -> None:
+    """Thinking blocks stream and aggregate exactly as the Anthropic spec fixes.
+
+    The golden frames were hand-authored against the public Messages
+    streaming contract: the thinking block opens with empty fields, streams
+    thinking_delta fragments, closes with one signature_delta, redacted
+    thinking travels whole in its start frame, and the non-streaming body
+    carries the same blocks in order with the byte-exact signature.
+    """
+    native = pytest.importorskip("exp_gateway_native")
+
+    frames = native.encode_messages_fixture("request-abc", "coding", _thinking_fixture_json())
+    assert list(frames) == _parity_golden("messages_thinking_frames")
+    body = native.completed_messages_fixture("request-abc", "coding", _thinking_fixture_json())
+    assert body == _parity_golden("messages_thinking_body")
+
+
+def test_rust_responses_encrypted_reasoning_matches_the_hand_authored_golden() -> None:
+    """Requested encrypted reasoning lands verbatim on the reasoning item."""
+    native = pytest.importorskip("exp_gateway_native")
+
+    fixture = json.dumps(
+        [
+            {
+                "kind": "reasoning_summary_delta",
+                "output_index": 0,
+                "summary_index": 0,
+                "text": "planned",
+            },
+            {"kind": "encrypted_reasoning", "output_index": 0, "encrypted_content": "ZW5jcnlwdGVk"},
+            {"kind": "text_delta", "text": "Hello"},
+            {
+                "kind": "usage",
+                "input_tokens": 12,
+                "output_tokens": 9,
+                "cached_input_tokens": 0,
+                "reasoning_tokens": 4,
+            },
+            {"kind": "completed"},
+        ]
+    )
+    body = native.completed_responses_fixture(
+        "request-abc", "coding", 1_700_000_000.0, "{}", fixture
+    )
+    assert body == _parity_golden("responses_encrypted_reasoning_body")
+
+
+def test_thinking_bytes_round_trip_the_native_pipeline_exactly() -> None:
+    """Non-ASCII thinking text and a multi-kilobyte signature survive the full
+    provider-frames-to-public-frames pipeline byte-identically.
+
+    The signature is an opaque cryptographic value the provider verifies on
+    replay, so any re-encoding drift (Unicode escaping, truncation, split
+    handling) would break every continued Claude Code conversation.
+    """
+    native = pytest.importorskip("exp_gateway_native")
+
+    thinking_one = "Grüß 事實 مرحبا  "
+    thinking_two = "🤔🧠 σκέψη ⇒ done"
+    signature = "Eq" + "A0b/+=" * 700  # ~4.2 KB, base64-shaped.
+    redacted = "R3" * 1500
+    provider_chunks = [
+        json.dumps({"type": "message_start", "message": {"usage": {"input_tokens": 3}}}),
+        json.dumps(
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "thinking", "thinking": "", "signature": ""},
+            }
+        ),
+        json.dumps(
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": thinking_one},
+            },
+            ensure_ascii=False,
+        ),
+        json.dumps(
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": thinking_two},
+            },
+            ensure_ascii=False,
+        ),
+        json.dumps(
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "signature_delta", "signature": signature},
+            }
+        ),
+        json.dumps({"type": "content_block_stop", "index": 0}),
+        json.dumps(
+            {
+                "type": "content_block_start",
+                "index": 1,
+                "content_block": {"type": "redacted_thinking", "data": redacted},
+            }
+        ),
+        json.dumps({"type": "content_block_stop", "index": 1}),
+        json.dumps(
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn"},
+                "usage": {"output_tokens": 9},
+            }
+        ),
+        json.dumps({"type": "message_stop"}),
+    ]
+    # The fixture boundary carries raw stream bytes as latin-1 code points.
+    frames_json = json.dumps(
+        [f"data: {chunk}\n\n".encode().decode("latin-1") for chunk in provider_chunks]
+    )
+    normalized = json.loads(native.normalize_stream_fixture("anthropic_messages", frames_json))
+    assert normalized["failure"] is None
+    events = normalized["events"]
+    streamed_thinking = "".join(
+        event["text"] for event in events if event["kind"] == "thinking_delta"
+    )
+    assert streamed_thinking.encode() == (thinking_one + thinking_two).encode()
+    assert [event["signature"] for event in events if event["kind"] == "thinking_signature"] == [
+        signature
+    ]
+
+    fixture = json.dumps(events, ensure_ascii=False)
+    public_frames = native.encode_messages_fixture("request-abc", "coding", fixture)
+    payloads = [json.loads(frame.split("data: ", 1)[1].strip()) for frame in public_frames if frame]
+    out_thinking = "".join(
+        payload["delta"]["thinking"]
+        for payload in payloads
+        if payload["type"] == "content_block_delta" and payload["delta"]["type"] == "thinking_delta"
+    )
+    out_signature = "".join(
+        payload["delta"]["signature"]
+        for payload in payloads
+        if payload["type"] == "content_block_delta"
+        and payload["delta"]["type"] == "signature_delta"
+    )
+    assert out_thinking.encode() == (thinking_one + thinking_two).encode()
+    assert out_signature.encode() == signature.encode()
+
+    body = json.loads(native.completed_messages_fixture("request-abc", "coding", fixture))
+    assert body["content"][0]["thinking"].encode() == (thinking_one + thinking_two).encode()
+    assert body["content"][0]["signature"].encode() == signature.encode()
+    assert body["content"][1]["data"].encode() == redacted.encode()
+
+
+def test_encrypted_content_bytes_survive_the_responses_encoder_exactly() -> None:
+    """A large opaque encrypted payload lands byte-identical on the public item."""
+    native = pytest.importorskip("exp_gateway_native")
+
+    encrypted = "gAAAA" + "Zm9vYmFy+/=" * 1200  # ~13 KB, base64-shaped.
+    fixture = json.dumps(
+        [
+            {"kind": "encrypted_reasoning", "output_index": 0, "encrypted_content": encrypted},
+            {"kind": "text_delta", "text": "done ✓"},
+            {"kind": "completed"},
+        ],
+        ensure_ascii=False,
+    )
+    body = json.loads(
+        native.completed_responses_fixture("request-abc", "coding", 1_700_000_000.0, "{}", fixture)
+    )
+    assert body["output"][0]["encrypted_content"].encode() == encrypted.encode()
+
+    frames = native.encode_responses_fixture(
+        "request-abc", "coding", 1_700_000_000.0, "{}", fixture
+    )
+    done_items = [
+        json.loads(frame.split("data: ", 1)[1].strip())
+        for frame in frames
+        if "response.output_item.done" in frame
+    ]
+    reasoning_items = [item["item"] for item in done_items if item["item"]["type"] == "reasoning"]
+    assert len(reasoning_items) == 1
+    assert reasoning_items[0]["encrypted_content"].encode() == encrypted.encode()
+
+
+def test_keyed_store_false_never_reaches_the_continuation_store(tmp_path: Path) -> None:
+    """An Idempotency-Key on a store:false request opens no side door into
+    continuation state: the retention callback stays a no-op, the response ID
+    resolves to continuation_unavailable in its own namespace, and keyed
+    admission replays the operation without manufacturing stored history."""
+    control, raw_key = _control_plane(tmp_path)
+    body = _responses_body(store=False)
+    admission = json.loads(
+        control.admit(
+            json.dumps(
+                {
+                    "raw_key": raw_key,
+                    "body": body,
+                    "surface": "responses",
+                    "idempotency_key": "codex-op",
+                }
+            )
+        )
+    )
+    assert (
+        control.remember(
+            json.dumps(
+                {
+                    "request_id": admission["request_id"],
+                    "text": "The answer is 42.",
+                    "refusal": False,
+                    "tool_calls": [],
+                }
+            )
+        )
+        == "{}"
+    )
+    response_id = stable_public_id("resp", _admitted_request_id(admission))
+    # Direct store probe in the exact tenant namespace: nothing was retained.
+    entry = control._accounting.entry(  # noqa: SLF001 - namespace extraction for the probe.
+        _admitted_request_id(admission)
+    )
+    assert entry is not None and entry.continuation is not None
+    assert entry.continuation.retain is False
+    with pytest.raises(OpenAIProtocolError) as direct:
+        control._continuations.resolve_now(  # noqa: SLF001 - retention isolation assertion.
+            namespace=entry.continuation.namespace,
+            previous_response_id=response_id,
+        )
+    assert direct.value.detail.code == "continuation_unavailable"
+    # Continuing from the ID through the public path fails closed too, with
+    # or without the original caller operation key.
+    for key in (None, "codex-op-next"):
+        with pytest.raises(NativeBridgeError) as continued:
+            control.admit(
+                json.dumps(
+                    {
+                        "raw_key": raw_key,
+                        "body": _responses_body(previous_response_id=response_id),
+                        "surface": "responses",
+                        "idempotency_key": key,
+                    }
+                )
+            )
+        assert json.loads(continued.value.public_error_json)["code"] == "continuation_unavailable"
+
+
+def test_keyed_reasoning_content_joins_replay_identity(tmp_path: Path) -> None:
+    """A caller operation key reused with different replayed reasoning is a
+    conflict: opaque carriers are digest-excluded for artifact stability, so
+    replay identity must fold them back in through canonical_request_sha256."""
+    control, raw_key = _control_plane(tmp_path)
+
+    def reasoning_body(encrypted_content: str) -> str:
+        """Return one Responses body replaying encrypted reasoning."""
+        return json.dumps(
+            {
+                "model": "coding",
+                "input": [
+                    {"type": "message", "role": "user", "content": "go"},
+                    {
+                        "type": "reasoning",
+                        "id": "rs_1",
+                        "summary": [],
+                        "encrypted_content": encrypted_content,
+                    },
+                    {"type": "message", "role": "assistant", "content": "done"},
+                    {"type": "message", "role": "user", "content": "continue"},
+                ],
+            }
+        )
+
+    def admit_keyed(body: str) -> JsonObject:
+        """Admit one keyed Responses request."""
+        return json.loads(
+            control.admit(
+                json.dumps(
+                    {
+                        "raw_key": raw_key,
+                        "body": body,
+                        "surface": "responses",
+                        "idempotency_key": "reasoning-op",
+                    }
+                )
+            )
+        )
+
+    # The seeded route is OpenAI-compatible, so the carrier is rejected at
+    # parameter admission; the accepted request still lands a durable keyed
+    # terminal, which is exactly what replay identity is checked against.
+    with pytest.raises(NativeBridgeError) as first:
+        admit_keyed(reasoning_body("blob-one=="))
+    assert json.loads(first.value.public_error_json)["code"] == "unsupported_parameter"
+
+    with pytest.raises(NativeBridgeError) as changed:
+        admit_keyed(reasoning_body("blob-two=="))
+    assert json.loads(changed.value.public_error_json)["code"] == "idempotency_conflict"
+
+    with pytest.raises(NativeBridgeError) as repeated:
+        admit_keyed(reasoning_body("blob-one=="))
+    assert json.loads(repeated.value.public_error_json)["code"] != "idempotency_conflict"
